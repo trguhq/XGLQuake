@@ -17,6 +17,15 @@ static const char *test_fault;
 static const char *test_error = "";
 static int test_batch = 128;
 static int test_zbuffer;
+static xb_case test_case;
+static int test_lighting_bad;
+static unsigned long test_material_checksum;
+static unsigned long test_light_updates;
+static unsigned long test_fail_light_update;
+static xb_rgb *test_native_colors;
+static size_t test_native_color_count;
+static unsigned long test_native_color_checksum;
+static xb_light_state test_lights;
 
 typedef struct {
     xb_rgb *colors;
@@ -36,6 +45,7 @@ static unsigned long test_fail_drain;
 static double test_drain_delay;
 static int test_stream_bad;
 static int test_stream_fail(const char *error);
+static unsigned long test_checksum(const xb_rgb *colors, size_t count);
 
 static void test_log(const char *operation, int width, int height)
 {
@@ -51,7 +61,7 @@ static void test_log(const char *operation, int width, int height)
 
 int xb_backend_open(const xb_options *options, int width, int height)
 {
-    const char *draw, *delay, *drain;
+    const char *draw, *delay, *drain, *light;
     (void)options;
     test_width = width;
     test_height = height;
@@ -59,6 +69,12 @@ int xb_backend_open(const xb_options *options, int width, int height)
     test_fault_pending = test_fault_fired = 0;
     test_error = "";
     test_stream_bad = 0;
+    test_lighting_bad = 0;
+    test_light_updates = 0;
+    test_native_colors = NULL;
+    test_native_color_count = 0;
+    memset(&test_case, 0, sizeof(test_case));
+    memset(&test_lights, 0, sizeof(test_lights));
     test_slot_count = test_outstanding = test_peak = 0;
     test_submitted = test_completed = test_nonempty_drains = 0;
     memset(test_slots, 0, sizeof(test_slots));
@@ -66,6 +82,8 @@ int xb_backend_open(const xb_options *options, int width, int height)
     test_drain_delay = delay ? atof(delay) * .001 : 0;
     drain = getenv("XB_TEST_FAIL_DRAIN");
     test_fail_drain = drain ? strtoul(drain, NULL, 10) : 0;
+    light = getenv("XB_TEST_FAIL_LIGHT_UPDATE");
+    test_fail_light_update = light ? strtoul(light, NULL, 10) : 0;
     test_fault = getenv("XB_TEST_FAULT");
     draw = getenv("XB_TEST_FAULT_DRAW");
     test_fault_draw = draw ? strtoul(draw, NULL, 10) : 5;
@@ -79,6 +97,8 @@ void xb_backend_close(void)
     for (i = 0; i < test_slot_count; ++i) free(test_slots[i].colors);
     memset(test_slots, 0, sizeof(test_slots));
     test_slot_count = 0;
+    free(test_native_colors);
+    test_native_colors = NULL;
     test_log("close", test_width, test_height);
 }
 
@@ -119,23 +139,161 @@ int xb_backend_validate(enum xb_method method, char *reason, size_t size)
     return 1;
 }
 
+static int test_lighting_fail(const char *error)
+{
+    test_error = error;
+    test_lighting_bad = 1;
+    test_log("lighting-error", (int)test_case.lighting, (int)test_case.shade);
+    return 0;
+}
+
+static int test_unit_normal(const xb_point *normal)
+{
+    double length;
+    length = (double)normal->x * normal->x +
+             (double)normal->y * normal->y +
+             (double)normal->z * normal->z;
+    /* Ordered comparisons reject NaNs as well as incorrect normalization. */
+    return length >= .999 && length <= 1.001;
+}
+
+static int test_color_valid(const xb_rgb *color)
+{
+    return color->r >= 0 && color->r <= 1 &&
+           color->g >= 0 && color->g <= 1 &&
+           color->b >= 0 && color->b <= 1;
+}
+
+static int test_lighting_mesh(const xb_mesh *mesh)
+{
+    size_t i;
+    if (!mesh || !mesh->lighting_ready || !mesh->triangles ||
+        mesh->point_count != mesh->triangles * 3 || !mesh->base_colors ||
+        !mesh->colors || !mesh->facet_normals || !mesh->vertex_normals ||
+        !mesh->centers || !mesh->vertex_colors || !mesh->facet_styles ||
+        !mesh->vertex_styles)
+        return test_lighting_fail("mock lighting geometry is incomplete");
+    for (i = 0; i < mesh->triangles; ++i) {
+        if (!test_unit_normal(&mesh->facet_normals[i]) ||
+            !test_color_valid(&mesh->colors[i]) ||
+            !test_color_valid(&mesh->base_colors[i]))
+            return test_lighting_fail("mock facet normal/color is invalid");
+        if (test_case.xgl_lighting &&
+            memcmp(&mesh->colors[i], &mesh->base_colors[i], sizeof(xb_rgb)))
+            return test_lighting_fail("hardware lighting received already-lit facet RGB");
+    }
+    for (i = 0; i < mesh->point_count; ++i) {
+        if (!test_unit_normal(&mesh->vertex_normals[i]) ||
+            !test_color_valid(&mesh->vertex_colors[i]))
+            return test_lighting_fail("mock vertex normal/color is invalid");
+        if (test_case.xgl_lighting &&
+            memcmp(&mesh->vertex_colors[i], &mesh->base_colors[i / 3], sizeof(xb_rgb)))
+            return test_lighting_fail("hardware lighting received already-lit vertex RGB");
+    }
+    return 1;
+}
+
 int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
                          char *reason, size_t size)
 {
+    const char *failed;
+    test_case = *test;
     test_batch = test->batch > 0 ? test->batch : 128;
     test_zbuffer = test->zbuffer;
+    test_lighting_bad = 0;
+    test_error = "";
+    test_light_updates = 0;
+    memset(&test_lights, 0, sizeof(test_lights));
+    test_log("lighting-configure", (int)test->lighting, (int)test->shade);
+    test_log("lighting-compute", test->xgl_lighting, test->lights);
+    test_log("lighting-style", test->styles, test->moving);
     if (size) reason[0] = '\0';
+    failed = getenv("XB_TEST_FAIL_LIGHTING");
+    if (test->lighting != XB_LIGHT_OFF && failed && *failed) {
+        test_lighting_fail("injected lighting readback validation failure");
+        if (size) {
+            strncpy(reason, test_error, size - 1);
+            reason[size - 1] = '\0';
+        }
+        return 0;
+    }
+    if (test->lighting != XB_LIGHT_OFF) {
+        if (test->method != XB_MULTI || !test_lighting_mesh(mesh)) {
+            if (size) {
+                strncpy(reason, test_error, size - 1);
+                reason[size - 1] = '\0';
+            }
+            return 0;
+        }
+        test_material_checksum = test_checksum(mesh->base_colors, mesh->triangles);
+        xb_lighting_state(test, 0, &test_lights);
+    }
     return xb_backend_upload(mesh);
 }
 
 int xb_backend_upload(const xb_mesh *mesh)
 {
+    const xb_rgb *colors;
+    free(test_native_colors);
+    test_native_colors = NULL;
+    test_native_color_count = 0;
     test_triangles = mesh->triangles;
     test_strips = mesh->strip_count;
+    if (test_case.lighting != XB_LIGHT_OFF) {
+        test_native_color_count = test_case.shade == XB_SMOOTH ?
+                                  mesh->point_count : mesh->triangles;
+        test_native_colors = (xb_rgb *)malloc(test_native_color_count * sizeof(xb_rgb));
+        if (!test_native_colors)
+            return test_lighting_fail("mock lighting color allocation failed");
+        colors = test_case.shade == XB_SMOOTH ? mesh->vertex_colors : mesh->colors;
+        memcpy(test_native_colors, colors, test_native_color_count * sizeof(xb_rgb));
+        test_native_color_checksum = test_checksum(test_native_colors, test_native_color_count);
+    }
     return 1;
 }
 
-void xb_backend_colors(const xb_mesh *mesh) { (void)mesh; }
+void xb_backend_colors(const xb_mesh *mesh)
+{
+    const xb_rgb *colors;
+    unsigned long checksum;
+    if (test_case.lighting == XB_LIGHT_OFF) return;
+    if (!test_lighting_mesh(mesh)) return;
+    if (test_case.xgl_lighting) {
+        test_lighting_fail("XGL lighting unexpectedly uploaded CPU-lit colors");
+        return;
+    }
+    if (test_checksum(mesh->base_colors, mesh->triangles) != test_material_checksum) {
+        test_lighting_fail("lighting update mutated cached material RGB");
+        return;
+    }
+    colors = test_case.shade == XB_SMOOTH ? mesh->vertex_colors : mesh->colors;
+    checksum = test_checksum(colors, test_native_color_count);
+    test_log("lighting-colors", (int)test_case.shade,
+             checksum != test_native_color_checksum);
+    memcpy(test_native_colors, colors, test_native_color_count * sizeof(xb_rgb));
+    test_native_color_checksum = checksum;
+}
+
+int xb_backend_lighting(const xb_light_state *state)
+{
+    size_t i;
+    if (!test_case.xgl_lighting || test_case.lighting != XB_LIGHT_LAMBERT ||
+        !state || state->count != test_case.lights || state->count < 1 ||
+        state->count > XB_MAX_LIGHTS || state->directional != test_case.directional)
+        return test_lighting_fail("invalid mock light-state update");
+    if (!(state->ambient >= 0 && state->ambient <= 1) ||
+        !(state->attenuation1 > 0) || !(state->attenuation2 >= 0))
+        return test_lighting_fail("invalid mock light coefficients");
+    for (i = 0; i < (size_t)state->count; ++i)
+        if (!test_color_valid(&state->color[i]))
+            return test_lighting_fail("invalid mock light color");
+    ++test_light_updates;
+    if (test_fail_light_update && test_light_updates == test_fail_light_update)
+        return test_lighting_fail("injected light-state update failure");
+    test_log("lighting-update", state->count, state->directional);
+    test_lights = *state;
+    return 1;
+}
 void xb_backend_transform(unsigned long frame) { (void)frame; }
 void xb_backend_clear(int color, int depth)
 {
@@ -178,7 +336,7 @@ void xb_backend_raster(int masked)
 }
 int xb_backend_events(void)
 {
-    if (test_stream_bad) return 0;
+    if (test_stream_bad || test_lighting_bad) return 0;
     if (!test_fault_pending) return 1;
     test_fault_pending = 0;
     if (!strcmp(test_fault, "native-error")) {
@@ -205,6 +363,13 @@ size_t xb_backend_input_bytes(enum xb_method method, int batch)
     /* A test-double payload estimate only, never native transfer bandwidth. */
     points = method == XB_STRIP ? test_triangles + test_strips * 2 : test_triangles * 3;
     facets = method == XB_TLIST ? test_triangles * 3 : test_triangles;
+    if (test_case.lighting != XB_LIGHT_OFF) {
+        if (test_case.shade == XB_SMOOTH)
+            return points * (sizeof(xb_point) + sizeof(xb_rgb) +
+                   (test_case.xgl_lighting ? sizeof(xb_point) : 0));
+        return points * sizeof(xb_point) + facets *
+               (sizeof(xb_rgb) + (test_case.xgl_lighting ? sizeof(xb_point) : 0));
+    }
     return points * sizeof(xb_point) + facets * sizeof(xb_rgb);
 }
 

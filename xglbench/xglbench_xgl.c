@@ -1,6 +1,6 @@
 /* Native Sun XGL 3.x backend, GPL-2.0-or-later. See COPYING.
  * API references: Sun XGL Reference Manual 802-5864, printed pp. 37-42,
- * 79-80, 101, 174, 204-205, 228-233, 274-277, 333-334, 387-400,
+ * 79-84, 94-115, 174, 204-205, 228-233, 274-277, 312-315, 333-334, 387-400,
  * 417-424, 457-459, 467-470, 515, 552-567. No OpenGL is used.
  */
 #include "xglbench.h"
@@ -48,6 +48,9 @@ typedef struct {
     Xgl_usgn32 buffers;
     char device[160], error[256], version[160];
     Xgl_pt_f3d *points, *strip_points;
+    Xgl_pt_color_f3d *color_points;
+    Xgl_pt_color_normal_f3d *lit_points;
+    Xgl_color_normal_facet *lit_facets;
     Xgl_pt_list *lists;
     Xgl_color_facet *facets, *restart_facets;
     Xgl_facet_list *batch_facets;
@@ -55,6 +58,9 @@ typedef struct {
     size_t triangles, point_count, strip_point_count, strip_count;
     enum xb_method method;
     int batch, perspective, errors, fatal;
+    int shading, hardware_lighting, allow_fallback, light_count;
+    Xgl_light lights[XB_MAX_LIGHTS + 1];
+    xb_light_state light_state;
     int raster_checked, raster_ok, mask_checked, mask_ok;
     xb_native_slot stream[XB_MAX_QUEUE];
     int stream_active, stream_slots, stream_batch;
@@ -64,6 +70,7 @@ typedef struct {
 static xb_native b;
 static int validate_raster(int masked);
 static int validate_stream(void);
+static int validate_lighting(void);
 
 static void free_stream_slots(void)
 {
@@ -337,6 +344,7 @@ int xb_backend_open(const xb_options *options, int width, int height)
     XSizeHints hints;
     char *version;
     memset(&b, 0, sizeof(b));
+    b.allow_fallback = options->allow_fallback;
     b.display = XOpenDisplay(options->display);
     if (!b.display) {
         fail("cannot open X display; run in the local OpenWindows desktop");
@@ -441,9 +449,13 @@ int xb_backend_open(const xb_options *options, int width, int height)
 static void free_geometry(void)
 {
     free(b.points); free(b.strip_points); free(b.lists);
+    free(b.color_points); free(b.lit_points); free(b.lit_facets);
     free(b.facets); free(b.restart_facets); free(b.strips);
     free(b.batch_facets);
     b.points = b.strip_points = NULL;
+    b.color_points = NULL;
+    b.lit_points = NULL;
+    b.lit_facets = NULL;
     b.lists = NULL;
     b.facets = b.restart_facets = NULL;
     b.batch_facets = NULL;
@@ -514,7 +526,7 @@ void xb_backend_info(FILE *out)
     fprintf(out, "Swap implementation: %s; transparency=%s; lighting=%s\n",
             b.inquiry.db_buffer_is_copy ? "copy" : "buffer switch",
             support(b.inquiry.transparency), support(b.inquiry.lighting));
-    fprintf(out, "State: flat facet RGB; no XGL illumination/textures; culling off; "
+    fprintf(out, "Default state: flat facet RGB; illumination off; no textures; culling off; "
                  "six clipping planes; deferred submission; volatile geometry "
                  "except retained-array and pipeline cases.\n");
     fprintf(out, "Raster copies share the 3D context to preserve draw order "
@@ -526,6 +538,10 @@ void xb_backend_info(FILE *out)
             XB_RASTER_W, XB_RASTER_H);
     fprintf(out, "Pipeline: one thread/context; stable native slots; BUFFERS posts, "
                  "SYNCHRONIZE drains before slot reuse; no presentation.\n");
+    fprintf(out, "Lighting cases: CPU facet/vertex RGB or XGL facet/vertex ambient+diffuse; "
+                 "supplied unit normals, both normal-flip options off, specular disabled.\n");
+    fprintf(out, "Reported lighting support is coarse; it does not prove every light "
+                 "type/count remains accelerated. XGL point positions use double precision.\n");
     fprintf(out, "Input bytes count referenced native points/facet colors, including "
                  "strip overlaps and list padding, excluding descriptors; "
                  "not measured SBus/DMA traffic.\n");
@@ -546,10 +562,25 @@ int xb_backend_upload(const xb_mesh *mesh)
     if (b.batch <= 0) b.batch = 128;
     /* Full rebuild is intentionally measurable; static workloads upload once. */
     free_geometry();
-    needs_points = b.method != XB_STRIP;
+    needs_points = b.method != XB_STRIP && b.shading != XB_SMOOTH;
     needs_lists = b.method == XB_POLYGON || b.method == XB_MULTI;
     if (needs_points)
         b.points = (Xgl_pt_f3d *)calloc(mesh->point_count, sizeof(*b.points));
+    if (b.shading == XB_SMOOTH) {
+        if (!mesh->vertex_colors || (b.hardware_lighting && !mesh->vertex_normals)) {
+            fail("smooth shading requires vertex colors and lit vertices require normals");
+            return 0;
+        }
+        if (b.hardware_lighting)
+            b.lit_points = (Xgl_pt_color_normal_f3d *)calloc(mesh->point_count,
+                                                           sizeof(*b.lit_points));
+        else b.color_points = (Xgl_pt_color_f3d *)calloc(mesh->point_count,
+                                                       sizeof(*b.color_points));
+    } else if (b.hardware_lighting) {
+        if (!mesh->facet_normals) { fail("facet lighting requires supplied normals"); return 0; }
+        b.lit_facets = (Xgl_color_normal_facet *)calloc(mesh->triangles,
+                                                      sizeof(*b.lit_facets));
+    }
     if (b.method == XB_STRIP) {
         b.strip_points = (Xgl_pt_f3d *)calloc(mesh->strip_point_count,
                                             sizeof(*b.strip_points));
@@ -565,6 +596,9 @@ int xb_backend_upload(const xb_mesh *mesh)
     if (b.method == XB_MULTI)
         b.batch_facets = (Xgl_facet_list *)calloc(batch_count, sizeof(*b.batch_facets));
     if ((needs_points && !b.points) || (needs_lists && !b.lists) || !b.facets ||
+        (b.shading == XB_SMOOTH && !(b.hardware_lighting ? (void *)b.lit_points :
+                                                          (void *)b.color_points)) ||
+        (b.shading != XB_SMOOTH && b.hardware_lighting && !b.lit_facets) ||
         (b.method == XB_STRIP && (!b.strips || !b.strip_points)) ||
         (b.method == XB_TLIST && !b.restart_facets) ||
         (b.method == XB_MULTI && !b.batch_facets)) {
@@ -583,6 +617,24 @@ int xb_backend_upload(const xb_mesh *mesh)
         b.points[i].y = mesh->points[i].y;
         b.points[i].z = mesh->points[i].z;
     }
+    for (i = 0; b.color_points && i < mesh->point_count; ++i) {
+        b.color_points[i].x = mesh->points[i].x;
+        b.color_points[i].y = mesh->points[i].y;
+        b.color_points[i].z = mesh->points[i].z;
+    }
+    for (i = 0; b.lit_points && i < mesh->point_count; ++i) {
+        b.lit_points[i].x = mesh->points[i].x;
+        b.lit_points[i].y = mesh->points[i].y;
+        b.lit_points[i].z = mesh->points[i].z;
+        b.lit_points[i].normal.x = mesh->vertex_normals[i].x;
+        b.lit_points[i].normal.y = mesh->vertex_normals[i].y;
+        b.lit_points[i].normal.z = mesh->vertex_normals[i].z;
+    }
+    for (i = 0; b.lit_facets && i < mesh->triangles; ++i) {
+        b.lit_facets[i].normal.x = mesh->facet_normals[i].x;
+        b.lit_facets[i].normal.y = mesh->facet_normals[i].y;
+        b.lit_facets[i].normal.z = mesh->facet_normals[i].z;
+    }
     for (i = 0; b.strip_points && i < mesh->strip_point_count; ++i) {
         b.strip_points[i].x = mesh->strip_points[i].x;
         b.strip_points[i].y = mesh->strip_points[i].y;
@@ -592,7 +644,13 @@ int xb_backend_upload(const xb_mesh *mesh)
         b.lists[i].pt_type = XGL_PT_F3D;
         b.lists[i].num_pts = 3;
         b.lists[i].num_data_values = 0;
-        b.lists[i].pts.f3d = &b.points[i * 3];
+        if (b.lit_points) {
+            b.lists[i].pt_type = XGL_PT_COLOR_NORMAL_F3D;
+            b.lists[i].pts.color_normal_f3d = &b.lit_points[i * 3];
+        } else if (b.color_points) {
+            b.lists[i].pt_type = XGL_PT_COLOR_F3D;
+            b.lists[i].pts.color_f3d = &b.color_points[i * 3];
+        } else b.lists[i].pts.f3d = &b.points[i * 3];
     }
     for (i = 0, start = 0; b.batch_facets && start < mesh->triangles;
          ++i, start += count) {
@@ -600,7 +658,10 @@ int xb_backend_upload(const xb_mesh *mesh)
         if (count > (size_t)b.batch) count = (size_t)b.batch;
         b.batch_facets[i].facet_type = XGL_FACET_COLOR;
         b.batch_facets[i].num_facets = (Xgl_usgn32)count;
-        b.batch_facets[i].facets.color_facets = b.facets + start;
+        if (b.lit_facets) {
+            b.batch_facets[i].facet_type = XGL_FACET_COLOR_NORMAL;
+            b.batch_facets[i].facets.color_normal_facets = b.lit_facets + start;
+        } else b.batch_facets[i].facets.color_facets = b.facets + start;
     }
     xb_backend_colors(mesh);
     return 1;
@@ -611,10 +672,18 @@ void xb_backend_colors(const xb_mesh *mesh)
     size_t i, start, count;
     int batch;
     if (!mesh || mesh->triangles != b.triangles) return;
-    for (i = 0; i < b.triangles; ++i) {
+    for (i = 0; b.shading != XB_SMOOTH && i < b.triangles; ++i) {
         b.facets[i].color.rgb.r = mesh->colors[i].r;
         b.facets[i].color.rgb.g = mesh->colors[i].g;
         b.facets[i].color.rgb.b = mesh->colors[i].b;
+        if (b.lit_facets) b.lit_facets[i].color = b.facets[i].color;
+    }
+    for (i = 0; (b.color_points || b.lit_points) && i < b.point_count; ++i) {
+        Xgl_color *color;
+        color = b.lit_points ? &b.lit_points[i].color : &b.color_points[i].color;
+        color->rgb.r = mesh->vertex_colors[i].r;
+        color->rgb.g = mesh->vertex_colors[i].g;
+        color->rgb.b = mesh->vertex_colors[i].b;
     }
     if (b.method != XB_TLIST) return;
     batch = b.batch > 0 ? b.batch : 128;
@@ -635,6 +704,10 @@ size_t xb_backend_input_bytes(enum xb_method method, int batch)
 {
     size_t i, count, batches, points, facets;
     if (method != b.method) return 0;
+    if (b.lit_points) return b.point_count * sizeof(*b.lit_points);
+    if (b.color_points) return b.point_count * sizeof(*b.color_points);
+    if (b.lit_facets)
+        return b.point_count * sizeof(*b.points) + b.triangles * sizeof(*b.lit_facets);
     if (batch <= 0) batch = 128;
     points = b.point_count;
     facets = b.triangles;
@@ -824,6 +897,106 @@ bad:
     return 0;
 }
 
+int xb_backend_lighting(const xb_light_state *state)
+{
+    Xgl_color color;
+    Xgl_pt_f3d direction;
+    Xgl_pt_d3d position;
+    int i;
+    if (b.errors || b.fatal) return 0;
+    if (!b.hardware_lighting || !state || state->count != b.light_count ||
+        state->count < 1 || state->count > XB_MAX_LIGHTS) {
+        fail("light state does not match the configured native light count");
+        return 0;
+    }
+    memset(&color, 0, sizeof(color));
+    color.rgb.r = color.rgb.g = color.rgb.b = state->ambient;
+    xgl_object_set(b.lights[0], XGL_LIGHT_TYPE, XGL_LIGHT_AMBIENT,
+                   XGL_LIGHT_COLOR, &color, 0);
+    direction.x = state->direction.x;
+    direction.y = state->direction.y;
+    direction.z = state->direction.z;
+    for (i = 0; i < state->count && !b.errors; ++i) {
+        color.rgb.r = state->color[i].r;
+        color.rgb.g = state->color[i].g;
+        color.rgb.b = state->color[i].b;
+        if (state->directional) {
+            xgl_object_set(b.lights[i + 1], XGL_LIGHT_TYPE, XGL_LIGHT_DIRECTIONAL,
+                XGL_LIGHT_COLOR, &color, XGL_LIGHT_DIRECTION, &direction, 0);
+        } else {
+            /* Reference pp.314-315 deliberately use different point types:
+             * direction is Xgl_pt_f3d; position MUST be Xgl_pt_d3d. */
+            position.x = state->position[i].x;
+            position.y = state->position[i].y;
+            position.z = state->position[i].z;
+            xgl_object_set(b.lights[i + 1], XGL_LIGHT_TYPE, XGL_LIGHT_POSITIONAL,
+                XGL_LIGHT_COLOR, &color, XGL_LIGHT_POSITION, &position,
+                XGL_LIGHT_ATTENUATION_1, (double)state->attenuation1,
+                XGL_LIGHT_ATTENUATION_2, (double)state->attenuation2, 0);
+        }
+    }
+    if (b.errors) return 0;
+    b.light_state = *state;
+    return 1;
+}
+
+static int configure_lighting(const xb_case *test)
+{
+    xb_light_state state;
+    Xgl_boolean switches[XB_MAX_LIGHTS + 1];
+    int i, illumination;
+    b.shading = test->shade;
+    b.hardware_lighting = test->xgl_lighting;
+    b.light_count = test->xgl_lighting ? test->lights : 0;
+    if ((test->shade != XB_FLAT || test->lighting != XB_LIGHT_OFF) &&
+        (test->method != XB_MULTI || test->work == XB_PIPELINE)) {
+        fail("lighting and smooth-color cases require serialized multi-polygon draws");
+        return 0;
+    }
+    if (b.hardware_lighting && (test->lighting != XB_LIGHT_LAMBERT ||
+        b.light_count < 1 || b.light_count > XB_MAX_LIGHTS)) {
+        fail("native lighting requires the Lambert model and 1..4 diffuse lights");
+        return 0;
+    }
+    if (b.hardware_lighting && b.inquiry.lighting != XGL_INQ_HARDWARE &&
+        (!b.allow_fallback || b.inquiry.lighting == XGL_INQ_NOT_SUPPORTED)) {
+        fail("XGL does not report hardware lighting; use -allow-fallback for supported software lighting");
+        return 0;
+    }
+    illumination = b.hardware_lighting ?
+        (b.shading == XB_SMOOTH ? XGL_ILLUM_PER_VERTEX : XGL_ILLUM_PER_FACET) :
+        (b.shading == XB_SMOOTH ? XGL_ILLUM_NONE_INTERP_COLOR : XGL_ILLUM_NONE);
+    /* Explicit reset is required when a lit/interpolated case is followed by
+     * one of the original unlit tests, including the next resolution's gates.
+     * Default LIGHTING_NORMAL_FLIP is TRUE; disable it to match the supplied
+     * unit normals used by the CPU reference (Reference pp.114-115). */
+    xgl_object_set(b.ctx,
+        XGL_CTX_SURF_FRONT_COLOR_SELECTOR, b.shading == XB_SMOOTH ?
+            XGL_SURF_COLOR_VERTEX_ILLUM_DEP : XGL_SURF_COLOR_FACET,
+        XGL_3D_CTX_SURF_FRONT_ILLUMINATION, illumination,
+        XGL_3D_CTX_SURF_NORMAL_FLIP, FALSE,
+        XGL_3D_CTX_SURF_LIGHTING_NORMAL_FLIP, FALSE,
+        XGL_3D_CTX_SURF_FRONT_AMBIENT, 1.0,
+        XGL_3D_CTX_SURF_FRONT_DIFFUSE, 1.0,
+        XGL_3D_CTX_SURF_FRONT_SPECULAR, 0.0,
+        XGL_3D_CTX_SURF_FRONT_LIGHT_COMPONENT,
+            XGL_LIGHT_ENABLE_COMP_AMBIENT | XGL_LIGHT_ENABLE_COMP_DIFFUSE,
+        XGL_3D_CTX_LIGHT_NUM, (Xgl_usgn32)(b.hardware_lighting ? b.light_count + 1 : 0), 0);
+    if (b.errors) return 0;
+    memset(b.lights, 0, sizeof(b.lights));
+    if (!b.hardware_lighting) return 1;
+    xgl_object_get(b.ctx, XGL_3D_CTX_LIGHTS, b.lights);
+    if (b.errors) return 0;
+    for (i = 0; i <= b.light_count; ++i) {
+        if (!b.lights[i]) { fail("XGL returned a missing Light object"); return 0; }
+        switches[i] = TRUE;
+    }
+    xgl_object_set(b.ctx, XGL_3D_CTX_LIGHT_SWITCHES, switches, 0);
+    if (b.errors) return 0;
+    xb_lighting_state(test, 0, &state);
+    return xb_backend_lighting(&state);
+}
+
 int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
                          char *reason, size_t size)
 {
@@ -861,6 +1034,10 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
                    b.current_z ? XGL_HLHSR_Z_BUFFER : XGL_HLHSR_NONE, 0);
     identity(b.model);
     view_matrix(test->perspective);
+    if (!configure_lighting(test) || !validate_lighting()) {
+        copy_text(reason, size, b.error);
+        return 0;
+    }
     if (mesh && mesh->triangles && !xb_backend_upload(mesh)) {
         copy_text(reason, size, b.error);
         return 0;
@@ -879,6 +1056,9 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
         xb_backend_clear(1, 1);
         xb_backend_sync();
     }
+    if (test->xgl_lighting && b.inquiry.lighting != XGL_INQ_HARDWARE)
+        copy_text(reason, size,
+            "diagnostic fallback: lighting not reported in hardware; readback passed");
     return 1;
 }
 
@@ -966,7 +1146,8 @@ size_t xb_backend_draw(enum xb_method method, int batch)
         if (method == XB_MULTI) {
             xgl_multi_simple_polygon(b.ctx,
                 XGL_FACET_FLAG_SIDES_ARE_3 | XGL_FACET_FLAG_SHAPE_CONVEX,
-                &b.batch_facets[calls], NULL, (Xgl_usgn32)count, b.lists + start);
+                b.shading == XB_SMOOTH ? NULL : &b.batch_facets[calls],
+                NULL, (Xgl_usgn32)count, b.lists + start);
         } else {
             points.num_pts = (Xgl_usgn32)(count * 3);
             points.pts.f3d = b.points + start * 3;
@@ -1085,6 +1266,136 @@ static int pixel_matches(int x, int y, const xb_rgb *expected)
         return 0;
     }
     return !b.errors;
+}
+
+static int lighting_probe_draw(const xb_mesh *mesh)
+{
+    if (b.errors || !xb_backend_upload(mesh)) return 0;
+    xb_backend_clear(1, 1);
+    if (!xb_backend_draw(XB_MULTI, b.batch)) return 0;
+    xb_backend_sync();
+    return !b.errors;
+}
+
+static int validate_lighting(void)
+{
+    xb_mesh mesh;
+    xb_point points[3], normals[3], facet_normal;
+    xb_rgb corners[3], colors[1], expected, reflected[3];
+    xb_light_state state, saved;
+    double wx, wy, weight[3];
+    int i, phase, px, py, result;
+    if (b.shading == XB_FLAT && !b.hardware_lighting) return 1;
+    memset(&mesh, 0, sizeof(mesh));
+    mesh.triangles = 1; mesh.point_count = 3;
+    mesh.points = points; mesh.colors = mesh.base_colors = colors;
+    mesh.vertex_colors = corners; mesh.vertex_normals = normals;
+    mesh.facet_normals = &facet_normal;
+    facet_normal.x = facet_normal.y = 0; facet_normal.z = 1;
+    for (i = 0; i < 3; ++i) {
+        points[i].z = .5f; normals[i] = facet_normal;
+    }
+    colors[0].r = .9f; colors[0].g = .8f; colors[0].b = .7f;
+    saved = b.light_state;
+    memset(&state, 0, sizeof(state));
+    state.count = b.light_count;
+    state.directional = 1; state.direction.z = -1;
+    state.ambient = .1f;
+    for (i = 0; i < state.count; ++i) {
+        state.color[i].r = .6f / (float)state.count;
+        state.color[i].g = .6f / (float)state.count;
+        state.color[i].b = .6f / (float)state.count;
+    }
+    result = 0;
+    identity(b.model);
+    view_matrix(0);
+    if (b.hardware_lighting && !xb_backend_lighting(&state)) goto done;
+    if (b.shading == XB_SMOOTH) {
+        /* Primary-colored corners expose accidental flat shading, wrong color
+         * selectors, missing color payloads and hardware vertex lighting that
+         * shades a facet only once. Read an interior barycentric mixture. */
+        points[0].x = -.8f; points[0].y = -.8f;
+        points[1].x =  .8f; points[1].y = -.8f;
+        points[2].x = -.8f; points[2].y =  .8f;
+        memset(corners, 0, sizeof(corners));
+        corners[0].r = .8f; corners[1].g = .8f; corners[2].b = .8f;
+        px = (int)(.35 * (b.width - 1));
+        py = (int)(.35 * (b.height - 1));
+        wx = 2.0 * px / (b.width - 1) - 1.0;
+        wy = 2.0 * py / (b.height - 1) - 1.0;
+        weight[1] = (wx + .8) / 1.6;
+        weight[2] = (wy + .8) / 1.6;
+        weight[0] = 1.0 - weight[1] - weight[2];
+        memset(&expected, 0, sizeof(expected));
+        for (i = 0; i < 3; ++i) {
+            /* Distinct unit normals also verify per-vertex normal fetches.
+             * Material remains corner-specific only in this readback probe. */
+            if (b.hardware_lighting && i) {
+                normals[i].z = .6f;
+                if (i == 1) normals[i].x = .8f;
+                else normals[i].y = .8f;
+            }
+            reflected[i] = b.hardware_lighting ?
+                xb_lighting_evaluate(&state, &points[i], &normals[i], &corners[i]) : corners[i];
+            expected.r += (float)(weight[i] * reflected[i].r);
+            expected.g += (float)(weight[i] * reflected[i].g);
+            expected.b += (float)(weight[i] * reflected[i].b);
+        }
+        if (!lighting_probe_draw(&mesh) || !pixel_matches(px, py, &expected)) goto done;
+        /* Timed CPU paths replace colors without reallocating positions. */
+        for (i = 0; i < 3; ++i) corners[i] = colors[0];
+        xb_backend_colors(&mesh);
+        memset(&expected, 0, sizeof(expected));
+        for (i = 0; i < 3; ++i) {
+            reflected[i] = b.hardware_lighting ?
+                xb_lighting_evaluate(&state, &points[i], &normals[i], &corners[i]) : corners[i];
+            expected.r += (float)(weight[i] * reflected[i].r);
+            expected.g += (float)(weight[i] * reflected[i].g);
+            expected.b += (float)(weight[i] * reflected[i].b);
+        }
+        xb_backend_clear(1, 1);
+        if (!xb_backend_draw(XB_MULTI, b.batch)) goto done;
+        xb_backend_sync();
+        if (!pixel_matches(px, py, &expected)) goto done;
+    }
+    if (!b.hardware_lighting) { result = 1; goto done; }
+    /* Equilateral fixture: all corners are the same distance from lights on
+     * its central normal. Flat lighting may choose any vertex (Guide p400),
+     * and still has an exact reference value, without assuming a centroid. */
+    points[0].x = -.649519053f; points[0].y = -.375f;
+    points[1].x =  .649519053f; points[1].y = -.375f;
+    points[2].x = 0; points[2].y = .75f;
+    px = b.width / 2; py = b.height / 2;
+    for (i = 0; i < 3; ++i) { normals[i] = facet_normal; corners[i] = colors[0]; }
+    for (phase = 0; phase < 2; ++phase) {
+        facet_normal.z = phase ? -1.0f : 1.0f;
+        for (i = 0; i < 3; ++i) normals[i] = facet_normal;
+        expected = xb_lighting_evaluate(&state, &points[0], &facet_normal, &colors[0]);
+        if (!lighting_probe_draw(&mesh) || !pixel_matches(px, py, &expected)) goto done;
+    }
+    facet_normal.z = 1;
+    for (i = 0; i < 3; ++i) normals[i] = facet_normal;
+    state.directional = 0;
+    state.attenuation1 = .25f; state.attenuation2 = .65f;
+    for (i = 0; i < state.count; ++i) {
+        state.color[i].r = .9f / (float)state.count;
+        state.color[i].g = .75f / (float)state.count;
+        state.color[i].b = .6f / (float)state.count;
+    }
+    for (phase = 0; phase < 2; ++phase) {
+        for (i = 0; i < state.count; ++i)
+            state.position[i].z = 1.5f + .2f * i + 2.0f * phase;
+        if (!xb_backend_lighting(&state)) goto done;
+        expected = xb_lighting_evaluate(&state, &points[0], &facet_normal, &colors[0]);
+        if (!lighting_probe_draw(&mesh) || !pixel_matches(px, py, &expected)) goto done;
+    }
+    result = 1;
+done:
+    if (!b.errors) {
+        if (b.hardware_lighting && !xb_backend_lighting(&saved)) result = 0;
+        view_matrix(b.perspective);
+    }
+    return result && !b.errors;
 }
 
 static int validate_stream(void)

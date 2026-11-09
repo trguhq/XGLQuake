@@ -66,6 +66,7 @@ An explicit `-winsize` runs only that resolution:
 ./xglbench -list
 ./xglbench -test submit/multi_polygon/batch-128 -winsize 320 240
 ./xglbench -test pipeline/ -queue 2 -csv pipeline.csv | tee pipeline.txt
+./xglbench -test lighting/ -quick -csv lighting.csv | tee lighting.txt
 ```
 
 Options:
@@ -92,7 +93,9 @@ is supplied by the caller. Keep the window fully visible and unobscured, and
 avoid moving or resizing it during a trial. Run on the workstation's local
 OpenWindows display rather than through SSH X forwarding. Background work
 and window-system activity can materially affect a 60 MHz machine.
-The full suite's default repeated trials take several minutes. Use `-list`
+The full suite has 134 cases per resolution. At the default duration and
+repeat count, its two resolutions require at least 13.4 minutes of measured
+work, plus setup, warm-up and validation. Use `-list`
 to inspect the current case list, `-quick` for a smoke run, or `-test` to
 investigate a particular family. There is no randomized test order, so rerun
 close comparisons and control changes in background load.
@@ -132,6 +135,19 @@ close comparisons and control changes in background load.
 * **What changes with animation?** Static meshes, changing model transforms,
   and changing facet colors exercise different preparation and submission
   costs.
+* **Can XGL calculate lighting more cheaply than the CPU?** Separate CPU and
+  XGL lighting paths use the same Lambert model, with directional and moving
+  positional lights. A separate Quake-like model preserves a finite light
+  radius and surface-distance falloff instead of treating XGL lighting as an
+  exact replacement for Quake's world lighting.
+* **Does smooth shading help?** CPU-supplied vertex RGB with XGL interpolation
+  is distinct from XGL-calculated vertex lighting. Both are compared with
+  flat facets. The material color remains constant within each triangle, so
+  these tests smooth lighting without blending colors across material edges.
+* **What does baked lighting cost?** Cached procedural lighting samples are
+  separate from recombining animated lightstyle layers. This tests the work
+  needed to update supplied colors without reconstructing the baked field
+  from XGL light sources.
 * **How much frame overhead remains?** Color clears, depth clears, swaps,
   and full-frame workloads separate fixed work from primitive throughput.
   Full-frame cases include a masked HUD copy as well as the scene and swap.
@@ -158,10 +174,11 @@ The square-aspect cases are named `area/{4,16,64,100,256,1024}px`;
 `shape/100px/horizontal-16x1` and `shape/100px/vertical-1x16` compare the
 elongated shapes with `area/100px`.
 The generator retains the requested triangle count, so controlled overlap
-may be needed when the triangles cannot all fit without overlap. Calibrated
-triangles use a constant depth and the less-than-or-equal Z comparison, so
-later triangles at that depth can pass even where they overlap. These are
-geometry/raster stress tests, not a promise of scene-like spatial coverage.
+may be needed when the triangles cannot all fit without overlap. The
+`area/` and `shape/` triangles use a constant depth and the less-than-or-equal
+Z comparison, so later triangles at that depth can pass even where they
+overlap. These are geometry/raster stress tests, not a promise of scene-like
+spatial coverage.
 
 The original patch scenes retain their normalized dimensions instead. Their
 nominal reference area grows approximately fourfold when the window changes
@@ -191,13 +208,140 @@ Michael F. Deering and Scott R. Nelson's *Leo: A System for Cost Effective
   microseconds and 24-bit image uploads at 10 million pixels per second.
 
 Those are historical system results under the paper's conditions, not
-pass/fail thresholds or expected Quake frame rates. Our flat-color cases do
-not reproduce its lighted Gouraud workload. Subdivision increases setup and
-input work while approximately preserving the covered area; dividing the
-published triangle rate by a new triangle count is not a reliable FPS model.
-This first extension keeps flat colors and CPU material sampling. It adds
-neither texture mapping nor a Gouraud renderer, and it creates no additional
+pass/fail thresholds or expected Quake frame rates. The lighting cases below
+do not reproduce the paper's complete measurement setup. In particular, its
+reported rate used one directional diffuse light plus ambient light; it does
+not establish the cost of several moving positional lights. Subdivision
+increases setup and input work while approximately preserving the covered
+area; dividing the published triangle rate by a new triangle count is not a
+reliable FPS model.
+Material sampling remains on the CPU. Flat and smooth lighting are now
+separate experiments; neither uses XGL texture mapping or additional
 application threads.
+
+## Lighting and smooth shading
+
+The original `colors/changing-light`, `subdivide/relight`, `frame/relight`,
+and `pipeline/*/relight` cases retain their inexpensive synthetic brightness
+ramp. They measure color preparation and submission, without light positions,
+normals or distance calculations. The `lighting/` family adds those costs
+explicitly rather than changing the meaning of the earlier cases.
+
+Four rendering paths distinguish interpolation from illumination:
+
+| Path | Color calculation | XGL rendering |
+| --- | --- | --- |
+| `cpu-flat` | CPU evaluates one color per facet. | `XGL_ILLUM_NONE`, one supplied RGB value per facet. |
+| `cpu-smooth` | CPU evaluates RGB at each vertex. | `XGL_ILLUM_NONE_INTERP_COLOR` interpolates supplied vertex colors. |
+| `xgl-flat` | XGL evaluates lighting once per facet. | `XGL_ILLUM_PER_FACET`, using supplied material colors and facet normals. |
+| `xgl-smooth` | XGL evaluates lighting at each vertex. | `XGL_ILLUM_PER_VERTEX` interpolates the resulting colors. |
+
+The family names identify the comparison being run:
+
+| Prefix | Workload |
+| --- | --- |
+| `lighting/baked/{cpu-flat,cpu-smooth}/cached/depth-{0,1,2}` | Cached procedural baked lighting. |
+| `lighting/baked/{cpu-flat,cpu-smooth}/styles-{1,4}/depth-{0,1,2}` | Recombine changing lightstyle samples. |
+| `lighting/matched/{path}/directional/depth-{0,1,2}` | Moving directional light with ambient illumination. |
+| `lighting/matched/{path}/point-1/depth-{0,1,2}` | One moving positional light with ambient illumination. |
+| `lighting/matched/{path}/point-{2,4}/depth-1` | Two or four moving positional lights with ambient illumination. |
+| `lighting/static/{path}/directional/depth-1` | Fixed directional light; CPU colors and native light state are prepared before timing. |
+| `lighting/area-100/{path}/point-1` | One moving positional light with fixed 100-pixel projected triangle areas at both resolutions. |
+| `lighting/quake-like/{cpu-flat,cpu-smooth}/point-{1,2,4}/depth-1` | CPU baked-plus-dynamic lighting with a Quake-like finite-radius falloff. |
+
+`{path}` means each of the four paths above. Braces describe the available
+case names; they are not literal `-test` syntax. For example, use
+`-test lighting/matched/xgl-smooth/point-1` or `-test lighting/baked/`.
+The positional count excludes the ambient contribution. It is a benchmark
+sweep, not an asserted XGL hardware limit.
+
+The lighting scene has a shallow curved profile. Flat paths use geometric
+facet normals; smooth paths use unit normals from the underlying curved
+surface. Each triangle retains one CPU-sampled material RGB value, copied
+to all three corners before lighting. Corners are duplicated at material
+boundaries, so smooth shading does not average neighboring texture samples
+together. It can reduce subdivision needed for lighting gradients, but it
+cannot restore texture detail absent from the geometry. The projected
+triangle areas still describe geometric coverage, not a count of shaded
+pixels. Baked shadow edges can also soften when vertex interpolation spans
+them; extra geometry is still needed to preserve a sharp boundary.
+
+The matched CPU and XGL cases use ambient plus diffuse Lambert lighting,
+with specular reflections disabled. Positional attenuation follows XGL's
+`1 / (constant + linear * distance)` model. Directional and positional
+workloads are separate, and the positional cases sweep the number of active
+lights. Light creation, native allocation and scene construction are outside
+timing; animated cases include updates to light state or supplied colors.
+XGL's automatic lighting-normal reversal is disabled so that it does not
+silently change the normals used by the CPU comparison.
+
+For flat positional lighting, the CPU uses the triangle centroid, while XGL
+may evaluate lighting at a device-selected vertex. These cases compare
+closely related workloads, not identical sample positions or images. The
+directional pairs have no position-dependent light calculation. Smooth
+CPU/XGL pairs evaluate the same light model at the same vertex positions.
+The window preview shows a representative phase. These throughput cases do
+not swap buffers during measurement, so the preview is not a moving-light
+animation on the normal double-buffer path. Native readback probes check
+interpolation and responses to changed lights outside timing. Perceived
+lighting quality still needs an engine experiment, especially for large flat
+triangles under moving point lights.
+
+Baked-light cases use procedural sample layers, not BSP data or a Quake map.
+The cached variant prepares lit colors before timing. Animated variants
+recombine one or four lightstyle layers and retain cached results when the
+style coefficients have not changed. The deterministic simulation advances
+one frame per work item, with a 10 Hz style tick every six simulated frames;
+it is not paced by wall-clock time. Positional light animation likewise uses
+the work-item sequence. The source material colors remain
+immutable; repeated updates do not multiply an already illuminated color.
+This is an approximation of the work involved in sampling and updating
+Quake lighting, not a complete implementation of its surface cache.
+
+Before each animated-style trial, the colors and style cache are reset to
+phase zero outside timing. The measured trial runs at least 24 work items
+and ends on a complete six-item tick. This ensures that even short trials
+exercise actual style changes, including the one-layer pattern's changes at
+items 12 and 18 (zero-based sequence). On slower hardware, this minimum work
+can extend a `-quick` trial beyond its requested minimum duration.
+
+The separate Quake-like dynamic-light cases combine baked illumination with
+a finite-radius, surface-distance lighting contribution on the CPU. They
+are intentionally identified separately from the Lambert comparison:
+Quake's world-light falloff does not include the same normal-dot-light
+factor or attenuation equation as XGL positional lighting. The synthetic
+surface axes, floating-point units and colored light gains are not Quake's
+integer lightmap grid or a claim of pixel-identical engine output. Neither these
+synthetic scenes nor fixed-function XGL lights reconstruct the visibility
+and shadow information stored in an actual Quake lightmap.
+
+There is no claim of a faithful single-pass baked-plus-XGL-dynamic hybrid.
+The desired composition is material color multiplied by the sum of baked
+and dynamic illumination. Lighting a color that already includes baked
+illumination instead modulates that baked result. The documented XGL model
+has ambient, diffuse and specular components, with no separate emissive
+material term to make this combination automatic. Any future hybrid that
+uses extra state changes or passes must include their cost.
+
+Compare CPU/XGL lighting using **completed `total_ms`**, which includes CPU
+evaluation, color conversion/upload or native light-state updates, drawing
+and completion. Comparing `render_ms` alone would omit the CPU work being
+considered for offload. Lighting facets/second also uses `total_ms`. Cached
+CPU lighting is a useful control: static lighting need not be recomputed
+every frame just because XGL can calculate it. The reported input payload
+includes the vertex colors and normals used by each path; smoother or
+hardware-lit variants can require more input data.
+
+These cases remain serialized, single-threaded batched-polygon tests. They
+do not extend the bounded streaming cases to every lighting mode. The
+device's reported lighting/shading support is a coarse capability indication,
+not proof that every selected light configuration runs entirely in Leo
+hardware. Unsupported or incorrect paths remain skipped results, and real
+Solaris/ZX measurements are required to establish a useful rendering choice.
+Successful cases can also carry a note, printed in the console and saved in
+the CSV `reason` field, such as a reported software-lighting fallback when
+fallback is allowed. Read that note before treating a result as an
+accelerated lighting measurement.
 
 ## Bounded single-thread streaming
 
@@ -291,6 +435,18 @@ measure the actual projection in perspective or animated-transform cases.
 the text report with the CSV to retain device/build metadata and
 interpretation.
 
+Lighting rows use `timing_mode=lighting-serialized`. The appended `shading`
+field distinguishes `flat` and `smooth`, while `lighting_model` identifies
+`none`, `baked`, `lambert` or `quake-like`. `lighting_compute` is `none`,
+`cpu` or `xgl`; smooth shading alone does not imply XGL illumination.
+`light_count` excludes ambient light, and `light_motion` is one only when
+the light changes with the work-item sequence. `style_layers` counts the
+source layers: cached baked and Quake-like lighting use one, and animated
+baked cases use one or four. `lighting_sample` is `none`, `centroid`,
+`vertices` or `device-vertex`, making the positional flat-lighting sample
+difference explicit. Compare rows with matching model and sample semantics
+before interpreting any timing ratio as an offload benefit.
+
 Repeated trials report a median and range. These describe the repeated-trial
 measurements, not a per-frame 95th/99th-percentile latency distribution.
 Run longer trials and more repeats when methods are close. Record compiler
@@ -321,12 +477,14 @@ On a development host without Solaris/XGL:
 make check
 ```
 
-This compiles geometry tests and a separate `build/xglbench-test` executable
-linked with `tests/test_backend.c`. That backend is a test double used for
-argument handling, case scheduling, resize sequencing, queue ownership and
-report/CSV checks. Its deferred-queue bookkeeping does not emulate a ZX. It
-identifies its output as **NO GRAPHICS / NO VALID
-HARDWARE PERFORMANCE DATA**. Its timing numbers have no graphics meaning.
+This compiles geometry and lighting-math tests, plus a separate
+`build/xglbench-test` executable linked with `tests/test_backend.c`. That
+backend is a test double used for argument handling, case scheduling,
+resize sequencing, queue ownership,
+lighting-state versus color updates, and report/CSV checks. Its deferred-queue
+bookkeeping does not emulate a ZX. It identifies its output as
+**NO GRAPHICS / NO VALID HARDWARE PERFORMANCE DATA**. Its timing numbers
+have no graphics meaning.
 It is never linked into the native `xglbench` executable.
 Fault injection also checks that a native completion error, exposure, user
 interruption, or unexpected resize cannot turn a partial trial into a valid
@@ -355,6 +513,10 @@ window buffering. See source comments for API-specific details. The OpenGL
 performance specification. The calibrated and streaming tests are informed
 by the supplied *Leo: A System for Cost Effective 3D Shaded Graphics*
 architectural whitepaper, especially printed pages 103-107.
+The illumination modes and positional-light attenuation are described in
+the Reference Manual, printed pages 101-103 and 312, and the Programmer's
+Guide, pages 398-403. The Quake-like comparison follows the surface-distance
+approach in `WinQuake/gl_rsurf.c`; it does not link engine code or load assets.
 
 The benchmark source is GPL-2.0-or-later. `COPYING` is duplicated from the
 repository's `gnu.txt`. All benchmark files and generated build artifacts

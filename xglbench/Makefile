@@ -21,9 +21,9 @@ else
 XGL_RPATH ?=
 endif
 
-COMMON = xglbench.c xglbench_scene.c xglbench_timer.c
+COMMON = xglbench.c xglbench_scene.c xglbench_lighting.c xglbench_timer.c
 NATIVE_OBJS = build/xglbench.o build/xglbench_scene.o \
-              build/xglbench_timer.o build/xglbench_xgl.o
+              build/xglbench_lighting.o build/xglbench_timer.o build/xglbench_xgl.o
 
 .PHONY: all native sdk-check check syntax-check clean
 all: native
@@ -57,15 +57,21 @@ build/test_timer: tests/test_timer.c xglbench_timer.c xglbench.h
 	$(CC) $(CPPFLAGS) $(API_CPPFLAGS) -I. $(CFLAGS) $(LANGFLAGS) $(WARNFLAGS) \
 	    -o $@ tests/test_timer.c xglbench_timer.c -lm
 
+build/test_lighting: tests/test_lighting.c xglbench_lighting.c xglbench_scene.c xglbench.h
+	@mkdir -p build
+	$(CC) $(CPPFLAGS) $(API_CPPFLAGS) -I. $(CFLAGS) $(LANGFLAGS) $(WARNFLAGS) \
+	    -o $@ tests/test_lighting.c xglbench_lighting.c xglbench_scene.c -lm
+
 # This executable tests scheduling and reports, not graphics performance.
 build/xglbench-test: $(COMMON) tests/test_backend.c xglbench.h
 	@mkdir -p build
 	$(CC) $(CPPFLAGS) $(API_CPPFLAGS) -I. $(CFLAGS) $(LANGFLAGS) $(WARNFLAGS) \
 	    -o $@ $(COMMON) tests/test_backend.c -lm
 
-check: build/test_scene build/test_timer build/xglbench-test
+check: build/test_scene build/test_timer build/test_lighting build/xglbench-test
 	./build/test_scene
 	./build/test_timer
+	./build/test_lighting
 	sh tests/test_cli.sh ./build/xglbench-test
 
 # Modern development host only. The contract headers are NOT the Sun SDK.

@@ -67,6 +67,35 @@ for mode in serialized streaming; do
     done
 done
 
+for path in cpu-flat cpu-smooth xgl-flat xgl-smooth; do
+    for light in directional point-1; do
+        for depth in 0 1 2; do
+            grep "lighting/matched/$path/$light/depth-$depth" "$test_dir/output" >/dev/null ||
+                fail "missing matched $path/$light/depth-$depth case"
+        done
+    done
+    for light in 2 4; do
+        grep "lighting/matched/$path/point-$light/depth-1" "$test_dir/output" >/dev/null ||
+            fail "missing matched $path/point-$light case"
+    done
+    grep "lighting/static/$path/directional/depth-1" "$test_dir/output" >/dev/null ||
+        fail "missing static $path case"
+    grep "lighting/area-100/$path/point-1" "$test_dir/output" >/dev/null ||
+        fail "missing controlled-area $path case"
+done
+for path in cpu-flat cpu-smooth; do
+    for styles in cached styles-1 styles-4; do
+        for depth in 0 1 2; do
+            grep "lighting/baked/$path/$styles/depth-$depth" "$test_dir/output" >/dev/null ||
+                fail "missing baked $path/$styles/depth-$depth case"
+        done
+    done
+    for lights in 1 2 4; do
+        grep "lighting/quake-like/$path/point-$lights/depth-1" "$test_dir/output" >/dev/null ||
+            fail "missing Quake-like $path/point-$lights case"
+    done
+done
+
 XB_TEST_LOG="$test_dir/default.log" "$bench" -quick -allow-fallback \
     -test submit/multi_polygon/batch-128 -triangles 8 -seconds .002 -warmup 0 \
     -repeats 1 -csv "$test_dir/default.csv" >"$test_dir/output" 2>&1
@@ -370,4 +399,213 @@ awk -F, '
     END { if (!record || !status || rows != 1 || bad) exit 1 }
 ' "$test_dir/drain-failure.csv" || fail "failed final drain produced a successful measurement"
 
-echo 'CLI tests: arguments, resize, calibrated cases, CSV, bounded queues, completion timing and fault rejection passed'
+# Lighting logs verify host scheduling and data ownership, not illumination
+# pixels. Native readback gates and the portable math tests cover those parts.
+check_lighting_log()
+{
+    awk -v hardware="$2" -v smooth="$3" -v updates="$4" '
+        /^lighting-configure / { if (!$2 || $3 != smooth) bad++; cases++ }
+        /^lighting-compute / { if ($2 != hardware) bad++ }
+        /^lighting-colors / {
+            if (hardware || $2 != smooth) bad++
+            colors++; changed+=$3
+        }
+        /^lighting-update / { if (!hardware) bad++; lights++ }
+        /^lighting-error / { bad++ }
+        END {
+            if (bad || cases != 1) exit 1
+            if (!updates && (colors || lights)) exit 1
+            if (updates && hardware && !lights) exit 1
+            if (updates && !hardware && (!colors || !changed)) exit 1
+        }
+    ' "$1" || fail "lighting path used incorrect updates, payloads or cached data"
+}
+
+check_lighting_csv()
+{
+    awk -F, -v path="$2" -v count="$3" -v model="$4" -v motion="$5" -v styles="$6" '
+        NR == 1 {
+            for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+            record=col["record"]; status=col["status"]; total=col["total_ms"]
+            facets=col["triangles"]; rate=col["triangles_per_second"]
+            shade=col["shading"]; equation=col["lighting_model"]; cpu=col["lighting_compute"]
+            lights=col["light_count"]; moving=col["light_motion"]; layers=col["style_layers"]
+            sample=col["lighting_sample"]; mode=col["timing_mode"]; payload=col["input_payload_bytes"]
+            next
+        }
+        {
+            smooth=path ~ /smooth/; hardware=path ~ /^xgl/
+            sampling=smooth ? "vertices" : (hardware ? "device-vertex" : "centroid")
+            expected_shade=smooth ? "smooth" : "flat"
+            expected_compute=hardware ? "xgl" : "cpu"
+            if ($status != "ok" || $shade != expected_shade || $equation != model ||
+                $cpu != expected_compute || $lights != count || $moving != motion ||
+                $layers != styles || $sample != sampling || $mode != "lighting-serialized" ||
+                $payload <= 0 || $total <= 0) bad++
+            expected=$facets*1000/$total
+            if ($rate < expected*.999 || $rate > expected*1.001) bad++
+            rows++
+        }
+        END {
+            if (!record || !status || !total || !facets || !rate || !shade || !equation ||
+                !cpu || !lights || !moving || !layers || !sample || !mode || !payload ||
+                rows != 2 || bad) exit 1
+        }
+    ' "$1" || fail "lighting CSV mislabeled equation, shading, sample location or completed rate"
+}
+
+for path in cpu-flat cpu-smooth xgl-flat xgl-smooth; do
+    case "$path" in xgl-*) hardware=1 ;; *) hardware=0 ;; esac
+    case "$path" in *smooth) smooth=1 ;; *) smooth=0 ;; esac
+    for light in directional point-1 point-2 point-4; do
+        case "$light" in point-2) lights=2 ;; point-4) lights=4 ;; *) lights=1 ;; esac
+        log="$test_dir/lighting-$path-$light.log"
+        csv="$test_dir/lighting-$path-$light.csv"
+        XB_TEST_LOG="$log" "$bench" -winsize 320 240 -allow-fallback \
+            -test "lighting/matched/$path/$light/depth-1" -triangles 8 \
+            -seconds .005 -warmup 0 -repeats 1 -csv "$csv" >"$test_dir/output" 2>&1
+        check_lighting_log "$log" "$hardware" "$smooth" 1
+        check_lighting_csv "$csv" "$path" "$lights" lambert 1 0
+    done
+    log="$test_dir/static-$path.log"
+    csv="$test_dir/static-$path.csv"
+    XB_TEST_LOG="$log" "$bench" -winsize 320 240 -allow-fallback \
+        -test "lighting/static/$path/directional/depth-1" -triangles 8 \
+        -seconds .001 -warmup 0 -repeats 1 -csv "$csv" >"$test_dir/output" 2>&1
+    check_lighting_log "$log" "$hardware" "$smooth" 0
+    check_lighting_csv "$csv" "$path" 1 lambert 0 0
+done
+
+# New lit geometry preserves the requested pixel area while its Z surface and
+# normals vary. Both resolutions must still report the same geometric area.
+"$bench" -allow-fallback -test lighting/area-100/ -triangles 8 \
+    -seconds .001 -warmup 0 -repeats 1 -csv "$test_dir/lit-area.csv" \
+    >"$test_dir/output" 2>&1
+awk -F, '
+    NR == 1 {
+        for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+        status=col["status"]; record=col["record"]; width=col["width"]
+        average=col["nominal_area_mean_px"]; low=col["nominal_area_min_px"]; high=col["nominal_area_max_px"]
+        next
+    }
+    $record == "summary" {
+        if ($status != "ok" || $average < 99.99 || $average > 100.01 ||
+            $low < 99.99 || $high > 100.01) bad++
+        if ($width == 320) small++
+        else if ($width == 640) large++
+        else bad++
+    }
+    END { if (!status || !record || !width || !average || !low || !high || small != 4 || large != 4 || bad) exit 1 }
+' "$test_dir/lit-area.csv" || fail "lighting geometry changed calibrated area or resolution labels"
+
+
+# Payloads include smooth per-vertex colors and hardware normals. Equal
+# triangle counts must not imply identical referenced native input sizes.
+awk -F, '
+    FNR == 1 {
+        for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+        record=col["record"]; payload=col["input_payload_bytes"]
+        shade=col["shading"]; cpu=col["lighting_compute"]
+        next
+    }
+    $record == "summary" { bytes[$cpu "/" $shade]=$payload }
+    END {
+        if (!(bytes["cpu/smooth"] > bytes["cpu/flat"] &&
+              bytes["xgl/flat"] > bytes["cpu/flat"] &&
+              bytes["xgl/smooth"] > bytes["cpu/smooth"])) exit 1
+    }
+' "$test_dir"/static-*.csv || fail "lighting input estimates omitted vertex colors or normals"
+
+for path in cpu-flat cpu-smooth; do
+    case "$path" in *smooth) smooth=1 ;; *) smooth=0 ;; esac
+    for styles in cached styles-1 styles-4; do
+        case "$styles" in cached) updates=0; layers=1 ;; styles-1) updates=1; layers=1 ;; *) updates=1; layers=4 ;; esac
+        log="$test_dir/baked-$path-$styles.log"
+        csv="$test_dir/baked-$path-$styles.csv"
+        XB_TEST_LOG="$log" "$bench" -winsize 320 240 -allow-fallback \
+            -test "lighting/baked/$path/$styles/depth-1" -triangles 8 \
+            -seconds .05 -warmup 0 -repeats 1 -csv "$csv" >"$test_dir/output" 2>&1
+        check_lighting_log "$log" 0 "$smooth" "$updates"
+        check_lighting_csv "$csv" "$path" 0 baked 0 "$layers"
+    done
+    log="$test_dir/quake-$path.log"
+    csv="$test_dir/quake-$path.csv"
+    XB_TEST_LOG="$log" "$bench" -winsize 320 240 -allow-fallback \
+        -test "lighting/quake-like/$path/point-2/depth-1" -triangles 8 \
+        -seconds .005 -warmup 0 -repeats 1 -csv "$csv" >"$test_dir/output" 2>&1
+    check_lighting_log "$log" 0 "$smooth" 1
+    check_lighting_csv "$csv" "$path" 2 quake-like 1 1
+done
+
+# Every animated-style trial must reach real 10 Hz style changes, even when a
+# draw itself exceeds the requested duration. Reuse the mock's existing
+# pre-fault delay with an unreachable fault index; no error is injected.
+XB_TEST_LOG="$test_dir/style-minimum.log" XB_TEST_FAULT=native-error \
+    XB_TEST_FAULT_DRAW=1000000 "$bench" -winsize 320 240 -allow-fallback \
+    -test lighting/baked/cpu-flat/styles-1/depth-0 -triangles 8 \
+    -seconds .001 -warmup 0 -repeats 2 -csv "$test_dir/style-minimum.csv" \
+    >"$test_dir/output" 2>&1
+check_lighting_log "$test_dir/style-minimum.log" 0 0 1
+awk -F, '
+    NR == 1 {
+        for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+        record=col["record"]; status=col["status"]; frames=col["frames_all_trials"]
+        next
+    }
+    {
+        if ($status != "ok" || $frames < 48 || $frames % 6 != 0) bad++
+        if ($record == "trial") trials++
+        else if ($record == "summary") summaries++
+        else bad++
+    }
+    END { if (!record || !status || !frames || trials != 2 || summaries != 1 || bad) exit 1 }
+' "$test_dir/style-minimum.csv" || fail "short animated-style trials omitted a complete changing tick"
+awk '
+    /^lighting-colors / { updates++; changed+=$3 }
+    /^native-error / { bad++ }
+    END { if (updates < 4 || changed < 4 || bad) exit 1 }
+' "$test_dir/style-minimum.log" || fail "short repeated style trials exercised only cached colors"
+
+XB_TEST_LOG="$test_dir/style-cached-control.log" XB_TEST_FAULT=native-error \
+    XB_TEST_FAULT_DRAW=1000000 "$bench" -winsize 320 240 -allow-fallback \
+    -test lighting/baked/cpu-flat/cached/depth-0 -triangles 8 \
+    -seconds .001 -warmup 0 -repeats 2 >"$test_dir/output" 2>&1
+check_lighting_log "$test_dir/style-cached-control.log" 0 0 0
+
+
+for mode in native-error resize expose interrupt; do
+    fault_case "$mode" lighting/matched/xgl-smooth/point-1/depth-1 5
+done
+
+check_lighting_rejected()
+{
+    awk -F, '
+        NR == 1 {
+            for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+            record=col["record"]; status=col["status"]
+            next
+        }
+        { if ($record != "summary" || $status != "skipped") bad++; rows++ }
+        END { if (!record || !status || rows != 1 || bad) exit 1 }
+    ' "$1" || fail "failed lighting operation produced a successful measurement"
+}
+
+if XB_TEST_FAIL_LIGHT_UPDATE=2 "$bench" -winsize 320 240 -allow-fallback \
+    -test lighting/matched/xgl-flat/point-1/depth-1 -triangles 8 \
+    -seconds .001 -warmup 0 -repeats 1 -csv "$test_dir/light-update-failure.csv" \
+    >"$test_dir/output" 2>&1; then
+    fail "failed light-state update reported success"
+fi
+grep 'injected light-state update failure' "$test_dir/output" >/dev/null || fail "light-state failure reason lost"
+check_lighting_rejected "$test_dir/light-update-failure.csv"
+
+if XB_TEST_FAIL_LIGHTING=1 "$bench" -winsize 320 240 -allow-fallback \
+    -test lighting/matched/xgl-smooth/point-1/depth-1 -triangles 8 \
+    -seconds .001 -warmup 0 -repeats 1 -csv "$test_dir/light-validation-failure.csv" \
+    >"$test_dir/output" 2>&1; then
+    fail "failed lighting readback reported success"
+fi
+grep 'injected lighting readback validation failure' "$test_dir/output" >/dev/null || fail "lighting validation failure reason lost"
+check_lighting_rejected "$test_dir/light-validation-failure.csv"
+
+echo 'CLI tests: arguments, resize, calibrated cases, queues, lighting/shading reports, update paths and fault rejection passed'

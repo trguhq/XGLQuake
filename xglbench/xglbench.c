@@ -7,13 +7,13 @@
 #include <string.h>
 #include <sys/utsname.h>
 
-#define XB_MAX_CASES 96
+#define XB_MAX_CASES 192
 static int xb_quit;
 
 static void usage(FILE *f)
 {
     fprintf(f,
-        "xglbench " XB_VERSION " - native Sun XGL flat-color benchmark\n"
+        "xglbench " XB_VERSION " - native Sun XGL geometry and lighting benchmark\n"
         "Usage: xglbench [options]\n"
         "  -winsize W H       Run only this drawable size (default: 320x240, 640x480)\n"
         "  -seconds S         Minimum elapsed time per trial (default 1)\n"
@@ -126,14 +126,30 @@ static xb_case *add_case(xb_case *cases, int *count, const char *name)
     return c;
 }
 
+static void add_lighting_case(xb_case *cases, int *count, const char *name,
+                              int path, enum xb_light_model model, int lights,
+                              int directional, int moving, int styles,
+                              int depth, double area)
+{
+    xb_case *c;
+    c = add_case(cases, count, name);
+    c->shade = path & 1 ? XB_SMOOTH : XB_FLAT;
+    c->xgl_lighting = path >= 2;
+    c->lighting = model;
+    c->lights = lights; c->directional = directional; c->moving = moving;
+    c->styles = styles; c->depth = depth; c->area = area; c->aspect = 1;
+    if (moving || styles) c->update = XB_LIGHT_UPDATE;
+}
+
 static int make_cases(xb_case *cases)
 {
-    int n, m, b, d, z, i, mode, update;
+    int n, m, b, d, z, i, mode, update, path, styles, lights;
     int batches[4];
     int areas[6];
     char name[80];
     xb_case *c;
     const char *sizes[3];
+    const char *paths[4];
     float scale[3];
     n = 0;
     batches[0] = 8; batches[1] = 32; batches[2] = 128; batches[3] = 512;
@@ -216,6 +232,40 @@ static int make_cases(xb_case *cases)
             }
         }
     }
+    paths[0] = "cpu-flat"; paths[1] = "cpu-smooth";
+    paths[2] = "xgl-flat"; paths[3] = "xgl-smooth";
+    for (path = 0; path < 2; ++path) {
+        for (d = 0; d <= 2; ++d) {
+            sprintf(name, "lighting/baked/%s/cached/depth-%d", paths[path], d);
+            add_lighting_case(cases, &n, name, path, XB_LIGHT_BAKED, 0, 0, 0, 0, d, 0);
+            for (styles = 1; styles <= 4; styles += 3) {
+                sprintf(name, "lighting/baked/%s/styles-%d/depth-%d", paths[path], styles, d);
+                add_lighting_case(cases, &n, name, path, XB_LIGHT_BAKED, 0, 0, 0, styles, d, 0);
+            }
+        }
+    }
+    for (path = 0; path < 4; ++path) {
+        for (d = 0; d <= 2; ++d) {
+            sprintf(name, "lighting/matched/%s/directional/depth-%d", paths[path], d);
+            add_lighting_case(cases, &n, name, path, XB_LIGHT_LAMBERT, 1, 1, 1, 0, d, 0);
+            sprintf(name, "lighting/matched/%s/point-1/depth-%d", paths[path], d);
+            add_lighting_case(cases, &n, name, path, XB_LIGHT_LAMBERT, 1, 0, 1, 0, d, 0);
+        }
+        for (lights = 2; lights <= 4; lights += 2) {
+            sprintf(name, "lighting/matched/%s/point-%d/depth-1", paths[path], lights);
+            add_lighting_case(cases, &n, name, path, XB_LIGHT_LAMBERT, lights, 0, 1, 0, 1, 0);
+        }
+        sprintf(name, "lighting/static/%s/directional/depth-1", paths[path]);
+        add_lighting_case(cases, &n, name, path, XB_LIGHT_LAMBERT, 1, 1, 0, 0, 1, 0);
+        sprintf(name, "lighting/area-100/%s/point-1", paths[path]);
+        add_lighting_case(cases, &n, name, path, XB_LIGHT_LAMBERT, 1, 0, 1, 0, 0, 100);
+    }
+    for (path = 0; path < 2; ++path) {
+        for (lights = 1; lights <= 4; lights *= 2) {
+            sprintf(name, "lighting/quake-like/%s/point-%d/depth-1", paths[path], lights);
+            add_lighting_case(cases, &n, name, path, XB_LIGHT_QUAKE, lights, 0, 1, 0, 1, 0);
+        }
+    }
     return n;
 }
 
@@ -224,9 +274,9 @@ static int build_mesh(xb_mesh *mesh, const xb_options *o, const xb_case *c,
 {
     int ok;
     size_t i;
-    if (c->area > 0) return xb_mesh_build_calibrated(mesh, o->base_triangles,
-                                                  width, height, c->area, c->aspect);
-    if (c->connected) ok = xb_mesh_build_connected(mesh, o->base_triangles, c->depth);
+    if (c->area > 0) ok = xb_mesh_build_calibrated(mesh, o->base_triangles,
+                                                 width, height, c->area, c->aspect);
+    else if (c->connected) ok = xb_mesh_build_connected(mesh, o->base_triangles, c->depth);
     else ok = xb_mesh_build(mesh, o->base_triangles, c->depth, c->size, c->overdraw);
     if (ok && c->reverse) ok = xb_mesh_reverse_draw_order(mesh);
     if (ok && c->clipping) {
@@ -234,6 +284,10 @@ static int build_mesh(xb_mesh *mesh, const xb_options *o, const xb_case *c,
             mesh->points[i].z = (mesh->points[i].x + .2f) * .8f;
         for (i = 0; i < mesh->strip_point_count; ++i)
             mesh->strip_points[i].z = (mesh->strip_points[i].x + .2f) * .8f;
+    }
+    if (ok && c->lighting != XB_LIGHT_OFF && !xb_lighting_init(mesh, c)) {
+        xb_mesh_free(mesh);
+        return 0;
     }
     return ok;
 }
@@ -244,7 +298,8 @@ static int one_frame(const xb_options *o, const xb_case *c, xb_mesh *mesh,
                      unsigned long sequence, xb_frame *f)
 {
     double start, prepared, render_start, rendered, end;
-    int width, height;
+    int width, height, changes;
+    xb_light_state state;
     memset(f, 0, sizeof(*f));
     start = xb_now();
     if (c->update == XB_REBUILD) {
@@ -255,6 +310,11 @@ static int one_frame(const xb_options *o, const xb_case *c, xb_mesh *mesh,
         xb_backend_colors(mesh);
     } else if (c->update == XB_TRANSFORM) {
         xb_backend_transform(sequence);
+    } else if (c->update == XB_LIGHT_UPDATE) {
+        changes = xb_lighting_update(mesh, c, sequence, &state);
+        if (changes < 0) return 0;
+        if (changes & XB_UPDATE_COLORS) xb_backend_colors(mesh);
+        if ((changes & XB_UPDATE_LIGHTS) && !xb_backend_lighting(&state)) return 0;
     }
     prepared = xb_now();
     if (c->work == XB_DRAW || c->work == XB_RASTER || c->work == XB_MASKED_RASTER) {
@@ -426,11 +486,13 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
 {
     xb_mesh mesh;
     xb_frame f;
+    xb_light_state state;
     double start, cpu, sum, prep, render, present;
     unsigned long frames, sequence;
-    int trial, uses_mesh, preview;
+    int trial, uses_mesh, preview, style_changes, animated_styles;
     const xb_case *c;
     c = &r->test;
+    animated_styles = c->lighting == XB_LIGHT_BAKED && c->styles > 0;
     memset(&mesh, 0, sizeof(mesh));
     uses_mesh = c->work == XB_DRAW || c->work == XB_FRAME || c->work == XB_PIPELINE;
     if (uses_mesh && !valid[c->method]) {
@@ -482,21 +544,34 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
     do {
         if (!events(r)) goto done;
         if (!one_frame(o, c, &mesh, sequence++, &f)) {
-            strcpy(r->reason, "warm-up geometry/native buffer allocation failed"); goto done;
+            backend_reason(r, "warm-up preparation/native submission failed"); goto done;
         }
     } while (xb_now() - start < o->warmup);
     for (trial = 0; trial < o->repeats; ++trial) {
+        if (c->lighting != XB_LIGHT_OFF) sequence = 0;
+        if (animated_styles) {
+            /* Every trial starts with the same style cache. Otherwise the
+             * final warm-up/timed phase can add a spurious reset upload. */
+            style_changes = xb_lighting_update(&mesh, c, 0, &state);
+            if (style_changes < 0) {
+                backend_reason(r, "resetting lightstyle cache failed"); goto done;
+            }
+            if (style_changes & XB_UPDATE_COLORS) xb_backend_colors(&mesh);
+            xb_backend_sync();
+            if (!events(r)) goto done;
+        }
         frames = 0; sum = 0; prep = 0; render = 0; present = 0;
         cpu = xb_cpu_now(); start = xb_now();
         do {
             if (!events(r)) goto done;
             if (!one_frame(o, c, &mesh, sequence++, &f)) {
-                strcpy(r->reason, "geometry/native buffer allocation failed"); goto done;
+                backend_reason(r, "preparation/native submission failed"); goto done;
             }
             ++frames;
             sum += f.total; prep += f.prepare; render += f.render; present += f.present;
             r->calls = f.calls;
-        } while (frames < 3 || xb_now() - start < o->seconds);
+        } while (frames < (unsigned long)(animated_styles ? 24 : 3) ||
+                 xb_now() - start < o->seconds || (animated_styles && frames % 6));
         /* A fault in the final draw/flush must not turn into a successful trial. */
         if (!events(r)) goto done;
         r->cpu[trial] = (xb_cpu_now() - cpu) / (double)frames;
@@ -528,6 +603,34 @@ static void csv_text(FILE *f, const char *s)
     fputc('"', f);
 }
 
+static const char *lighting_name(const xb_case *c)
+{
+    switch (c->lighting) {
+    case XB_LIGHT_BAKED: return "baked";
+    case XB_LIGHT_LAMBERT: return "lambert";
+    case XB_LIGHT_QUAKE: return "quake-like";
+    default: return "none";
+    }
+}
+
+static const char *lighting_compute(const xb_case *c)
+{
+    return c->lighting == XB_LIGHT_OFF ? "none" : (c->xgl_lighting ? "xgl" : "cpu");
+}
+
+static const char *lighting_sample(const xb_case *c)
+{
+    if (c->lighting == XB_LIGHT_OFF) return "none";
+    if (c->shade == XB_SMOOTH) return "vertices";
+    return c->xgl_lighting ? "device-vertex" : "centroid";
+}
+
+static int style_layers(const xb_case *c)
+{
+    if (c->lighting == XB_LIGHT_BAKED) return c->styles ? c->styles : 1;
+    return c->lighting == XB_LIGHT_QUAKE ? 1 : 0;
+}
+
 static void csv_row(FILE *f, const xb_result *r, const char *record, int trial,
                     double total, double prep, double render, double present, double cpu)
 {
@@ -535,7 +638,7 @@ static void csv_row(FILE *f, const xb_result *r, const char *record, int trial,
     int pipeline;
     if (!f) return;
     pipeline = r->test.work == XB_PIPELINE;
-    duration = pipeline ? total : render;
+    duration = pipeline || r->test.lighting != XB_LIGHT_OFF ? total : render;
     rate = r->triangles && duration > 0 ? (double)r->triangles / duration : 0;
     enqueue = drain = 0;
     if (r->passed && pipeline) {
@@ -554,10 +657,14 @@ static void csv_row(FILE *f, const xb_result *r, const char *record, int trial,
     if (!pipeline) fprintf(f, "%.9f", render * 1000);
     fprintf(f, ",%.9f,%.9f,%.3f,", present * 1000, cpu * 1000, rate);
     csv_text(f, r->reason);
-    fprintf(f, ",%s,%d,%lu,%lu,%.9f,%.9f,%.6f,%.6f,%.6f,%lu\n",
-        pipeline ? (r->test.streaming ? "pipeline-streaming" : "pipeline-serialized") : "serialized",
+    fprintf(f, ",%s,%d,%lu,%lu,%.9f,%.9f,%.6f,%.6f,%.6f,%lu,",
+        pipeline ? (r->test.streaming ? "pipeline-streaming" : "pipeline-serialized") :
+            (r->test.lighting != XB_LIGHT_OFF ? "lighting-serialized" : "serialized"),
         r->queue_limit, r->max_outstanding, r->drains, enqueue * 1000, drain * 1000,
         r->area_mean, r->area_min, r->area_max, (unsigned long)r->input_bytes);
+    fprintf(f, "%s,%s,%s,%d,%d,%d,%s\n", r->test.shade == XB_SMOOTH ? "smooth" : "flat",
+        lighting_name(&r->test), lighting_compute(&r->test), r->test.lights,
+        r->test.moving, style_layers(&r->test), lighting_sample(&r->test));
 }
 
 static void print_result(FILE *csv, const xb_result *r)
@@ -570,12 +677,14 @@ static void print_result(FILE *csv, const xb_result *r)
         csv_row(csv, r, "summary", -1, 0, 0, 0, 0, 0);
         return;
     }
-    duration = r->test.work == XB_PIPELINE ? r->median : r->render_median;
+    duration = r->test.work == XB_PIPELINE || r->test.lighting != XB_LIGHT_OFF ?
+               r->median : r->render_median;
     rate = r->triangles && duration > 0 ? (double)r->triangles / duration : 0;
     printf("%-38s %9.3f %9.3f ", r->test.name, r->median * 1000, r->prep_median * 1000);
     if (r->test.work == XB_PIPELINE) printf("%9s ", "n/a");
     else printf("%9.3f ", r->render_median * 1000);
     printf("%9.3f %10.0f %6lu\n", r->present_median * 1000, rate, (unsigned long)r->calls);
+    if (*r->reason) printf("  note: %s\n", r->reason);
     unit = r->test.work == XB_PIPELINE ? "item" : "frame";
     printf("  trial-mean range %.3f..%.3f ms; %lu %ss, %lu facets/%s, "
            "%.1f KiB portable mesh, CPU %.3f ms/%s\n",
@@ -589,6 +698,16 @@ static void print_result(FILE *csv, const xb_result *r)
                "%lu timed drains; no swaps\n",
             xb_median(r->enqueue, r->samples) * 1000, xb_median(r->drain, r->samples) * 1000,
             r->max_outstanding, r->queue_limit, r->drains);
+    if (r->test.lighting != XB_LIGHT_OFF) {
+        printf("  %s %s lighting; %s; %d %s light(s)%s; %d style layer(s); samples %s\n",
+            lighting_compute(&r->test), lighting_name(&r->test),
+            r->test.shade == XB_SMOOTH ? "smooth vertex colors" : "flat facet colors",
+            r->test.lights, r->test.moving ? "moving" : "fixed",
+            r->test.lighting == XB_LIGHT_LAMBERT ? " + ambient" : "",
+            style_layers(&r->test),
+            lighting_sample(&r->test));
+        printf("  lighting facets/sec uses total_ms (CPU preparation + reset + completed draw).\n");
+    }
     for (i = 0; i < r->samples; ++i)
         csv_row(csv, r, "trial", i + 1, r->total[i], r->prepare[i],
                 r->render[i], r->present[i], r->cpu[i]);
@@ -608,7 +727,7 @@ static const xb_result *find_result(const xb_result *r, int count,
 
 static void findings(const xb_result *r, int count, int width, int height)
 {
-    int i, d, update;
+    int i, d, update, shade, lights;
     const xb_result *best, *poly, *connected, *a, *b;
     char name[80];
     double ratio;
@@ -689,6 +808,40 @@ static void findings(const xb_result *r, int count, int width, int height)
                     b->median * 1000, a->median * 1000);
         }
     }
+    for (shade = 0; shade < 2; ++shade) {
+        for (lights = 0; lights <= 4; ++lights) {
+            if (lights == 3) continue;
+            if (lights == 0)
+                sprintf(name, "lighting/matched/cpu-%s/directional/depth-1", shade ? "smooth" : "flat");
+            else sprintf(name, "lighting/matched/cpu-%s/point-%d/depth-1", shade ? "smooth" : "flat", lights);
+            a = find_result(r, count, width, height, name);
+            if (lights == 0)
+                sprintf(name, "lighting/matched/xgl-%s/directional/depth-1", shade ? "smooth" : "flat");
+            else sprintf(name, "lighting/matched/xgl-%s/point-%d/depth-1", shade ? "smooth" : "flat", lights);
+            b = find_result(r, count, width, height, name);
+            if (a && b && b->median > 0) {
+                printf("  Lambert %s, %d %s light(s), depth 1: XGL %.2fx CPU total throughput\n"
+                       "    (%.3f vs %.3f ms, including light/color update costs).\n",
+                    shade ? "smooth" : "flat", lights ? lights : 1,
+                    lights ? "positional" : "directional", a->median / b->median,
+                    b->median * 1000, a->median * 1000);
+                if (lights && !shade)
+                    printf("    Flat positional samples differ: CPU centroid, XGL device-selected vertex.\n");
+            }
+        }
+        sprintf(name, "lighting/baked/cpu-%s/cached/depth-1", shade ? "smooth" : "flat");
+        a = find_result(r, count, width, height, name);
+        sprintf(name, "lighting/baked/cpu-%s/styles-4/depth-1", shade ? "smooth" : "flat");
+        b = find_result(r, count, width, height, name);
+        if (a && b && a->median > 0)
+            printf("  Baked %s: animated four-layer/cached total-time ratio %.2f (different layer workloads).\n",
+                shade ? "smooth" : "flat", b->median / a->median);
+    }
+    a = find_result(r, count, width, height, "lighting/baked/cpu-flat/cached/depth-1");
+    b = find_result(r, count, width, height, "lighting/baked/cpu-smooth/cached/depth-1");
+    if (a && b && a->median > 0)
+        printf("  Cached baked smooth/flat total-time ratio %.2f; compare lighting gradients visually.\n",
+            b->median / a->median);
     for (d = 0; d <= 2; ++d) {
         sprintf(name, "frame/relight/depth-%d", d);
         a = find_result(r, count, width, height, name);
@@ -756,7 +909,8 @@ int main(int argc, char **argv)
                      "triangles,calls,mesh_bytes,frames_all_trials,total_ms,prepare_ms,render_ms,"
                      "present_ms,cpu_ms,triangles_per_second,reason,");
         fprintf(csv, "timing_mode,queue_limit,max_queued,drain_calls,enqueue_ms,drain_ms,"
-                     "nominal_area_mean_px,nominal_area_min_px,nominal_area_max_px,input_payload_bytes\n");
+                     "nominal_area_mean_px,nominal_area_min_px,nominal_area_max_px,input_payload_bytes,");
+        fprintf(csv, "shading,lighting_model,lighting_compute,light_count,light_motion,style_layers,lighting_sample\n");
     }
     results = (xb_result *)calloc(XB_MAX_RESULTS, sizeof(*results));
     if (!results) { if (csv) fclose(csv); fprintf(stderr, "Out of memory.\n"); return 1; }
@@ -764,7 +918,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "XGL setup failed: %s\n", xb_backend_error());
         xb_backend_close(); free(results); if (csv) fclose(csv); return 1;
     }
-    printf("xglbench " XB_VERSION " - native XGL flat-color pipeline investigation\n");
+    printf("xglbench " XB_VERSION " - native XGL geometry and lighting investigation\n");
     if (uname(&host) == 0)
         printf("Host: %s %s %s %s\n", host.nodename, host.sysname, host.release, host.machine);
     printf("Build: %s %s; pointer %lu bytes; float %lu bytes\n", __DATE__, __TIME__,
@@ -772,7 +926,7 @@ int main(int argc, char **argv)
     xb_backend_info(stdout);
     printf("Settings: %d base triangles; %.3f seconds/trial; %d repeats; %.3f seconds warm-up; queue %d\n",
         o.base_triangles, o.seconds, o.repeats, o.warmup, o.queue);
-    printf("Texture sampling is CPU-only; XGL receives positions and flat RGB facet colors.\n"
+    printf("Texture sampling is CPU-only; XGL receives material/final RGB, positions and optional normals.\n"
            "All timed rendering waits for completion. No result is a GPU-only timer.\n"
            "Totals include reset clears; draw render_ms excludes the reset. frame/* includes\n"
            "clear+draw+masked HUD in render_ms and swap in present_ms. Their event polling is untimed.\n");
@@ -793,8 +947,19 @@ int main(int argc, char **argv)
            "Input payload estimates exclude descriptors/driver packing; they are not measured\n"
            "SBus or DMA traffic. Posting or retaining arrays does not prove DMA is active.\n");
     printf("Whitepaper context: 210K isolated 100px lit Gouraud/Z/depth-cued triangles/sec\n"
-           "was a VRAM-limited historical result. These flat tests do not reproduce that\n"
+           "was a VRAM-limited historical result. These tests do not reproduce that exact\n"
            "workload; treat it as context, not an expected result or a pass/fail threshold.\n");
+    printf("Lighting cases separate CPU flat/smooth colors from XGL facet/vertex illumination.\n"
+           "Smooth colors interpolate lighting while preserving each triangle's material color.\n"
+           "Compare completed total_ms: XGL light-state changes and CPU recoloring are preparation.\n"
+           "Lighting facets/sec also uses total_ms. Point-lit flat pairs share equations but\n"
+           "not sample locations (CPU centroid vs device-chosen XGL vertex).\n");
+    printf("Lambert tests use ambient+diffuse only; Quake-like radius falloff is a separate model.\n"
+           "Baked/style samples are procedural. No BSP loading or baked+XGL-light hybrid is implied.\n"
+           "Lightstyles use deterministic 10Hz simulation ticks at six work items/tick, not wall time.\n"
+           "Normals and sample caches are built before timing; updated RGB/native light state is timed.\n");
+    printf("Animated-style trials reset their cache before timing, run at least 24 items,\n"
+           "and finish a six-item tick so even short trials exercise actual color changes.\n");
     if (!xb_backend_has_hardware())
         printf("FALLBACK/TEST RUN: results do not establish the accelerated ZX performance path.\n");
     nresult = 0; successes = 0;

@@ -5,8 +5,10 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define XB_VERSION "0.2"
+#define XB_VERSION "0.3"
 #define XB_MAX_QUEUE 8
+#define XB_MAX_LIGHTS 4
+#define XB_STYLE_LAYERS 4
 #define XB_MAX_RESULTS 512
 #define XB_MAX_REPEATS 31
 #define XB_METHODS 4
@@ -22,12 +24,32 @@ typedef struct {
     xb_rgb *base_colors;
     xb_strip *strips;
     size_t bytes;
+    /* Optional lighting data. Material RGB stays constant across each facet;
+     * smooth variants interpolate lighting without blending material edges. */
+    xb_point *facet_normals, *vertex_normals, *centers;
+    xb_rgb *vertex_colors;
+    float *facet_styles, *vertex_styles;
+    float style_weights[XB_STYLE_LAYERS];
+    int lighting_ready, style_cache_valid;
 } xb_mesh;
 
 enum xb_method { XB_POLYGON, XB_MULTI, XB_TLIST, XB_STRIP };
 enum xb_work { XB_DRAW, XB_COLOR_CLEAR, XB_DEPTH_CLEAR, XB_SWAP,
                XB_RASTER, XB_MASKED_RASTER, XB_FRAME, XB_PIPELINE };
-enum xb_update { XB_STATIC, XB_TRANSFORM, XB_COLORS, XB_REBUILD };
+enum xb_update { XB_STATIC, XB_TRANSFORM, XB_COLORS, XB_REBUILD, XB_LIGHT_UPDATE };
+enum xb_shade { XB_FLAT, XB_SMOOTH };
+enum xb_light_model { XB_LIGHT_OFF, XB_LIGHT_BAKED, XB_LIGHT_LAMBERT, XB_LIGHT_QUAKE };
+
+typedef struct {
+    int count, directional;
+    float ambient, attenuation1, attenuation2;
+    xb_point direction, position[XB_MAX_LIGHTS];
+    xb_rgb color[XB_MAX_LIGHTS];
+    float radius[XB_MAX_LIGHTS];
+} xb_light_state;
+
+#define XB_UPDATE_COLORS 1
+#define XB_UPDATE_LIGHTS 2
 
 typedef struct {
     char name[80];
@@ -38,6 +60,9 @@ typedef struct {
     int streaming;
     float size;
     double area, aspect; /* positive area requests calibrated projected geometry */
+    enum xb_shade shade;
+    enum xb_light_model lighting;
+    int xgl_lighting, lights, directional, styles, moving;
 } xb_case;
 
 typedef struct {
@@ -81,6 +106,17 @@ void xb_mesh_colors(xb_mesh *mesh, unsigned long frame);
 size_t xb_mesh_expected_triangles(int base_triangles, int depth);
 const char *xb_method_name(enum xb_method method);
 
+/* Lighting uses procedural samples, not BSP assets or XGL texture objects.
+ * Init owns optional mesh arrays and builds phase-zero colors. Update returns
+ * XB_UPDATE_* flags, zero for a cached result, or -1 on invalid input. */
+int xb_lighting_init(xb_mesh *mesh, const xb_case *test);
+int xb_lighting_update(xb_mesh *mesh, const xb_case *test,
+                       unsigned long sequence, xb_light_state *state);
+void xb_lighting_state(const xb_case *test, unsigned long sequence,
+                       xb_light_state *state);
+xb_rgb xb_lighting_evaluate(const xb_light_state *state, const xb_point *position,
+                            const xb_point *normal, const xb_rgb *material);
+
 /* Time is elapsed wall time; gethrtime() on Solaris. CPU includes user+system. */
 double xb_now(void);
 double xb_cpu_now(void);
@@ -97,6 +133,7 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
                          char *reason, size_t size);
 int xb_backend_upload(const xb_mesh *mesh);
 void xb_backend_colors(const xb_mesh *mesh);
+int xb_backend_lighting(const xb_light_state *state);
 void xb_backend_transform(unsigned long frame);
 void xb_backend_clear(int color, int depth);
 size_t xb_backend_draw(enum xb_method method, int batch);

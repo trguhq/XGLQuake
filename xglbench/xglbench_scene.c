@@ -153,6 +153,12 @@ xb_mesh_free(xb_mesh *mesh)
     free(mesh->colors);
     free(mesh->base_colors);
     free(mesh->strips);
+    free(mesh->facet_normals);
+    free(mesh->vertex_normals);
+    free(mesh->centers);
+    free(mesh->vertex_colors);
+    free(mesh->facet_styles);
+    free(mesh->vertex_styles);
     memset(mesh, 0, sizeof(*mesh));
 }
 

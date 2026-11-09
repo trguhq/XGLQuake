@@ -11,6 +11,7 @@ typedef void *Xgl_ctx;
 typedef void *Xgl_trans;
 typedef void *Xgl_mem_ras;
 typedef void *Xgl_ras;
+typedef void *Xgl_light;
 typedef void *Xgl_object;
 typedef unsigned int Xgl_usgn32;
 typedef unsigned short Xgl_usgn16;
@@ -31,17 +32,21 @@ typedef struct xb_contract_bbox Xgl_bbox;
 typedef struct { float r, g, b; } Xgl_color_rgb;
 typedef union { Xgl_usgn32 index; float gray; Xgl_color_rgb rgb; Xgl_usgn32 z; } Xgl_color;
 typedef struct { Xgl_color color; } Xgl_color_facet;
+typedef struct { Xgl_color color; Xgl_pt_f3d normal; } Xgl_color_normal_facet;
+typedef struct { float x, y, z; Xgl_color color; } Xgl_pt_color_f3d;
+typedef struct { float x, y, z; Xgl_color color; Xgl_pt_f3d normal; } Xgl_pt_color_normal_f3d;
 typedef union { Xgl_color_facet color_facet; } Xgl_facet;
 typedef struct {
     Xgl_facet_type facet_type;
     Xgl_usgn32 num_facets;
-    union { Xgl_color_facet *color_facets; } facets;
+    union { Xgl_color_facet *color_facets; Xgl_color_normal_facet *color_normal_facets; } facets;
 } Xgl_facet_list;
 typedef struct {
     int pt_type;
     Xgl_bbox *bbox;
     Xgl_usgn32 num_pts, num_data_values;
-    union { Xgl_pt_f3d *f3d; } pts;
+    union { Xgl_pt_f3d *f3d; Xgl_pt_color_f3d *color_f3d;
+            Xgl_pt_color_normal_f3d *color_normal_f3d; } pts;
 } Xgl_pt_list;
 typedef union { struct { float z_value; } z_buffer; } Xgl_hlhsr_data;
 typedef struct {
@@ -97,7 +102,18 @@ enum {
     XGL_TRANS_DIMENSION, XGL_VDC_MAP_ALL, XGL_WIN_RAS, XGL_WIN_RAS_BACKING_STORE,
     XGL_WIN_RAS_BUFFERS_ALLOCATED, XGL_WIN_RAS_BUFFERS_REQUESTED,
     XGL_WIN_RAS_BUF_DISPLAY, XGL_WIN_RAS_BUF_DRAW, XGL_WIN_X,
-    XGL_WIN_X_PROTO_DGA, XGL_Y_DOWN_Z_AWAY, XGL_Z_COMP_LESS_THAN_OR_EQUAL
+    XGL_WIN_X_PROTO_DGA, XGL_Y_DOWN_Z_AWAY, XGL_Z_COMP_LESS_THAN_OR_EQUAL,
+    XGL_3D_CTX_LIGHT_NUM, XGL_3D_CTX_LIGHTS, XGL_3D_CTX_LIGHT_SWITCHES,
+    XGL_3D_CTX_SURF_FRONT_AMBIENT, XGL_3D_CTX_SURF_FRONT_DIFFUSE,
+    XGL_3D_CTX_SURF_FRONT_SPECULAR, XGL_3D_CTX_SURF_FRONT_LIGHT_COMPONENT,
+    XGL_3D_CTX_SURF_LIGHTING_NORMAL_FLIP, XGL_3D_CTX_SURF_NORMAL_FLIP,
+    XGL_ILLUM_NONE_INTERP_COLOR, XGL_ILLUM_PER_FACET, XGL_ILLUM_PER_VERTEX,
+    XGL_SURF_COLOR_VERTEX_ILLUM_DEP, XGL_PT_COLOR_F3D,
+    XGL_PT_COLOR_NORMAL_F3D, XGL_FACET_COLOR_NORMAL,
+    XGL_LIGHT_AMBIENT, XGL_LIGHT_DIRECTIONAL, XGL_LIGHT_POSITIONAL,
+    XGL_LIGHT_TYPE, XGL_LIGHT_COLOR, XGL_LIGHT_DIRECTION, XGL_LIGHT_POSITION,
+    XGL_LIGHT_ATTENUATION_1, XGL_LIGHT_ATTENUATION_2,
+    XGL_LIGHT_ENABLE_COMP_AMBIENT, XGL_LIGHT_ENABLE_COMP_DIFFUSE
 };
 Xgl_sys_state xgl_open(void *);
 void xgl_close(Xgl_sys_state);
