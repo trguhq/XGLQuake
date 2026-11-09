@@ -13,6 +13,7 @@
  */
 #include "xglbench.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -370,6 +371,165 @@ xb_mesh_build_connected(xb_mesh *mesh, int base_triangles, int depth)
             result.colors[facet_number] = result.base_colors[facet_number];
             ++facet_number;
         }
+    }
+    xb_mesh_free(mesh);
+    *mesh = result;
+    return 1;
+}
+
+/* Projected geometric area, before viewport clipping or occlusion. Summing
+ * these areas counts overlap repeatedly; it is not a covered-pixel count.
+ * Use the same endpoint mapping as the XGL viewport: [-1,1] -> [0,size-1]. */
+int
+xb_mesh_projected_area(const xb_mesh *mesh, int width, int height,
+                       double *mean, double *minimum, double *maximum)
+{
+    const xb_point *a, *b, *c, *point;
+    size_t i;
+    double scale, area, total, low, high;
+
+    if (mesh == NULL || width < 2 || height < 2 || mean == NULL ||
+        minimum == NULL || maximum == NULL || mesh->triangles == 0 ||
+        mesh->triangles > (size_t)-1 / 3 || mesh->points == NULL ||
+        mesh->point_count != mesh->triangles * 3)
+        return 0;
+    for (i = 0; i < mesh->point_count; ++i) {
+        point = &mesh->points[i];
+        /* Ordered comparisons also reject NaNs, without C99 isfinite(). */
+        if (!(point->x >= -FLT_MAX && point->x <= FLT_MAX) ||
+            !(point->y >= -FLT_MAX && point->y <= FLT_MAX) ||
+            !(point->z >= -FLT_MAX && point->z <= FLT_MAX))
+            return 0;
+    }
+    scale = ((double)width - 1.0) * ((double)height - 1.0) * 0.125;
+    total = high = 0.0;
+    low = DBL_MAX;
+    for (i = 0; i < mesh->triangles; ++i) {
+        a = &mesh->points[i * 3];
+        b = a + 1;
+        c = a + 2;
+        area = fabs(((double)b->x - a->x) * ((double)c->y - a->y) -
+                    ((double)b->y - a->y) * ((double)c->x - a->x)) * scale;
+        if (!(area >= 0.0 && area <= DBL_MAX))
+            return 0;
+        total += area;
+        if (area < low)
+            low = area;
+        if (area > high)
+            high = area;
+    }
+    if (!(total >= 0.0 && total <= DBL_MAX))
+        return 0;
+    *mean = total / (double)mesh->triangles;
+    *minimum = low;
+    *maximum = high;
+    return 1;
+}
+
+int
+xb_mesh_build_calibrated(xb_mesh *mesh, int triangles, int width,
+                         int height, double area, double aspect)
+{
+    xb_mesh result;
+    xb_point *point;
+    xb_strip *strip;
+    size_t patches, patch, columns, rows, needed_rows, col, row, side;
+    size_t first_point, first_facet, triangle, a, b, c;
+    double span_x, span_y, double_area, patch_width, patch_height, slots, x0, y0;
+    double u, v, mean, minimum, maximum;
+
+    if (mesh == NULL || width < 2 || height < 2 ||
+        !(area > 0.0 && area <= DBL_MAX) ||
+        !(aspect > 0.0 && aspect <= DBL_MAX))
+        return 0;
+    memset(&result, 0, sizeof(result));
+    result.triangles = xb_mesh_expected_triangles(triangles, 0);
+    if (result.triangles == 0)
+        return 0;
+    span_x = (double)width - 1.0;
+    span_y = (double)height - 1.0;
+    if (area > span_x * span_y * 0.5)
+        return 0;
+    /* Reject arithmetic overflow before evaluating the bounding box. Keep
+     * each square root intact so exactly fitting integer boxes stay exact. */
+    double_area = 2.0 * area;
+    if ((aspect > 1.0 && double_area > DBL_MAX / aspect) ||
+        (aspect < 1.0 && double_area > DBL_MAX * aspect))
+        return 0;
+    patch_width = sqrt(double_area * aspect);
+    patch_height = sqrt(double_area / aspect);
+    if (!(patch_width > 0.0 && patch_width <= span_x) ||
+        !(patch_height > 0.0 && patch_height <= span_y))
+        return 0;
+
+    patches = result.triangles / 2;
+    slots = floor(span_x / patch_width);
+    columns = slots >= (double)patches ? patches : (size_t)slots;
+    slots = floor(span_y / patch_height);
+    rows = slots >= (double)patches ? patches : (size_t)slots;
+    needed_rows = (patches + columns - 1) / columns;
+    if (rows > needed_rows)
+        rows = needed_rows;
+    result.point_count = result.triangles * 3;
+    result.strip_count = patches;
+    result.strip_point_count = patches * 4;
+    if (!xb_mesh_allocate(&result))
+        return 0;
+    xb_texture_init();
+    for (patch = 0; patch < patches; ++patch) {
+        col = patch % columns;
+        row = (patch / columns) % rows;
+        /* Spread all available slots over the viewport. If the requested
+         * workload does not fit without overlap, cycle through these slots:
+         * each receives floor/ceil(patches/slots) identical-area patches.
+         * Never shrink geometry or reduce the requested triangle count. */
+        x0 = columns == 1 ? (span_x - patch_width) * 0.5 :
+             (span_x - patch_width) * (double)col / (double)(columns - 1);
+        y0 = rows == 1 ? (span_y - patch_height) * 0.5 :
+             (span_y - patch_height) * (double)row / (double)(rows - 1);
+        first_point = patch * 4;
+        first_facet = patch * 2;
+        strip = &result.strips[patch];
+        strip->first_point = first_point;
+        strip->point_count = 4;
+        strip->first_facet = first_facet;
+        for (col = 0; col < 2; ++col) {
+            for (side = 0; side < 2; ++side) {
+                point = &result.strip_points[first_point + col * 2 + side];
+                point->x = (float)(2.0 * (x0 + col * patch_width) / span_x - 1.0);
+                point->y = (float)(2.0 * (y0 + (1 - side) * patch_height) /
+                                   span_y - 1.0);
+                /* Equal depth makes every overlapping fragment pass LEQUAL,
+                 * keeping this a fill workload rather than a rejection test. */
+                point->z = 0.5f;
+            }
+        }
+        for (triangle = 0; triangle < 2; ++triangle) {
+            a = first_point + triangle;
+            b = a + 1;
+            c = a + 2;
+            if (triangle & 1) {
+                a = first_point + triangle + 1;
+                b = a - 1;
+            }
+            result.points[(first_facet + triangle) * 3] = result.strip_points[a];
+            result.points[(first_facet + triangle) * 3 + 1] = result.strip_points[b];
+            result.points[(first_facet + triangle) * 3 + 2] = result.strip_points[c];
+            u = (double)(patch % 13) * 0.37 + (triangle ? 2.0 : 1.0) / 3.0;
+            v = (double)(patch % 7) * 0.21 + (triangle ? 1.0 : 2.0) / 3.0;
+            result.base_colors[first_facet + triangle] =
+                xb_material_sample(u, v, 0, 0.85f);
+            result.colors[first_facet + triangle] =
+                result.base_colors[first_facet + triangle];
+        }
+    }
+    /* Reject dimensions too small to retain the requested area in float
+     * vertices, instead of quietly returning degenerate calibration meshes. */
+    if (!xb_mesh_projected_area(&result, width, height, &mean, &minimum,
+                                &maximum) ||
+        minimum < area * 0.999 || maximum > area * 1.001) {
+        xb_mesh_free(&result);
+        return 0;
     }
     xb_mesh_free(mesh);
     *mesh = result;

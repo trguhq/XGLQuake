@@ -408,6 +408,161 @@ static void test_reverse_draw_order(void)
     xb_mesh_free(&reversed);
 }
 
+static void test_calibrated_geometry(void)
+{
+    const double areas[] = { 4.0, 16.0, 64.0, 100.0, 256.0, 1024.0 };
+    const double aspects[] = { 1.0, 16.0, 1.0 / 16.0 };
+    const int widths[] = { 320, 640 };
+    const int heights[] = { 240, 480 };
+    xb_mesh mesh, duplicate, before;
+    const xb_point *points;
+    size_t i, j, k, p;
+    double mean, minimum, maximum, span_x, span_y, box_width, box_height;
+    double nonfinite;
+
+    memset(&mesh, 0, sizeof(mesh));
+    memset(&duplicate, 0, sizeof(duplicate));
+    for (i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+        span_x = (widths[i] - 1) * 0.5;
+        span_y = (heights[i] - 1) * 0.5;
+        for (j = 0; j < sizeof(areas) / sizeof(areas[0]); ++j) {
+            for (k = 0; k < sizeof(aspects) / sizeof(aspects[0]); ++k) {
+                assert(xb_mesh_build_calibrated(&mesh, 512, widths[i], heights[i],
+                                                areas[j], aspects[k]));
+                check_mesh(&mesh, 512, 0, 0, 0);
+                assert(xb_mesh_projected_area(&mesh, widths[i], heights[i],
+                                              &mean, &minimum, &maximum));
+                assert(fabs(mean - areas[j]) < areas[j] * 0.0001);
+                assert(fabs(minimum - areas[j]) < areas[j] * 0.0001);
+                assert(fabs(maximum - areas[j]) < areas[j] * 0.0001);
+                for (p = 0; p < mesh.point_count; ++p) {
+                    assert(mesh.points[p].x >= -1.0f && mesh.points[p].x <= 1.0f);
+                    assert(mesh.points[p].y >= -1.0f && mesh.points[p].y <= 1.0f);
+                    assert(mesh.points[p].z == 0.5f);
+                }
+                for (p = 0; p < mesh.strip_count; ++p) {
+                    points = mesh.strip_points + mesh.strips[p].first_point;
+                    box_width = ((double)points[2].x - points[0].x) * span_x;
+                    box_height = ((double)points[0].y - points[1].y) * span_y;
+                    assert(fabs(box_width / box_height - aspects[k]) <
+                           aspects[k] * 0.0001);
+                }
+                assert(xb_mesh_build_calibrated(&duplicate, 512, widths[i],
+                                                heights[i], areas[j], aspects[k]));
+                check_identical_mesh(&mesh, &duplicate);
+            }
+        }
+    }
+    /* This area fills the tiny viewport with one quad; repeated patches must
+     * retain their area, count, winding and depth instead of being shrunk. */
+    assert(xb_mesh_build_calibrated(&mesh, 514, 21, 11, 100.0, 2.0));
+    check_mesh(&mesh, 514, 0, 0, 0);
+    assert(xb_mesh_projected_area(&mesh, 21, 11, &mean, &minimum, &maximum));
+    assert(mean == 100.0 && minimum == 100.0 && maximum == 100.0);
+    for (p = 4; p < mesh.strip_point_count; ++p)
+        assert(same_point(&mesh.strip_points[p], &mesh.strip_points[p % 4]));
+
+    assert(xb_mesh_build_calibrated(&mesh, 512, 320, 240, 100.0, 1.0));
+    assert(xb_mesh_build_calibrated(&duplicate, 512, 640, 480, 100.0, 1.0));
+    /* A resize changes positions, never the workload's facet-color stream. */
+    assert(memcmp(mesh.base_colors, duplicate.base_colors,
+                  mesh.triangles * sizeof(*mesh.base_colors)) == 0);
+    assert(xb_mesh_build_calibrated(&duplicate, 512, 320, 240, 100.0, 1.0));
+    before = mesh;
+    assert(!xb_mesh_build_calibrated(NULL, 512, 320, 240, 100.0, 1.0));
+    assert(!xb_mesh_build_calibrated(&mesh, 0, 320, 240, 100.0, 1.0));
+    assert(!xb_mesh_build_calibrated(&mesh, -2, 320, 240, 100.0, 1.0));
+    assert(!xb_mesh_build_calibrated(&mesh, 3, 320, 240, 100.0, 1.0));
+    assert(!xb_mesh_build_calibrated(&mesh, INT_MAX - 1, 320, 240, 100.0, 1.0));
+    assert(!xb_mesh_build_calibrated(&mesh, 512, 1, 240, 100.0, 1.0));
+    assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 0, 100.0, 1.0));
+    assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 240, 0.0, 1.0));
+    assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 240, -1.0, 1.0));
+    assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 240, 100.0, 0.0));
+    assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 240, 100.0, -1.0));
+    assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 240, DBL_MAX, 1.0));
+    assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 240, 100.0, DBL_MAX));
+    assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 240, 100.0, DBL_MIN));
+    assert(!xb_mesh_build_calibrated(&mesh, 512, 20, 20, 100.0, 16.0));
+    assert(!xb_mesh_build_calibrated(&mesh, 512, 20, 20, 100.0, 1.0 / 16.0));
+    nonfinite = strtod("nan", NULL);
+    if (nonfinite != nonfinite) {
+        assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 240, nonfinite, 1.0));
+        assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 240, 100.0, nonfinite));
+    }
+    nonfinite = strtod("inf", NULL);
+    if (nonfinite > DBL_MAX) {
+        assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 240, nonfinite, 1.0));
+        assert(!xb_mesh_build_calibrated(&mesh, 512, 320, 240, 100.0, nonfinite));
+    }
+    assert(memcmp(&mesh, &before, sizeof(mesh)) == 0);
+    check_identical_mesh(&mesh, &duplicate);
+    xb_mesh_free(&mesh);
+    xb_mesh_free(&duplicate);
+}
+
+static void test_projected_area(void)
+{
+    xb_mesh mesh;
+    xb_point points[6], temporary;
+    double mean, minimum, maximum, nonfinite;
+    size_t i;
+
+    memset(&mesh, 0, sizeof(mesh));
+    memset(points, 0, sizeof(points));
+    mesh.triangles = 2;
+    mesh.point_count = 6;
+    mesh.points = points;
+    points[0].x = points[0].y = -2.0f;
+    points[1].x = 2.0f;
+    points[1].y = -2.0f;
+    points[2].x = -2.0f;
+    points[2].y = 2.0f;
+    /* One triangle extends beyond the viewport, the other is degenerate.
+     * A summary describes raw projected area, without clipping or culling. */
+    assert(xb_mesh_projected_area(&mesh, 5, 3, &mean, &minimum, &maximum));
+    assert(mean == 8.0 && minimum == 0.0 && maximum == 16.0);
+    temporary = points[1];
+    points[1] = points[2];
+    points[2] = temporary;
+    assert(xb_mesh_projected_area(&mesh, 5, 3, &mean, &minimum, &maximum));
+    assert(mean == 8.0 && minimum == 0.0 && maximum == 16.0);
+    assert(!xb_mesh_projected_area(NULL, 5, 3, &mean, &minimum, &maximum));
+    assert(!xb_mesh_projected_area(&mesh, 1, 3, &mean, &minimum, &maximum));
+    assert(!xb_mesh_projected_area(&mesh, 5, 1, &mean, &minimum, &maximum));
+    assert(!xb_mesh_projected_area(&mesh, 5, 3, NULL, &minimum, &maximum));
+    assert(!xb_mesh_projected_area(&mesh, 5, 3, &mean, NULL, &maximum));
+    assert(!xb_mesh_projected_area(&mesh, 5, 3, &mean, &minimum, NULL));
+    mesh.point_count = 5;
+    assert(!xb_mesh_projected_area(&mesh, 5, 3, &mean, &minimum, &maximum));
+    mesh.point_count = 6;
+    mesh.triangles = 0;
+    assert(!xb_mesh_projected_area(&mesh, 5, 3, &mean, &minimum, &maximum));
+    mesh.triangles = (size_t)-1;
+    assert(!xb_mesh_projected_area(&mesh, 5, 3, &mean, &minimum, &maximum));
+    mesh.triangles = 2;
+    mesh.points = NULL;
+    assert(!xb_mesh_projected_area(&mesh, 5, 3, &mean, &minimum, &maximum));
+    mesh.points = points;
+    for (i = 0; i < 2; ++i) {
+        nonfinite = strtod(i ? "inf" : "nan", NULL);
+        if (nonfinite != nonfinite || nonfinite > DBL_MAX) {
+            temporary = points[5];
+            points[5].x = (float)nonfinite;
+            assert(!xb_mesh_projected_area(&mesh, 5, 3, &mean, &minimum, &maximum));
+            points[5] = temporary;
+            points[5].y = (float)nonfinite;
+            assert(!xb_mesh_projected_area(&mesh, 5, 3, &mean, &minimum, &maximum));
+            points[5] = temporary;
+            points[5].z = (float)nonfinite;
+            assert(!xb_mesh_projected_area(&mesh, 5, 3, &mean, &minimum, &maximum));
+            points[5] = temporary;
+        }
+    }
+    /* Failures leave all three outputs unchanged. */
+    assert(mean == 8.0 && minimum == 0.0 && maximum == 16.0);
+}
+
 int main(void)
 {
     int method;
@@ -416,9 +571,11 @@ int main(void)
     test_invalid_input();
     test_connected_geometry();
     test_reverse_draw_order();
+    test_calibrated_geometry();
+    test_projected_area();
     for (method = 0; method < XB_METHODS; ++method)
         assert(xb_method_name((enum xb_method)method)[0] != '\0');
     puts("scene tests: geometry equivalence, subdivision coverage, color caches,"
-         " allocation accounting and invalid inputs passed");
+         " calibrated pixel areas, allocation accounting and invalid inputs passed");
     return 0;
 }

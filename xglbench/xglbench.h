@@ -5,7 +5,8 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define XB_VERSION "0.1"
+#define XB_VERSION "0.2"
+#define XB_MAX_QUEUE 8
 #define XB_MAX_RESULTS 512
 #define XB_MAX_REPEATS 31
 #define XB_METHODS 4
@@ -25,7 +26,7 @@ typedef struct {
 
 enum xb_method { XB_POLYGON, XB_MULTI, XB_TLIST, XB_STRIP };
 enum xb_work { XB_DRAW, XB_COLOR_CLEAR, XB_DEPTH_CLEAR, XB_SWAP,
-               XB_RASTER, XB_MASKED_RASTER, XB_FRAME };
+               XB_RASTER, XB_MASKED_RASTER, XB_FRAME, XB_PIPELINE };
 enum xb_update { XB_STATIC, XB_TRANSFORM, XB_COLORS, XB_REBUILD };
 
 typedef struct {
@@ -34,12 +35,14 @@ typedef struct {
     enum xb_method method;
     enum xb_update update;
     int batch, depth, zbuffer, overdraw, perspective, connected, retained, clipping, reverse;
+    int streaming;
     float size;
+    double area, aspect; /* positive area requests calibrated projected geometry */
 } xb_case;
 
 typedef struct {
     int width, height, force_size;
-    int repeats, base_triangles, quick, allow_fallback, list_only;
+    int repeats, base_triangles, quick, allow_fallback, list_only, queue;
     double seconds, warmup;
     const char *csv_path, *filter, *display;
 } xb_options;
@@ -54,6 +57,12 @@ typedef struct {
     double render[XB_MAX_REPEATS];
     double present[XB_MAX_REPEATS];
     double cpu[XB_MAX_REPEATS];
+    double drain[XB_MAX_REPEATS];
+    double enqueue[XB_MAX_REPEATS];
+    double area_mean, area_min, area_max;
+    size_t input_bytes;
+    int queue_limit;
+    unsigned long drains, max_outstanding;
     double median, low, high, prep_median, render_median, present_median;
     char reason[160];
 } xb_result;
@@ -62,6 +71,10 @@ typedef struct {
 int xb_mesh_build(xb_mesh *mesh, int base_triangles, int depth,
                   float size, int overdraw);
 int xb_mesh_build_connected(xb_mesh *mesh, int base_triangles, int depth);
+int xb_mesh_build_calibrated(xb_mesh *mesh, int triangles, int width,
+                            int height, double area, double aspect);
+int xb_mesh_projected_area(const xb_mesh *mesh, int width, int height,
+                           double *mean, double *minimum, double *maximum);
 int xb_mesh_reverse_draw_order(xb_mesh *mesh);
 void xb_mesh_free(xb_mesh *mesh);
 void xb_mesh_colors(xb_mesh *mesh, unsigned long frame);
@@ -95,5 +108,15 @@ void xb_backend_label(const char *name);
 int xb_backend_has_double_buffer(void);
 int xb_backend_has_hardware(void);
 const char *xb_backend_error(void);
+/* Native payload referenced by drawing calls, not measured SBus/DMA bytes. */
+size_t xb_backend_input_bytes(enum xb_method method, int batch);
+/* Bounded, same-context, no-swap stream. Every queued slot remains immutable
+ * until a successful drain. Begin preallocates all native storage. */
+int xb_backend_stream_begin(const xb_mesh *mesh, int slots, char *reason, size_t size);
+int xb_backend_stream_prepare(int slot, const xb_mesh *mesh);
+size_t xb_backend_stream_draw(int slot);
+void xb_backend_post(void);
+int xb_backend_stream_drain(void);
+void xb_backend_stream_end(void);
 
 #endif

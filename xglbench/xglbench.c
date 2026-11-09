@@ -19,6 +19,7 @@ static void usage(FILE *f)
         "  -seconds S         Minimum elapsed time per trial (default 1)\n"
         "  -warmup S          Warm-up per case, outside measurements (default .15)\n"
         "  -repeats N         Repeated trials, 1..31 (default 3)\n");
+    fprintf(f, "  -queue N           Streaming window, 1..8 work items (default 2)\n");
     fprintf(f,
         "  -triangles N       Base count, positive even number <=16384 (default 512)\n"
         "  -csv PATH          Write machine-readable per-trial and summary results\n"
@@ -64,6 +65,7 @@ static int options(int argc, char **argv, xb_options *o)
     o->width = 320; o->height = 240;
     o->seconds = 1.0; o->warmup = .15; o->repeats = 3;
     o->base_triangles = 512;
+    o->queue = 2;
     for (i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-quick")) {
             o->quick = 1; o->seconds = .05; o->warmup = .02; o->repeats = 1;
@@ -88,6 +90,8 @@ static int options(int argc, char **argv, xb_options *o)
             if (++i >= argc || !parse_double(argv[i], 0, 3600, &o->warmup)) goto invalid;
         } else if (!strcmp(argv[i], "-repeats")) {
             if (++i >= argc || !parse_long(argv[i], 1, XB_MAX_REPEATS, &o->repeats)) goto invalid;
+        } else if (!strcmp(argv[i], "-queue")) {
+            if (++i >= argc || !parse_long(argv[i], 1, XB_MAX_QUEUE, &o->queue)) goto invalid;
         } else if (!strcmp(argv[i], "-triangles")) {
             if (++i >= argc || !parse_long(argv[i], 2, 16384, &o->base_triangles) ||
                 (o->base_triangles & 1)) goto invalid;
@@ -124,8 +128,9 @@ static xb_case *add_case(xb_case *cases, int *count, const char *name)
 
 static int make_cases(xb_case *cases)
 {
-    int n, m, b, d, z, i;
+    int n, m, b, d, z, i, mode, update;
     int batches[4];
+    int areas[6];
     char name[80];
     xb_case *c;
     const char *sizes[3];
@@ -190,13 +195,37 @@ static int make_cases(xb_case *cases)
     c = add_case(cases, &n, "overhead/swap"); c->work = XB_SWAP;
     c = add_case(cases, &n, "hud/opaque-copy"); c->work = XB_RASTER; c->zbuffer = 0;
     c = add_case(cases, &n, "hud/masked-copy"); c->work = XB_MASKED_RASTER; c->zbuffer = 0;
+    areas[0] = 4; areas[1] = 16; areas[2] = 64;
+    areas[3] = 100; areas[4] = 256; areas[5] = 1024;
+    for (i = 0; i < 6; ++i) {
+        sprintf(name, "area/%dpx", areas[i]);
+        c = add_case(cases, &n, name); c->area = areas[i]; c->aspect = 1.0;
+    }
+    c = add_case(cases, &n, "shape/100px/horizontal-16x1");
+    c->area = 100; c->aspect = 16;
+    c = add_case(cases, &n, "shape/100px/vertical-1x16");
+    c->area = 100; c->aspect = 1.0 / 16.0;
+    for (mode = 0; mode <= 1; ++mode) {
+        for (update = 0; update <= 1; ++update) {
+            for (d = 0; d <= 2; ++d) {
+                sprintf(name, "pipeline/%s/%s/depth-%d", mode ? "streaming" : "serialized",
+                    update ? "relight" : "cached", d);
+                c = add_case(cases, &n, name);
+                c->work = XB_PIPELINE; c->streaming = mode; c->depth = d;
+                c->update = update ? XB_COLORS : XB_STATIC;
+            }
+        }
+    }
     return n;
 }
 
-static int build_mesh(xb_mesh *mesh, const xb_options *o, const xb_case *c)
+static int build_mesh(xb_mesh *mesh, const xb_options *o, const xb_case *c,
+                      int width, int height)
 {
     int ok;
     size_t i;
+    if (c->area > 0) return xb_mesh_build_calibrated(mesh, o->base_triangles,
+                                                  width, height, c->area, c->aspect);
     if (c->connected) ok = xb_mesh_build_connected(mesh, o->base_triangles, c->depth);
     else ok = xb_mesh_build(mesh, o->base_triangles, c->depth, c->size, c->overdraw);
     if (ok && c->reverse) ok = xb_mesh_reverse_draw_order(mesh);
@@ -215,10 +244,12 @@ static int one_frame(const xb_options *o, const xb_case *c, xb_mesh *mesh,
                      unsigned long sequence, xb_frame *f)
 {
     double start, prepared, render_start, rendered, end;
+    int width, height;
     memset(f, 0, sizeof(*f));
     start = xb_now();
     if (c->update == XB_REBUILD) {
-        if (!build_mesh(mesh, o, c) || !xb_backend_upload(mesh)) return 0;
+        xb_backend_dimensions(&width, &height);
+        if (!build_mesh(mesh, o, c, width, height) || !xb_backend_upload(mesh)) return 0;
     } else if (c->update == XB_COLORS) {
         xb_mesh_colors(mesh, sequence);
         xb_backend_colors(mesh);
@@ -245,6 +276,7 @@ static int one_frame(const xb_options *o, const xb_case *c, xb_mesh *mesh,
     case XB_RASTER: xb_backend_raster(0); break;
     case XB_MASKED_RASTER: xb_backend_raster(1); break;
     case XB_SWAP: break;
+    case XB_PIPELINE: return 0; /* has a separate bounded-window timing path */
     }
     if (c->work != XB_SWAP) xb_backend_sync();
     rendered = xb_now();
@@ -286,6 +318,109 @@ static int events(xb_result *r)
     return 1;
 }
 
+typedef struct {
+    unsigned long items, drains, maximum;
+    size_t calls;
+    double prepare, enqueue, drain;
+} xb_window;
+
+static void backend_reason(xb_result *r, const char *fallback)
+{
+    const char *message;
+    message = xb_backend_error();
+    if (!*message) message = fallback;
+    strncpy(r->reason, message, sizeof(r->reason) - 1);
+    r->reason[sizeof(r->reason) - 1] = '\0';
+}
+
+static int pipeline_window(xb_result *r, xb_mesh *mesh,
+                           unsigned long *sequence, xb_window *window)
+{
+    int slot, okay;
+    size_t calls;
+    double start;
+    memset(window, 0, sizeof(*window));
+    okay = 1;
+    for (slot = 0; slot < r->queue_limit; ++slot) {
+        if (!events(r)) { okay = 0; break; }
+        start = xb_now();
+        if (r->test.update == XB_COLORS) {
+            xb_mesh_colors(mesh, *sequence);
+            if (!xb_backend_stream_prepare(slot, mesh)) {
+                backend_reason(r, "stream color preparation failed"); okay = 0; break;
+            }
+        }
+        window->prepare += xb_now() - start;
+        start = xb_now();
+        calls = xb_backend_stream_draw(slot);
+        if (!calls) {
+            backend_reason(r, "stream submission failed"); okay = 0; break;
+        }
+        xb_backend_post();
+        window->enqueue += xb_now() - start;
+        window->calls = calls;
+        ++window->items;
+        ++*sequence;
+        window->maximum = window->items;
+    }
+    /* Always attempt the final drain, including interrupted/partial windows.
+     * Neither FLUSH_BUFFERS nor a drawing call releases retained arrays. */
+    start = xb_now();
+    if (!xb_backend_stream_drain()) {
+        if (okay) backend_reason(r, "stream completion drain failed");
+        okay = 0;
+    }
+    window->drain = xb_now() - start;
+    window->drains = 1;
+    if (okay && !events(r)) okay = 0;
+    return okay;
+}
+
+static int measure_pipeline(const xb_options *o, xb_result *r, xb_mesh *mesh)
+{
+    xb_window window;
+    double start, cpu, elapsed, prepare, enqueue, drain;
+    unsigned long sequence, items, drains, maximum;
+    int trial, okay;
+    r->queue_limit = r->test.streaming ? o->queue : 1;
+    if (!xb_backend_stream_begin(mesh, r->queue_limit, r->reason, sizeof(r->reason))) return 0;
+    okay = 0;
+    sequence = 0;
+    start = xb_now();
+    do {
+        if (!pipeline_window(r, mesh, &sequence, &window)) goto done;
+    } while (xb_now() - start < o->warmup);
+    for (trial = 0; trial < o->repeats; ++trial) {
+        sequence = 0; items = 0; drains = 0; maximum = 0;
+        prepare = enqueue = drain = 0;
+        cpu = xb_cpu_now();
+        start = xb_now();
+        do {
+            if (!pipeline_window(r, mesh, &sequence, &window)) goto done;
+            items += window.items; drains += window.drains;
+            if (window.maximum > maximum) maximum = window.maximum;
+            prepare += window.prepare; enqueue += window.enqueue; drain += window.drain;
+            r->calls = window.calls;
+            elapsed = xb_now() - start;
+        } while (items < 3 || elapsed < o->seconds);
+        /* elapsed spans first preparation through final completion, including
+         * window fill/drain and event polling. No queued work is counted early. */
+        r->cpu[trial] = (xb_cpu_now() - cpu) / (double)items;
+        r->total[trial] = elapsed / (double)items;
+        r->prepare[trial] = prepare / (double)items;
+        r->enqueue[trial] = enqueue / (double)items;
+        r->drain[trial] = drain / (double)items;
+        r->frames += items; r->drains += drains;
+        if (maximum > r->max_outstanding) r->max_outstanding = maximum;
+        ++r->samples;
+    }
+    okay = 1;
+done:
+    xb_backend_stream_end();
+    if (okay && !events(r)) okay = 0;
+    return okay;
+}
+
 static void measure(const xb_options *o, xb_result *r, const int *valid,
                     char validation[XB_METHODS][160])
 {
@@ -297,20 +432,28 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
     const xb_case *c;
     c = &r->test;
     memset(&mesh, 0, sizeof(mesh));
-    uses_mesh = c->work == XB_DRAW || c->work == XB_FRAME;
+    uses_mesh = c->work == XB_DRAW || c->work == XB_FRAME || c->work == XB_PIPELINE;
     if (uses_mesh && !valid[c->method]) {
         strcpy(r->reason, validation[c->method]); return;
     }
     if ((c->work == XB_SWAP || c->work == XB_FRAME) && !xb_backend_has_double_buffer()) {
         strcpy(r->reason, "two hardware/window buffers not allocated"); return;
     }
-    if (uses_mesh && !build_mesh(&mesh, o, c)) {
-        strcpy(r->reason, "geometry allocation or input limit failure"); return;
+    if (uses_mesh && !build_mesh(&mesh, o, c, r->width, r->height)) {
+        strcpy(r->reason, c->area > 0 ? "calibrated triangle does not fit, or allocation/input limit failure" :
+                                      "geometry allocation or input limit failure"); return;
     }
     if (!xb_backend_configure(c, &mesh, r->reason, sizeof(r->reason))) goto done;
     /* configure() owns the initial upload; updates upload inside one_frame(). */
     r->triangles = mesh.triangles;
     r->bytes = mesh.bytes;
+    if (uses_mesh) {
+        if (!xb_mesh_projected_area(&mesh, r->width, r->height,
+                                   &r->area_mean, &r->area_min, &r->area_max)) {
+            strcpy(r->reason, "invalid projected area in generated mesh"); goto done;
+        }
+        r->input_bytes = xb_backend_input_bytes(c->method, c->batch);
+    }
     xb_backend_label(c->name);
     /* Show a representative image even for tests which exclude presentation. */
     xb_backend_clear(1, c->zbuffer);
@@ -330,6 +473,10 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
         goto done;
     }
     /* Resize/expose from setup are consumed before warm-up; later events invalidate. */
+    if (c->work == XB_PIPELINE) {
+        if (!measure_pipeline(o, r, &mesh)) goto done;
+        goto summarize;
+    }
     sequence = 0;
     start = xb_now();
     do {
@@ -359,6 +506,7 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
         r->present[trial] = present / (double)frames;
         r->frames += frames; ++r->samples;
     }
+summarize:
     r->median = xb_median(r->total, r->samples);
     r->prep_median = xb_median(r->prepare, r->samples);
     r->render_median = xb_median(r->render, r->samples);
@@ -383,39 +531,64 @@ static void csv_text(FILE *f, const char *s)
 static void csv_row(FILE *f, const xb_result *r, const char *record, int trial,
                     double total, double prep, double render, double present, double cpu)
 {
-    double rate;
+    double rate, duration, enqueue, drain;
+    int pipeline;
     if (!f) return;
-    rate = r->triangles && render > 0 ? (double)r->triangles / render : 0;
+    pipeline = r->test.work == XB_PIPELINE;
+    duration = pipeline ? total : render;
+    rate = r->triangles && duration > 0 ? (double)r->triangles / duration : 0;
+    enqueue = drain = 0;
+    if (r->passed && pipeline) {
+        enqueue = trial > 0 ? r->enqueue[trial - 1] : xb_median(r->enqueue, r->samples);
+        drain = trial > 0 ? r->drain[trial - 1] : xb_median(r->drain, r->samples);
+    }
     fprintf(f, "%s,%d,%d,", record, r->width, r->height);
     csv_text(f, r->test.name);
-    fprintf(f, ",%s,%d,%s,%d,%d,%d,%d,%d,%lu,%lu,%lu,%lu,%.9f,%.9f,%.9f,%.9f,%.9f,%.3f,",
+    fprintf(f, ",%s,%d,%s,%d,%d,%d,%d,%d,%lu,%lu,%lu,%lu,%.9f,%.9f,",
             r->passed ? "ok" : "skipped", trial, xb_method_name(r->test.method),
-            r->test.batch, r->test.depth, r->test.zbuffer, r->test.connected, r->test.retained,
+            r->test.batch, r->test.depth, r->test.zbuffer, r->test.connected,
+            pipeline || r->test.retained,
             (unsigned long)r->triangles, (unsigned long)r->calls,
             (unsigned long)r->bytes, r->frames,
-            total * 1000, prep * 1000, render * 1000, present * 1000, cpu * 1000, rate);
+            total * 1000, prep * 1000);
+    if (!pipeline) fprintf(f, "%.9f", render * 1000);
+    fprintf(f, ",%.9f,%.9f,%.3f,", present * 1000, cpu * 1000, rate);
     csv_text(f, r->reason);
-    fputc('\n', f);
+    fprintf(f, ",%s,%d,%lu,%lu,%.9f,%.9f,%.6f,%.6f,%.6f,%lu\n",
+        pipeline ? (r->test.streaming ? "pipeline-streaming" : "pipeline-serialized") : "serialized",
+        r->queue_limit, r->max_outstanding, r->drains, enqueue * 1000, drain * 1000,
+        r->area_mean, r->area_min, r->area_max, (unsigned long)r->input_bytes);
 }
 
 static void print_result(FILE *csv, const xb_result *r)
 {
     int i;
-    double rate;
+    double rate, duration;
+    const char *unit;
     if (!r->passed) {
         printf("%-38s SKIPPED: %s\n", r->test.name, r->reason);
         csv_row(csv, r, "summary", -1, 0, 0, 0, 0, 0);
         return;
     }
-    rate = r->triangles && r->render_median > 0 ? (double)r->triangles / r->render_median : 0;
-    printf("%-38s %9.3f %9.3f %9.3f %9.3f %10.0f %6lu\n",
-        r->test.name, r->median * 1000, r->prep_median * 1000,
-        r->render_median * 1000, r->present_median * 1000,
-        rate, (unsigned long)r->calls);
-    printf("  trial-mean range %.3f..%.3f ms; %lu frames, %lu facets/frame, "
-           "%.1f KiB portable mesh, CPU %.3f ms/frame\n",
-        r->low * 1000, r->high * 1000, r->frames, (unsigned long)r->triangles,
-        (double)r->bytes / 1024, xb_median(r->cpu, r->samples) * 1000);
+    duration = r->test.work == XB_PIPELINE ? r->median : r->render_median;
+    rate = r->triangles && duration > 0 ? (double)r->triangles / duration : 0;
+    printf("%-38s %9.3f %9.3f ", r->test.name, r->median * 1000, r->prep_median * 1000);
+    if (r->test.work == XB_PIPELINE) printf("%9s ", "n/a");
+    else printf("%9.3f ", r->render_median * 1000);
+    printf("%9.3f %10.0f %6lu\n", r->present_median * 1000, rate, (unsigned long)r->calls);
+    unit = r->test.work == XB_PIPELINE ? "item" : "frame";
+    printf("  trial-mean range %.3f..%.3f ms; %lu %ss, %lu facets/%s, "
+           "%.1f KiB portable mesh, CPU %.3f ms/%s\n",
+        r->low * 1000, r->high * 1000, r->frames, unit, (unsigned long)r->triangles, unit,
+        (double)r->bytes / 1024, xb_median(r->cpu, r->samples) * 1000, unit);
+    if (r->triangles)
+        printf("  nominal area %.3f px/facet (%.3f..%.3f); input payload %lu bytes/%s\n",
+            r->area_mean, r->area_min, r->area_max, (unsigned long)r->input_bytes, unit);
+    if (r->test.work == XB_PIPELINE)
+        printf("  host enqueue %.3f ms/item; drain %.3f ms/item; max queued %lu/%d; "
+               "%lu timed drains; no swaps\n",
+            xb_median(r->enqueue, r->samples) * 1000, xb_median(r->drain, r->samples) * 1000,
+            r->max_outstanding, r->queue_limit, r->drains);
     for (i = 0; i < r->samples; ++i)
         csv_row(csv, r, "trial", i + 1, r->total[i], r->prepare[i],
                 r->render[i], r->present[i], r->cpu[i]);
@@ -435,7 +608,7 @@ static const xb_result *find_result(const xb_result *r, int count,
 
 static void findings(const xb_result *r, int count, int width, int height)
 {
-    int i, d;
+    int i, d, update;
     const xb_result *best, *poly, *connected, *a, *b;
     char name[80];
     double ratio;
@@ -462,6 +635,9 @@ static void findings(const xb_result *r, int count, int width, int height)
     if (connected)
         printf("  Lowest measured connected-grid render time: %s, %.3f ms.\n",
             connected->test.name, connected->render_median * 1000);
+    if (best || connected)
+        printf("  Leo expands strips before geometry processing: compact input may save\n"
+               "  input bandwidth/submission work, not downstream shared-vertex transforms.\n");
     a = find_result(r, count, width, height, "submit/multi_polygon/batch-128");
     b = find_result(r, count, width, height, "storage/multi_polygon/retained-arrays");
     if (a && b && a->render_median > 0)
@@ -491,6 +667,28 @@ static void findings(const xb_result *r, int count, int width, int height)
     if (a && b && a->render_median > 0)
         printf("  Far-to-near/near-to-far overdraw time ratio: %.2f (same geometry).\n",
             b->render_median / a->render_median);
+    a = find_result(r, count, width, height, "area/100px");
+    if (a && a->render_median > 0) {
+        b = find_result(r, count, width, height, "shape/100px/horizontal-16x1");
+        if (b) printf("  Equal 100px area: wide/square render-time ratio %.2f.\n",
+                      b->render_median / a->render_median);
+        b = find_result(r, count, width, height, "shape/100px/vertical-1x16");
+        if (b) printf("  Equal 100px area: tall/square render-time ratio %.2f.\n",
+                      b->render_median / a->render_median);
+    }
+    for (update = 0; update <= 1; ++update) {
+        for (d = 0; d <= 2; ++d) {
+            sprintf(name, "pipeline/serialized/%s/depth-%d", update ? "relight" : "cached", d);
+            a = find_result(r, count, width, height, name);
+            sprintf(name, "pipeline/streaming/%s/depth-%d", update ? "relight" : "cached", d);
+            b = find_result(r, count, width, height, name);
+            if (a && b && b->median > 0)
+                printf("  %s depth-%d: queue %d gives %.2fx completed throughput vs queue 1\n"
+                       "    (same clear+mesh work, single thread, no swaps; %.3f vs %.3f ms/item).\n",
+                    update ? "Relit" : "Cached", d, b->queue_limit, a->median / b->median,
+                    b->median * 1000, a->median * 1000);
+        }
+    }
     for (d = 0; d <= 2; ++d) {
         sprintf(name, "frame/relight/depth-%d", d);
         a = find_result(r, count, width, height, name);
@@ -510,17 +708,21 @@ static void compare_sizes(const xb_result *r, int count)
 {
     int i;
     const xb_result *large;
-    printf("\nResolution comparison: 640x480 / 320x240 (4x pixel area)\n");
+    printf("\nResolution comparison: 640x480 / 320x240 (4x window area)\n");
     for (i = 0; i < count; ++i) {
         if (!r[i].passed || r[i].width != 320 || r[i].height != 240) continue;
         large = find_result(r, count, 640, 480, r[i].test.name);
-        if (!large || r[i].render_median <= 0 || r[i].median <= 0) continue;
-        printf("  %-38s render %6.2fx; total %6.2fx\n", r[i].test.name,
-            large->render_median / r[i].render_median, large->median / r[i].median);
+        if (!large || r[i].median <= 0) continue;
+        printf("  %-38s ", r[i].test.name);
+        if (r[i].test.work == XB_PIPELINE || r[i].render_median <= 0) printf("render    n/a; ");
+        else printf("render %6.2fx; ", large->render_median / r[i].render_median);
+        printf("total %6.2fx%s\n", large->median / r[i].median,
+            r[i].test.area > 0 ? " (fixed triangle area/count)" : "");
     }
     printf("  Weak render-time scaling is consistent with geometry/CPU/dispatch limits;\n"
            "  stronger scaling indicates pixel-work sensitivity. Neither identifies a\n"
            "  unique bottleneck. Swap timing can be quantized by display refresh.\n"
+           "  Calibrated area/shape cases keep triangle area/count fixed; clears still grow.\n"
            "  HUD copies remain 128x64 pixels at both sizes; their work does not quadruple.\n");
 }
 
@@ -552,7 +754,9 @@ int main(int argc, char **argv)
         if (!csv) { perror(o.csv_path); return 1; }
         fprintf(csv, "record,width,height,test,status,trial,method,batch,depth,zbuffer,connected,retained,"
                      "triangles,calls,mesh_bytes,frames_all_trials,total_ms,prepare_ms,render_ms,"
-                     "present_ms,cpu_ms,triangles_per_second,reason\n");
+                     "present_ms,cpu_ms,triangles_per_second,reason,");
+        fprintf(csv, "timing_mode,queue_limit,max_queued,drain_calls,enqueue_ms,drain_ms,"
+                     "nominal_area_mean_px,nominal_area_min_px,nominal_area_max_px,input_payload_bytes\n");
     }
     results = (xb_result *)calloc(XB_MAX_RESULTS, sizeof(*results));
     if (!results) { if (csv) fclose(csv); fprintf(stderr, "Out of memory.\n"); return 1; }
@@ -566,18 +770,31 @@ int main(int argc, char **argv)
     printf("Build: %s %s; pointer %lu bytes; float %lu bytes\n", __DATE__, __TIME__,
         (unsigned long)sizeof(void *), (unsigned long)sizeof(float));
     xb_backend_info(stdout);
-    printf("Settings: %d base triangles; %.3f seconds/trial; %d repeats; %.3f seconds warm-up\n",
-        o.base_triangles, o.seconds, o.repeats, o.warmup);
+    printf("Settings: %d base triangles; %.3f seconds/trial; %d repeats; %.3f seconds warm-up; queue %d\n",
+        o.base_triangles, o.seconds, o.repeats, o.warmup, o.queue);
     printf("Texture sampling is CPU-only; XGL receives positions and flat RGB facet colors.\n"
            "All timed rendering waits for completion. No result is a GPU-only timer.\n"
            "Totals include reset clears; draw render_ms excludes the reset. frame/* includes\n"
-           "clear+draw+masked HUD in render_ms and swap in present_ms. Event polling is outside totals.\n");
+           "clear+draw+masked HUD in render_ms and swap in present_ms. Their event polling is untimed.\n");
+    printf("Pipeline cases use one thread, retained slots and bounded post/drain windows.\n"
+           "Their total includes clear+draw, preparation, event polling and final completion;\n"
+           "facets/sec uses this completed-item total, with render_ms empty (no swaps).\n"
+           "Enqueue/drain are host intervals, not GPU-stage times. max_queued counts software\n"
+           "submissions since a drain, not hardware occupancy. Queue 1 is the matched control.\n");
     printf(
            "Preparation includes native-array conversion/allocation where applicable.\n"
            "Rebuild cases also recreate portable list AND strip representations; this\n"
            "is harness preparation cost, not an optimized engine implementation.\n"
            "Statistics are medians/ranges of per-trial means, not frame-latency percentiles.\n"
            "Mesh bytes exclude XGL/native buffers and driver allocations.\n");
+    printf("Nominal area is reference orthographic pixel area before transforms/clipping.\n"
+           "Calibrated area/shape cases keep exact geometric area and count at both sizes;\n"
+           "overlap is intentional when necessary, at equal Z with LEQUAL depth testing.\n"
+           "Input payload estimates exclude descriptors/driver packing; they are not measured\n"
+           "SBus or DMA traffic. Posting or retaining arrays does not prove DMA is active.\n");
+    printf("Whitepaper context: 210K isolated 100px lit Gouraud/Z/depth-cued triangles/sec\n"
+           "was a VRAM-limited historical result. These flat tests do not reproduce that\n"
+           "workload; treat it as context, not an expected result or a pass/fail threshold.\n");
     if (!xb_backend_has_hardware())
         printf("FALLBACK/TEST RUN: results do not establish the accelerated ZX performance path.\n");
     nresult = 0; successes = 0;

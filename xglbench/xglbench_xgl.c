@@ -18,6 +18,19 @@
 #define XB_RASTER_W 128
 #define XB_RASTER_H 64
 
+/* Every pointer reachable by a retained draw remains stable until completion.
+ * Keeping separate native copies also prevents CPU color preparation from
+ * overwriting geometry still being consumed by the accelerator.
+ */
+typedef struct {
+    Xgl_pt_f3d *points;
+    Xgl_pt_list *lists;
+    Xgl_color_facet *facets;
+    Xgl_facet_list *batch_facets;
+    size_t triangles, point_count;
+    int pending, prepared;
+} xb_native_slot;
+
 typedef struct {
     Display *display;
     int screen, width, height, depth, quit, hardware, current_z, obscured;
@@ -43,10 +56,27 @@ typedef struct {
     enum xb_method method;
     int batch, perspective, errors, fatal;
     int raster_checked, raster_ok, mask_checked, mask_ok;
+    xb_native_slot stream[XB_MAX_QUEUE];
+    int stream_active, stream_slots, stream_batch;
+    Xgl_boolean stream_previous_volatile;
 } xb_native;
 
 static xb_native b;
 static int validate_raster(int masked);
+static int validate_stream(void);
+
+static void free_stream_slots(void)
+{
+    int i;
+    for (i = 0; i < XB_MAX_QUEUE; ++i) {
+        free(b.stream[i].points);
+        free(b.stream[i].lists);
+        free(b.stream[i].facets);
+        free(b.stream[i].batch_facets);
+        memset(&b.stream[i], 0, sizeof(b.stream[i]));
+    }
+    b.stream_slots = 0;
+}
 
 static void copy_text(char *dest, size_t size, const char *src)
 {
@@ -425,6 +455,9 @@ void xb_backend_close(void)
 {
     if (b.ctx && !b.errors) xb_backend_sync();
     if (b.system) xgl_close(b.system); /* also destroys every XGL object */
+    /* Even after an error, xgl_close ends all native references. */
+    free_stream_slots();
+    b.stream_active = 0;
     free_geometry();
     if (b.display) {
         if (b.window) XDestroyWindow(b.display, b.window);
@@ -483,14 +516,19 @@ void xb_backend_info(FILE *out)
             support(b.inquiry.transparency), support(b.inquiry.lighting));
     fprintf(out, "State: flat facet RGB; no XGL illumination/textures; culling off; "
                  "six clipping planes; deferred submission; volatile geometry "
-                 "except the named retained-array case.\n");
+                 "except retained-array and pipeline cases.\n");
     fprintf(out, "Raster copies share the 3D context to preserve draw order "
                  "without inter-context synchronization.\n");
     fprintf(out, "Triangle-list facets are padded per batch to num_points-2 as "
                  "documented; readback must pass. No IS_PLANAR flag is used.\n");
-    fprintf(out, "Strips retain native vertex sharing; batch caps split strips "
+    fprintf(out, "Strip inputs share vertex records; batch caps split strips "
                  "with two overlapping vertices. Raster copies: %dx%d.\n",
             XB_RASTER_W, XB_RASTER_H);
+    fprintf(out, "Pipeline: one thread/context; stable native slots; BUFFERS posts, "
+                 "SYNCHRONIZE drains before slot reuse; no presentation.\n");
+    fprintf(out, "Input bytes count referenced native points/facet colors, including "
+                 "strip overlaps and list padding, excluding descriptors; "
+                 "not measured SBus/DMA traffic.\n");
     if (!b.hardware || b.buffers < 2)
         fprintf(out, "DIAGNOSTIC FALLBACK: these results do not establish ZX hardware performance.\n");
 }
@@ -499,6 +537,10 @@ int xb_backend_upload(const xb_mesh *mesh)
 {
     size_t i, start, count, batch_count;
     int needs_points, needs_lists;
+    if (b.stream_active) {
+        fail("end the active stream before uploading ordinary native geometry");
+        return 0;
+    }
     if (!mesh || !mesh->triangles || mesh->point_count != mesh->triangles * 3)
         return 0;
     if (b.batch <= 0) b.batch = 128;
@@ -589,12 +631,202 @@ void xb_backend_colors(const xb_mesh *mesh)
     }
 }
 
+size_t xb_backend_input_bytes(enum xb_method method, int batch)
+{
+    size_t i, count, batches, points, facets;
+    if (method != b.method) return 0;
+    if (batch <= 0) batch = 128;
+    points = b.point_count;
+    facets = b.triangles;
+    if (method == XB_STRIP) {
+        points = facets = 0;
+        for (i = 0; i < b.strip_count; ++i) {
+            count = b.strips[i].point_count - 2;
+            batches = (count + (size_t)batch - 1) / (size_t)batch;
+            points += count + 2 * batches;
+            facets += count;
+        }
+    } else if (method == XB_TLIST) {
+        batches = (b.triangles + (size_t)batch - 1) / (size_t)batch;
+        facets = 3 * b.triangles - 2 * batches;
+    }
+    return points * sizeof(Xgl_pt_f3d) + facets * sizeof(Xgl_color_facet);
+}
+
+static int allocate_stream_slot(int index, const xb_mesh *mesh)
+{
+    xb_native_slot *slot;
+    size_t i, start, count, batches;
+    slot = &b.stream[index];
+    slot->triangles = mesh->triangles;
+    slot->point_count = mesh->point_count;
+    batches = (mesh->triangles + (size_t)b.stream_batch - 1) /
+              (size_t)b.stream_batch;
+    slot->points = (Xgl_pt_f3d *)calloc(mesh->point_count, sizeof(*slot->points));
+    slot->lists = (Xgl_pt_list *)calloc(mesh->triangles, sizeof(*slot->lists));
+    slot->facets = (Xgl_color_facet *)calloc(mesh->triangles, sizeof(*slot->facets));
+    slot->batch_facets = (Xgl_facet_list *)calloc(batches, sizeof(*slot->batch_facets));
+    if (!slot->points || !slot->lists || !slot->facets || !slot->batch_facets) {
+        fail("out of memory allocating stable native stream slots");
+        return 0;
+    }
+    for (i = 0; i < mesh->point_count; ++i) {
+        slot->points[i].x = mesh->points[i].x;
+        slot->points[i].y = mesh->points[i].y;
+        slot->points[i].z = mesh->points[i].z;
+    }
+    for (i = 0; i < mesh->triangles; ++i) {
+        slot->lists[i].pt_type = XGL_PT_F3D;
+        slot->lists[i].num_pts = 3;
+        slot->lists[i].pts.f3d = slot->points + i * 3;
+        slot->facets[i].color.rgb.r = mesh->colors[i].r;
+        slot->facets[i].color.rgb.g = mesh->colors[i].g;
+        slot->facets[i].color.rgb.b = mesh->colors[i].b;
+    }
+    for (i = 0, start = 0; start < mesh->triangles; ++i, start += count) {
+        count = mesh->triangles - start;
+        if (count > (size_t)b.stream_batch) count = (size_t)b.stream_batch;
+        slot->batch_facets[i].facet_type = XGL_FACET_COLOR;
+        slot->batch_facets[i].num_facets = (Xgl_usgn32)count;
+        slot->batch_facets[i].facets.color_facets = slot->facets + start;
+    }
+    slot->prepared = 1;
+    return 1;
+}
+
+int xb_backend_stream_prepare(int index, const xb_mesh *mesh)
+{
+    xb_native_slot *slot;
+    size_t i;
+    if (b.errors || b.fatal) return 0;
+    if (!b.stream_active || index < 0 || index >= b.stream_slots) {
+        fail("invalid native stream slot");
+        return 0;
+    }
+    slot = &b.stream[index];
+    if (slot->pending) {
+        fail("stream slot is pending; synchronize before replacing its colors");
+        return 0;
+    }
+    if (!mesh || !mesh->colors || mesh->triangles != slot->triangles ||
+        mesh->point_count != slot->point_count) {
+        fail("stream preparation requires the original static geometry dimensions");
+        return 0;
+    }
+    /* No allocation or source-mesh reference survives this call. */
+    for (i = 0; i < slot->triangles; ++i) {
+        slot->facets[i].color.rgb.r = mesh->colors[i].r;
+        slot->facets[i].color.rgb.g = mesh->colors[i].g;
+        slot->facets[i].color.rgb.b = mesh->colors[i].b;
+    }
+    slot->prepared = 1;
+    return 1;
+}
+
+static size_t draw_stream_slot(int index, int clear)
+{
+    xb_native_slot *slot;
+    size_t start, count, calls;
+    if (b.errors || b.fatal) return 0;
+    if (!b.stream_active || index < 0 || index >= b.stream_slots) {
+        fail("invalid native stream slot");
+        return 0;
+    }
+    slot = &b.stream[index];
+    if (slot->pending || !slot->prepared) {
+        fail("stream slot must be initialized and completed before submission");
+        return 0;
+    }
+    /* Mark before any native operation: failure cannot make its references
+     * safe to overwrite. Only a successful completion clears this flag.
+     */
+    slot->pending = 1;
+    if (clear) xb_backend_clear(1, 1);
+    calls = 0;
+    for (start = 0; start < slot->triangles && !b.errors; start += count) {
+        count = slot->triangles - start;
+        if (count > (size_t)b.stream_batch) count = (size_t)b.stream_batch;
+        xgl_multi_simple_polygon(b.ctx,
+                XGL_FACET_FLAG_SIDES_ARE_3 | XGL_FACET_FLAG_SHAPE_CONVEX,
+                &slot->batch_facets[calls], NULL, (Xgl_usgn32)count,
+                slot->lists + start);
+        ++calls;
+    }
+    return b.errors ? 0 : calls;
+}
+
+size_t xb_backend_stream_draw(int index)
+{
+    return draw_stream_slot(index, 1);
+}
+
+void xb_backend_post(void)
+{
+    if (b.ctx && !b.errors) xgl_context_flush(b.ctx, XGL_FLUSH_BUFFERS);
+}
+
+int xb_backend_stream_drain(void)
+{
+    int i;
+    if (!b.ctx || b.errors || b.fatal) return 0;
+    xgl_context_flush(b.ctx, XGL_FLUSH_SYNCHRONIZE);
+    if (b.errors) return 0;
+    for (i = 0; i < b.stream_slots; ++i) b.stream[i].pending = 0;
+    return 1;
+}
+
+void xb_backend_stream_end(void)
+{
+    if (!b.stream_active) return;
+    if (!xb_backend_stream_drain()) return;
+    xgl_object_set(b.ctx, XGL_CTX_GEOM_DATA_IS_VOLATILE,
+                   b.stream_previous_volatile, 0);
+    if (b.errors) return;
+    free_stream_slots();
+    b.stream_active = 0;
+}
+
+int xb_backend_stream_begin(const xb_mesh *mesh, int slots,
+                            char *reason, size_t size)
+{
+    int i;
+    if (b.errors || b.fatal || b.quit) goto bad;
+    xb_backend_stream_end();
+    if (b.stream_active || b.errors) goto bad;
+    if (b.method != XB_MULTI || slots < 1 || slots > XB_MAX_QUEUE || !mesh ||
+        !mesh->triangles || mesh->point_count != mesh->triangles * 3 ||
+        !mesh->points || !mesh->colors) {
+        fail("streaming requires multi-polygon geometry and 1..8 stable slots");
+        goto bad;
+    }
+    xb_backend_sync();
+    if (b.errors) goto bad;
+    xgl_object_get(b.ctx, XGL_CTX_GEOM_DATA_IS_VOLATILE,
+                   &b.stream_previous_volatile);
+    if (b.errors) goto bad;
+    /* Record ownership before changing state so error recovery restores it. */
+    b.stream_active = 1;
+    b.stream_batch = b.batch;
+    xgl_object_set(b.ctx, XGL_CTX_GEOM_DATA_IS_VOLATILE, FALSE, 0);
+    if (b.errors || !validate_stream()) goto bad;
+    free_stream_slots(); /* probe has completed successfully */
+    b.stream_slots = slots;
+    for (i = 0; i < slots; ++i)
+        if (!allocate_stream_slot(i, mesh)) goto bad;
+    copy_text(reason, size, "independent queued slot colors and per-item color/Z clear readback passed");
+    return 1;
+bad:
+    copy_text(reason, size, b.error);
+    /* On a native failure end deliberately keeps arrays alive for a later
+     * reconfiguration recovery or, ultimately, xgl_close.
+     */
+    xb_backend_stream_end();
+    return 0;
+}
+
 int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
                          char *reason, size_t size)
 {
-    b.batch = test->batch > 0 ? test->batch : 128;
-    b.method = test->method;
-    b.perspective = test->perspective;
     if (b.fatal || b.quit) { copy_text(reason, size, b.error); return 0; }
     /* A recoverable API error aborts its case. Reset only at an explicit
      * reconfiguration boundary; nonrecoverable errors never resume drawing.
@@ -606,6 +838,14 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
      */
     xb_backend_sync();
     if (b.errors) { copy_text(reason, size, b.error); return 0; }
+    xb_backend_stream_end();
+    if (b.stream_active || b.errors) {
+        copy_text(reason, size, b.error);
+        return 0;
+    }
+    b.batch = test->batch > 0 ? test->batch : 128;
+    b.method = test->method;
+    b.perspective = test->perspective;
     if (test->retained && (test->method != XB_MULTI || test->update != XB_STATIC)) {
         copy_text(reason, size, "retained-array test requires static multi-polygon geometry");
         return 0;
@@ -845,6 +1085,84 @@ static int pixel_matches(int x, int y, const xb_rgb *expected)
         return 0;
     }
     return !b.errors;
+}
+
+static int validate_stream(void)
+{
+    xb_mesh mesh;
+    xb_point points[6];
+    xb_rgb colors[2], expected[2], black;
+    float x;
+    int i, j, px, py, saved_z, result;
+    memset(&mesh, 0, sizeof(mesh));
+    mesh.triangles = 2; mesh.point_count = 6;
+    mesh.points = points; mesh.colors = colors;
+    expected[0].r = 1; expected[0].g = expected[0].b = 0;
+    expected[1].r = 0; expected[1].g = expected[1].b = 1;
+    black.r = black.g = black.b = 0;
+    saved_z = b.current_z;
+    result = 0;
+    b.current_z = 1;
+    xgl_object_set(b.ctx, XGL_3D_CTX_HLHSR_MODE, XGL_HLHSR_Z_BUFFER, 0);
+    identity(b.model);
+    view_matrix(0);
+    /* Even the depth-one control exercises two independent native slots in
+     * this untimed gate. Disjoint patches survive until the joint readback;
+     * normal per-item clears would hide mistakes in earlier queued draws.
+     */
+    b.stream_slots = 2;
+    for (i = 0; i < 2; ++i) {
+        x = i ? 0.3f : -0.9f;
+        points[0].x = x;        points[0].y = -0.85f;
+        points[1].x = x + 0.6f; points[1].y = -0.85f;
+        points[2].x = x;        points[2].y = -0.5f;
+        points[3].x = -0.3f; points[3].y = -0.2f;
+        points[4].x = 0.3f;  points[4].y = -0.2f;
+        points[5].x = 0;     points[5].y = 0.4f;
+        for (j = 0; j < 6; ++j) points[j].z = i ? 0.8f : 0.2f;
+        colors[0] = colors[1] = black;
+        if (!allocate_stream_slot(i, &mesh)) goto done;
+    }
+    xb_backend_clear(1, 1);
+    for (i = 0; i < 2; ++i) {
+        colors[0] = colors[1] = expected[i];
+        if (!xb_backend_stream_prepare(i, &mesh)) goto done;
+        colors[0] = colors[1] = black; /* CPU source must not be retained. */
+        if (!draw_stream_slot(i, 0)) goto done;
+        xb_backend_post();
+    }
+    if (!xb_backend_stream_drain()) goto done;
+    py = (int)((-0.733333333 + 1.0) * 0.5 * (b.height - 1));
+    for (i = 0; i < 2; ++i) {
+        x = i ? 0.5f : -0.7f;
+        px = (int)((x + 1.0) * 0.5 * (b.width - 1));
+        if (!pixel_matches(px, py, &expected[i])) goto done;
+    }
+    if (!pixel_matches(b.width / 2, b.height / 2, &expected[0])) goto done;
+    /* Reuse only after completion. The second far central triangle must
+     * replace the first near triangle, proving the queued Z clear as well
+     * as the color clear (the old left patch must disappear).
+     */
+    for (i = 0; i < 2; ++i) {
+        if (!xb_backend_stream_draw(i)) goto done;
+        xb_backend_post();
+    }
+    if (!xb_backend_stream_drain()) goto done;
+    px = (int)(0.3 * 0.5 * (b.width - 1));
+    if (!pixel_matches(px, py, &black)) goto done;
+    px = (int)(1.5 * 0.5 * (b.width - 1));
+    if (!pixel_matches(px, py, &expected[1])) goto done;
+    if (!pixel_matches(b.width / 2, b.height / 2, &expected[1])) goto done;
+    result = 1;
+done:
+    /* Native failures preserve all queued references until recovery/close. */
+    if (!b.errors) {
+        b.current_z = saved_z;
+        xgl_object_set(b.ctx, XGL_3D_CTX_HLHSR_MODE,
+                       saved_z ? XGL_HLHSR_Z_BUFFER : XGL_HLHSR_NONE, 0);
+        view_matrix(b.perspective);
+    }
+    return result && !b.errors;
 }
 
 static int validate_raster(int masked)
