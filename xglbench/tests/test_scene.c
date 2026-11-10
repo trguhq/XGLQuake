@@ -629,6 +629,134 @@ static void test_vertex_materials(void)
     assert(!mesh.texcoords && !mesh.vertex_materials && !mesh.vertex_colors && !mesh.bytes);
 }
 
+/* Independently average texels from the exported base image for the CPU
+ * approximation filter. This checks image identity, wrapping and gain rather
+ * than merely comparing two calls to the same sampling implementation. */
+static xb_rgb reference_texture_sample(const xb_rgb *image, double u, double v, int depth)
+{
+    xb_rgb result;
+    double r, g, b, du, dv, delta;
+    int sx, sy, x, y, ix, iy, block, size;
+    block = 1 << (3 - depth);
+    size = XB_TEXTURE_WIDTH / block;
+    delta = 0.20 / (double)(1 << depth);
+    r = g = b = 0.0;
+    for (sy = -1; sy <= 1; sy += 2) {
+        for (sx = -1; sx <= 1; sx += 2) {
+            du = u + sx * delta; du -= floor(du);
+            dv = v + sy * delta; dv -= floor(dv);
+            x = (int)(du * size) * block;
+            y = (int)(dv * size) * block;
+            for (iy = 0; iy < block; ++iy)
+                for (ix = 0; ix < block; ++ix) {
+                    r += image[(y + iy) * XB_TEXTURE_WIDTH + x + ix].r;
+                    g += image[(y + iy) * XB_TEXTURE_WIDTH + x + ix].g;
+                    b += image[(y + iy) * XB_TEXTURE_WIDTH + x + ix].b;
+                }
+        }
+    }
+    result.r = (float)(r / (4 * block * block));
+    result.g = (float)(g / (4 * block * block));
+    result.b = (float)(b / (4 * block * block));
+    return result;
+}
+
+static void close_texture_color(xb_rgb a, xb_rgb b)
+{
+    assert(fabs((double)a.r - b.r) < 0.000003);
+    assert(fabs((double)a.g - b.g) < 0.000003);
+    assert(fabs((double)a.b - b.b) < 0.000003);
+}
+
+static void test_texture_comparison(void)
+{
+    xb_mesh mesh, before;
+    xb_rgb *image, *facet_snapshot, expected, sentinel;
+    xb_texcoord *uv_snapshot;
+    size_t count, i, corner, bytes;
+    int depth, vertex;
+    double u, v;
+    count = (size_t)XB_TEXTURE_WIDTH * XB_TEXTURE_WIDTH;
+    image = (xb_rgb *)malloc((count + 1) * sizeof(*image)); assert(image);
+    sentinel.r = -1.0f; sentinel.g = -2.0f; sentinel.b = -3.0f;
+    for (i = 0; i <= count; ++i) image[i] = sentinel;
+    assert(!xb_texture_image(NULL, count));
+    assert(!xb_texture_image(image, count - 1));
+    for (i = 0; i <= count; ++i) assert(!memcmp(&image[i], &sentinel, sizeof(sentinel)));
+    assert(xb_texture_image(image, count + 1));
+    assert(!memcmp(&image[count], &sentinel, sizeof(sentinel)));
+    /* Known base-image locations distinguish mortar and brick/checker RGB. */
+    expected.r = 0.16f; expected.g = 0.18f; expected.b = 0.15f;
+    close_texture_color(image[0], expected);
+    expected.r = 0.68f; expected.g = 0.28f; expected.b = 0.16f;
+    close_texture_color(image[XB_TEXTURE_WIDTH + 1], expected);
+    expected.r *= 0.85f; expected.g *= 0.85f; expected.b *= 0.85f;
+    close_texture_color(image[XB_TEXTURE_WIDTH + 4], expected);
+    for (i = 0; i < count; ++i) check_color(&image[i]);
+    memset(&mesh, 0, sizeof(mesh));
+    assert(!xb_mesh_texture_materials(NULL, 0, 0));
+    assert(!xb_mesh_texture_materials(&mesh, 0, 0));
+    for (depth = 0; depth <= 2; ++depth) {
+        for (vertex = 0; vertex <= 1; ++vertex) {
+            assert(xb_mesh_build(&mesh, 6, depth, 0.85f, 0));
+            bytes = mesh.bytes;
+            facet_snapshot = (xb_rgb *)malloc(mesh.triangles * sizeof(*facet_snapshot));
+            uv_snapshot = (xb_texcoord *)malloc(mesh.point_count * sizeof(*uv_snapshot));
+            assert(facet_snapshot && uv_snapshot);
+            memcpy(facet_snapshot, mesh.base_colors, mesh.triangles * sizeof(*facet_snapshot));
+            memcpy(uv_snapshot, mesh.texcoords, mesh.point_count * sizeof(*uv_snapshot));
+            before = mesh;
+            assert(!xb_mesh_texture_materials(&mesh, -1, vertex));
+            assert(!xb_mesh_texture_materials(&mesh, 3, vertex));
+            assert(!xb_mesh_texture_materials(&mesh, depth, 2));
+            mesh.texcoords[0].gain = -1.0f;
+            assert(!xb_mesh_texture_materials(&mesh, depth, vertex));
+            mesh.texcoords[0].gain = uv_snapshot[0].gain;
+            assert(!memcmp(&mesh, &before, sizeof(mesh)));
+            assert(!memcmp(facet_snapshot, mesh.base_colors, mesh.triangles * sizeof(*facet_snapshot)));
+            assert(!memcmp(uv_snapshot, mesh.texcoords, mesh.point_count * sizeof(*uv_snapshot)));
+            assert(xb_mesh_texture_materials(&mesh, depth, vertex));
+            assert(mesh.bytes == bytes + (vertex ? mesh.point_count * 2 * sizeof(xb_rgb) : 0));
+            assert((mesh.vertex_materials != NULL) == vertex);
+            assert((mesh.vertex_colors != NULL) == vertex);
+            for (i = 0; i < mesh.triangles; ++i) {
+                corner = i * 3;
+                u = ((double)uv_snapshot[corner].u + uv_snapshot[corner + 1].u +
+                     uv_snapshot[corner + 2].u) / 3.0;
+                v = ((double)uv_snapshot[corner].v + uv_snapshot[corner + 1].v +
+                     uv_snapshot[corner + 2].v) / 3.0;
+                expected = reference_texture_sample(image, u, v, depth);
+                close_texture_color(mesh.base_colors[i], expected);
+                close_texture_color(mesh.colors[i], expected);
+            }
+            for (i = 0; i < mesh.point_count; ++i) {
+                assert(mesh.texcoords[i].u == uv_snapshot[i].u);
+                assert(mesh.texcoords[i].v == uv_snapshot[i].v);
+                assert(mesh.texcoords[i].gain == 1.0f);
+                if (vertex) {
+                    expected = reference_texture_sample(image, uv_snapshot[i].u,
+                                                         uv_snapshot[i].v, depth);
+                    close_texture_color(mesh.vertex_materials[i], expected);
+                    close_texture_color(mesh.vertex_colors[i], expected);
+                }
+            }
+            if (vertex) assert(!xb_mesh_texture_materials(&mesh, depth, vertex));
+            free(facet_snapshot); free(uv_snapshot); xb_mesh_free(&mesh);
+        }
+    }
+    /* Untinted sampling must preserve periodic wrapping, including negatives. */
+    assert(xb_mesh_build(&mesh, 2, 0, 0.85f, 0));
+    for (i = 0; i < mesh.point_count; ++i) {
+        mesh.texcoords[i].u = i & 1 ? -0.125f : 0.875f;
+        mesh.texcoords[i].v = i & 1 ? -0.25f : 0.75f;
+        mesh.texcoords[i].gain = i & 1 ? 0.0f : 1.0f;
+    }
+    assert(xb_mesh_texture_materials(&mesh, 2, 1));
+    for (i = 1; i < mesh.point_count; ++i)
+        close_texture_color(mesh.vertex_materials[0], mesh.vertex_materials[i]);
+    xb_mesh_free(&mesh); free(image);
+}
+
 int main(void)
 {
     int method;
@@ -640,9 +768,10 @@ int main(void)
     test_calibrated_geometry();
     test_projected_area();
     test_vertex_materials();
+    test_texture_comparison();
     for (method = 0; method < XB_METHODS; ++method)
         assert(xb_method_name((enum xb_method)method)[0] != '\0');
     puts("scene tests: geometry equivalence, subdivision coverage, color caches,"
-         " vertex texture samples, calibrated pixel areas, allocation accounting and invalid inputs passed");
+         " vertex texture samples, exported texture controls, calibrated pixel areas, allocation accounting and invalid inputs passed");
     return 0;
 }

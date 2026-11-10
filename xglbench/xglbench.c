@@ -7,7 +7,7 @@
 #include <string.h>
 #include <sys/utsname.h>
 
-#define XB_MAX_CASES 192
+#define XB_MAX_CASES 256
 #define XB_TARGET_FRAME_SECONDS (1.0 / 15.0)
 #if XB_MAX_RESULTS < 2 * XB_MAX_CASES
 #error Result capacity must cover both default resolutions
@@ -154,6 +154,7 @@ static int make_cases(xb_case *cases)
     xb_case *c;
     const char *sizes[3];
     const char *paths[4];
+    const char *texture_modes[5];
     float scale[3];
     n = 0;
     batches[0] = 8; batches[1] = 32; batches[2] = 128; batches[3] = 512;
@@ -323,6 +324,32 @@ static int make_cases(xb_case *cases)
             c->mixed_winding = path; c->cull = mode;
         }
     }
+    texture_modes[0] = "facet-flat"; texture_modes[1] = "vertex-smooth";
+    texture_modes[2] = "point"; texture_modes[3] = "bilinear";
+    texture_modes[4] = "trilinear";
+    for (mode = 0; mode < 5; ++mode) {
+        for (path = 0; path < 2; ++path) {
+            for (d = 0; d <= 2; ++d) {
+                sprintf(name, "texture-map/%s/%s/depth-%d", texture_modes[mode],
+                    path ? "frame" : "draw", d);
+                c = add_case(cases, &n, name);
+                c->depth = d; c->work = path ? XB_FRAME : XB_DRAW;
+                c->texture_compare = 1;
+                c->vertex_material = mode == 1;
+                c->shade = mode == 1 ? XB_SMOOTH : XB_FLAT;
+                c->texture_filter = mode < 2 ? XB_TEXTURE_OFF :
+                                      (enum xb_texture_filter)(mode - 1);
+            }
+        }
+        sprintf(name, "texture-map/%s/perspective-motion/depth-1", texture_modes[mode]);
+        c = add_case(cases, &n, name);
+        c->depth = 1; c->texture_compare = 1;
+        c->perspective = 1; c->update = XB_TRANSFORM;
+        c->vertex_material = mode == 1;
+        c->shade = mode == 1 ? XB_SMOOTH : XB_FLAT;
+        c->texture_filter = mode < 2 ? XB_TEXTURE_OFF :
+                              (enum xb_texture_filter)(mode - 1);
+    }
     return n;
 }
 
@@ -355,7 +382,21 @@ static int build_mesh(xb_mesh *mesh, const xb_options *o, const xb_case *c,
         for (i = 0; i < mesh->strip_point_count; ++i)
             mesh->strip_points[i].z = (mesh->strip_points[i].x + .2f) * .8f;
     }
-    if (ok && c->vertex_material && !xb_mesh_vertex_materials(mesh, c->depth)) {
+    if (ok && c->texture_compare && c->perspective) {
+        /* A tilted plane varies W within each triangle: a front-parallel
+         * rotating patch would not exercise perspective-correct UVs. */
+        for (i = 0; i < mesh->point_count; ++i)
+            mesh->points[i].z = .45f + .35f * mesh->points[i].x;
+        for (i = 0; i < mesh->strip_point_count; ++i)
+            mesh->strip_points[i].z = .45f + .35f * mesh->strip_points[i].x;
+    }
+    if (ok && c->texture_compare &&
+        !xb_mesh_texture_materials(mesh, c->depth, c->vertex_material)) {
+        xb_mesh_free(mesh);
+        return 0;
+    }
+    if (ok && !c->texture_compare && c->vertex_material &&
+        !xb_mesh_vertex_materials(mesh, c->depth)) {
         xb_mesh_free(mesh);
         return 0;
     }
@@ -716,6 +757,16 @@ static int style_layers(const xb_case *c)
     return c->lighting == XB_LIGHT_QUAKE ? 1 : 0;
 }
 
+static const char *texture_filter_name(enum xb_texture_filter filter)
+{
+    switch (filter) {
+    case XB_TEXTURE_POINT: return "point";
+    case XB_TEXTURE_BILINEAR: return "bilinear";
+    case XB_TEXTURE_TRILINEAR: return "trilinear";
+    default: return "off";
+    }
+}
+
 static void csv_row(FILE *f, const xb_result *r, const char *record, int trial,
                     double total, double prep, double render, double present, double cpu)
 {
@@ -750,11 +801,19 @@ static void csv_row(FILE *f, const xb_result *r, const char *record, int trial,
     fprintf(f, "%s,%s,%s,%d,%d,%d,%s,%s,%s,%s,", r->test.shade == XB_SMOOTH ? "smooth" : "flat",
         lighting_name(&r->test), lighting_compute(&r->test), r->test.lights,
         r->test.moving, style_layers(&r->test), lighting_sample(&r->test),
-        r->test.vertex_material ? "vertices" : "facet",
+        r->test.texture_filter != XB_TEXTURE_OFF ? "texels" :
+            (r->test.vertex_material ? "vertices" : "facet"),
         r->test.cull ? "back" : "off", r->test.mixed_winding ? "mixed" : "front");
     if (r->passed && r->test.work == XB_FRAME)
         fprintf(f, "%.9f,%.9f", XB_TARGET_FRAME_SECONDS * 1000,
                 total / XB_TARGET_FRAME_SECONDS);
+    else fputc(',', f);
+    fprintf(f, ",%s,%s,%s,",
+        r->test.texture_filter != XB_TEXTURE_OFF ? "native-xgl" : "none",
+        texture_filter_name(r->test.texture_filter),
+        r->test.texture_filter != XB_TEXTURE_OFF ? "unclassified" : "none");
+    if (r->test.texture_filter != XB_TEXTURE_OFF)
+        fprintf(f, "%d,%d", XB_TEXTURE_WIDTH, XB_TEXTURE_WIDTH);
     else fputc(',', f);
     fputc('\n', f);
 }
@@ -802,6 +861,11 @@ static void print_result(FILE *csv, const xb_result *r)
     }
     if (r->test.vertex_material)
         printf("  Material RGB sampled at each corner; interpolation includes texture color.\n");
+    if (r->test.texture_filter != XB_TEXTURE_OFF)
+        printf("  Native XGL %s texture mapping, %dx%d RGB image; execution unclassified.\n"
+               "  Software texturing is allowed; device acceleration reports do not classify it.\n"
+               "  Texture upload/mipmap setup and readback are outside timing; completed draws are timed.\n",
+               texture_filter_name(r->test.texture_filter), XB_TEXTURE_WIDTH, XB_TEXTURE_WIDTH);
     if (!strncmp(r->test.name, "cull/", 5))
         printf("  Backface culling %s; %s winding. Facet rate counts submitted triangles,\n"
                "  including rejected backfaces; this is not a CPU-culling comparison.\n",
@@ -1014,7 +1078,8 @@ int main(int argc, char **argv)
         fprintf(csv, "timing_mode,queue_limit,max_queued,drain_calls,enqueue_ms,drain_ms,"
                      "nominal_area_mean_px,nominal_area_min_px,nominal_area_max_px,input_payload_bytes,");
         fprintf(csv, "shading,lighting_model,lighting_compute,light_count,light_motion,style_layers,lighting_sample,"
-                     "material_sample,cull,winding,frame_budget_ms,frame_budget_fraction\n");
+                     "material_sample,cull,winding,frame_budget_ms,frame_budget_fraction,"
+                     "texture_mapping,texture_filter,texture_execution,texture_width,texture_height\n");
     }
     results = (xb_result *)calloc(XB_MAX_RESULTS, sizeof(*results));
     if (!results) { if (csv) fclose(csv); fprintf(stderr, "Out of memory.\n"); return 1; }
@@ -1030,7 +1095,7 @@ int main(int argc, char **argv)
     xb_backend_info(stdout);
     printf("Settings: %d base triangles; %.3f seconds/trial; %d repeats; %.3f seconds warm-up; queue %d\n",
         o.base_triangles, o.seconds, o.repeats, o.warmup, o.queue);
-    printf("Texture sampling is CPU-only; XGL receives material/final RGB, positions and optional normals.\n"
+    printf("Sampled-color cases use CPU material RGB; texture-map cases also compare native XGL texturing.\n"
            "All timed rendering waits for completion. No result is a GPU-only timer.\n"
            "Totals include reset clears; draw render_ms excludes the reset. frame/* includes\n"
            "clear+draw+masked HUD in render_ms and swap in present_ms. Their event polling is untimed.\n");
@@ -1067,6 +1132,9 @@ int main(int argc, char **argv)
     printf("All cases use one application thread; no SMP or worker-thread tests are included.\n"
            "Full-frame budget reference is 15 FPS (66.667 ms), not a promised Quake frame rate.\n"
            "Allow time for engine logic, visibility, audio, input and workloads absent here.\n");
+    printf("Native texturing is optional and may execute in software, even on a hardware DGA pipeline.\n"
+           "Unsupported/incorrect mapping is skipped, never replaced by a timed untextured fallback.\n"
+           "texture-map/* compares the same raw image without synthetic patch tint or lighting.\n");
     if (!xb_backend_has_hardware())
         printf("FALLBACK/TEST RUN: results do not establish the accelerated ZX performance path.\n");
     nresult = 0; successes = 0;

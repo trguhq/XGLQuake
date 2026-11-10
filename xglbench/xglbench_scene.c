@@ -3,9 +3,10 @@
  *
  * Procedural geometry and material sampling. No Quake assets or renderer code
  * are required. The 64x64 brick/checker image and its averaged RGB mip levels
- * live in CPU memory only. A facet receives a small filtered sample around its
+ * are generated in CPU memory. A facet receives a small filtered sample around its
  * UV centroid. Optional per-corner samples use the same CPU filter at each
- * corner; no per-pixel texturing is performed by either this file or XGL.
+ * corner. This file does no per-pixel rasterization; the base image is also
+ * exported for the optional native XGL texture-mapping comparison.
  *
  * Each base square contributes two triangles. Uniform edge subdivision yields
  * 2 * 4^depth triangles per square. The strip and independent-triangle arrays
@@ -20,7 +21,7 @@
 #include <string.h>
 
 #define XB_SCENE_MAX_TRIANGLES 262144UL
-#define XB_TEXTURE_SIZE 64
+#define XB_TEXTURE_SIZE XB_TEXTURE_WIDTH
 #define XB_TEXTURE_LEVELS 4
 #define XB_TEXTURE_PIXELS (4096 + 1024 + 256 + 64)
 
@@ -82,6 +83,15 @@ xb_texture_init(void)
         }
     }
     xb_texture_ready = 1;
+}
+
+int
+xb_texture_image(xb_rgb *pixels, size_t count)
+{
+    if (!pixels || count < (size_t)XB_TEXTURE_SIZE * XB_TEXTURE_SIZE) return 0;
+    xb_texture_init();
+    memcpy(pixels, xb_texture, (size_t)XB_TEXTURE_SIZE * XB_TEXTURE_SIZE * sizeof(*pixels));
+    return 1;
 }
 
 static xb_rgb
@@ -243,6 +253,61 @@ xb_mesh_vertex_materials(xb_mesh *mesh, int depth)
         coord = mesh->texcoords + i;
         materials[i] = xb_material_sample(coord->u, coord->v, depth, coord->gain);
         colors[i] = materials[i];
+    }
+    mesh->vertex_materials = materials;
+    mesh->vertex_colors = colors;
+    mesh->bytes += extra;
+    return 1;
+}
+
+int
+xb_mesh_texture_materials(xb_mesh *mesh, int depth, int vertex)
+{
+    xb_rgb *materials, *colors;
+    const xb_texcoord *coord;
+    size_t i, corner, extra;
+    double u, v;
+    if (!mesh || depth < 0 || depth > 2 || (vertex != 0 && vertex != 1) ||
+        !mesh->triangles || mesh->triangles > XB_SCENE_MAX_TRIANGLES ||
+        mesh->point_count != mesh->triangles * 3 || !mesh->texcoords ||
+        !mesh->colors || !mesh->base_colors || mesh->lighting_ready ||
+        mesh->vertex_materials || mesh->vertex_colors)
+        return 0;
+    for (i = 0; i < mesh->point_count; ++i) {
+        coord = mesh->texcoords + i;
+        if (!(coord->u >= -FLT_MAX && coord->u <= FLT_MAX &&
+              coord->v >= -FLT_MAX && coord->v <= FLT_MAX &&
+              coord->gain >= 0.0f && coord->gain <= 1.0f)) return 0;
+    }
+    extra = vertex ? mesh->point_count * 2 * sizeof(xb_rgb) : 0;
+    if (mesh->bytes > (size_t)-1 - extra) return 0;
+    materials = colors = NULL;
+    if (vertex) {
+        materials = (xb_rgb *)malloc(mesh->point_count * sizeof(*materials));
+        colors = (xb_rgb *)malloc(mesh->point_count * sizeof(*colors));
+        if (!materials || !colors) { free(materials); free(colors); return 0; }
+    }
+    /* All rejecting checks and allocations precede the commit. Use preserved
+     * UVs instead of geometry, which may already have been transformed. The
+     * native REPLACE texture path has no per-patch tint, so neither do these
+     * matched approximation controls. Filtering policies still differ. */
+    xb_texture_init();
+    for (i = 0; i < mesh->triangles; ++i) {
+        corner = i * 3;
+        u = ((double)mesh->texcoords[corner].u + mesh->texcoords[corner + 1].u +
+             mesh->texcoords[corner + 2].u) / 3.0;
+        v = ((double)mesh->texcoords[corner].v + mesh->texcoords[corner + 1].v +
+             mesh->texcoords[corner + 2].v) / 3.0;
+        mesh->base_colors[i] = xb_material_sample(u, v, depth, 1.0f);
+        mesh->colors[i] = mesh->base_colors[i];
+    }
+    for (i = 0; i < mesh->point_count; ++i) {
+        mesh->texcoords[i].gain = 1.0f;
+        if (vertex) {
+            materials[i] = xb_material_sample(mesh->texcoords[i].u,
+                mesh->texcoords[i].v, depth, 1.0f);
+            colors[i] = materials[i];
+        }
     }
     mesh->vertex_materials = materials;
     mesh->vertex_colors = colors;

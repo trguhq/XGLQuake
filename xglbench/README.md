@@ -1,9 +1,10 @@
 # xglbench
 
 `xglbench` is a standalone Sun XGL benchmark for choosing the rendering path
-for XGLQuake. It uses procedural geometry and CPU-sampled material colors;
-it needs no Quake executable, PAK files, OpenGL library, or texture-mapping
-support. Its current scope is the future `WinQuake`-based `xglquake` renderer.
+for XGLQuake. It compares CPU-sampled material colors with optional native
+XGL texture mapping, using procedural geometry and a generated RGB image.
+It needs no Quake executable, PAK files or OpenGL library. Its current scope
+is the future `WinQuake`-based `xglquake` renderer.
 
 The intended measurement machine is Solaris 2.6 on a SPARCstation 10 with a
 Sun ZX/Leo board and the corresponding XGL runtime/device pipeline. The
@@ -57,9 +58,10 @@ linking against the real installed SDK remain the authoritative API check.
 
 Use the XGL installation supplied for the target Solaris system; do not
 assume a newer SDK or a particular release from the OS name alone. The
-benchmark records the runtime version and device capabilities. The new cases
-use the same documented XGL interfaces as the existing backend, and retain
-ANSI C and the native 32-bit build. Older/other device pipelines may skip
+benchmark records the runtime version and device capabilities. The benchmark
+retains ANSI C and the native 32-bit build. Native mapping uses the Texture
+Map interface introduced in XGL 3.1; XGL 3.0 SDK compatibility is not claimed.
+The existing lighting backend also uses 3.1 attributes. Other device pipelines may skip
 unsupported or incorrect paths. Actual cross-version compatibility still
 requires builds and readback checks against those installed SDKs/runtimes.
 
@@ -110,8 +112,8 @@ is supplied by the caller. Keep the window fully visible and unobscured, and
 avoid moving or resizing it during a trial. Run on the workstation's local
 OpenWindows display rather than through SSH X forwarding. Background work
 and window-system activity can materially affect a 60 MHz machine.
-The full suite has 182 cases per resolution. At the default duration and
-repeat count, its two resolutions require at least 18.2 minutes of measured
+The full suite has 217 cases per resolution. At the default duration and
+repeat count, its two resolutions require at least 21.7 minutes of measured
 work, plus setup, warm-up and validation. Use `-list`
 to inspect the current case list, `-quick` for a smoke run, or `-test` to
 investigate a particular family. There is no randomized test order, so rerun
@@ -171,6 +173,10 @@ close comparisons and control changes in background load.
   Full-frame cases include a masked HUD copy as well as the scene and swap.
 * **Can a practical HUD be cheap?** Opaque and one-bit-masked raster-copy
   cases exercise 2D images without creating a triangle per image pixel.
+* **Is actual XGL texture mapping usable?** Optional point, bilinear and
+  trilinear texture modes use the same CPU-generated image as matched
+  flat-facet and smooth-corner controls. Draw-only, complete-frame and
+  tilted perspective-motion cases separate mapping cost from presentation.
 * **Does hardware backface rejection help?** Paired `cull/*` cases submit
   identical all-front or mixed-winding independent triangles with culling
   off or backface culling on. These measure device rejection, not CPU-side
@@ -231,6 +237,66 @@ not a thread count. Queue one is the serialized reference. No test uses the
 second host processor explicitly. Real SDK and on-device readback validation
 remain required before treating any timings as hardware evidence.
 
+## Native XGL texture mapping
+
+`texture-map/*` adds 35 optional cases. It does not change the original
+sampled-color cases or make texture mapping a requirement for their execution.
+
+| Cases | Workload |
+| --- | --- |
+| `texture-map/{facet-flat,vertex-smooth,point,bilinear,trilinear}/draw/depth-{0,1,2}` | Matching geometry and source image; draw completion without timed presentation. |
+| `texture-map/{facet-flat,vertex-smooth,point,bilinear,trilinear}/frame/depth-{0,1,2}` | The same modes with color/Z clear, masked HUD, swap and completion. |
+| `texture-map/{facet-flat,vertex-smooth,point,bilinear,trilinear}/perspective-motion/depth-1` | A rotating, tilted plane whose depth varies within triangles, exercising perspective mapping. |
+
+The `facet-flat` and `vertex-smooth` controls approximate the texture with
+cached CPU colors. The three native modes supply explicit unwrapped UVs to
+XGL, which samples a 64x64 RGB mipmap through a Texture Map object. The image
+is the same procedural brick/checker material used by the CPU sampler. All
+five modes omit the older fixtures' synthetic per-patch brightness gain, so
+they compare raw material colors with no dynamic or baked lighting. They
+use the same geometry, depths, transforms and buffer operations. Their images
+are intentionally different approximations, not a claim of identical filtering.
+
+Native mapping replaces final RGB. Point and bilinear modes compare nearest
+and bilinear sampling; trilinear filtering also blends adjacent mip levels
+during minification. Magnification uses point sampling for point mode and
+bilinear sampling for the other two. Coordinates repeat in both directions;
+the tests include negative and seam-crossing UVs. Texture creation, upload,
+mipmap generation, native array allocation and readback validation occur
+before timing. Completed textured drawing, state changes needed during a
+frame, and presentation where requested are measured. Texture allocation and
+upload performance are not measured by these cases.
+
+**Do not infer texture acceleration from the device name or DGA support.**
+The documented device inquiry does not expose a texture-acceleration field.
+XGL may use its software path for texture mapping even when other operations
+are accelerated. That is an intended comparison and does not require
+`-allow-fallback`; the existing requirements for the base display/geometry
+path still apply. Results label texture execution `unclassified`. They show
+the cost of the installed XGL pipeline, not proof of hardware texturing.
+
+Unsupported mapping, failed texture readback, or a rendering error leaves
+the requested case skipped. It never becomes an apparently successful
+untextured fallback. Texture state is disabled for ordinary cases and HUD
+copies; a failure to reset that state can also skip subsequent cases, and
+fatal native errors still stop the run. The texture readback gates require
+a drawable at least 128x128 pixels. Native texturing is currently
+limited to unlit, non-streaming multi-polygon draws and complete frames.
+Combining native texturing with baked/dynamic illumination, strip submissions
+or retained streaming is a subsequent experiment.
+
+```sh
+./xglbench -test texture-map/ -winsize 320 240 -quick
+./xglbench -test texture-map/point/ -winsize 320 240 -csv texture-point.csv
+./xglbench -test texture-map/trilinear/frame/ -winsize 320 240 -triangles 128
+```
+
+Start with a short run on slower hardware, then use longer trials for useful
+comparisons. Texture-mapped low-subdivision geometry might outperform a much
+denser sampled-color approximation; it might also be substantially slower.
+Both outcomes are useful. Compare the visible result and completed frame time
+at a suitable detail level instead of ranking by triangle rate alone.
+
 ## Calibrated geometry and the whitepaper
 
 The fixed-area cases specify geometric area in screen pixels, before edge
@@ -287,9 +353,9 @@ not establish the cost of several moving positional lights. Subdivision
 increases setup and input work while approximately preserving the covered
 area; dividing the published triangle rate by a new triangle count is not a
 reliable FPS model.
-Material sampling remains on the CPU. Flat and smooth lighting are now
-separate experiments; neither uses XGL texture mapping or additional
-application threads.
+The original flat and smooth lighting experiments keep material sampling on
+the CPU. Optional native mapping is isolated in `texture-map/*`; every case
+continues to use one application thread.
 
 ## Lighting and smooth shading
 
@@ -509,13 +575,22 @@ hardware queue depth. `drain_calls` is the total number of measured drains
 across those trials. Like `frames_all_trials`, both fields repeat the case's
 aggregate metadata on individual trial rows.
 
-`material_sample` records `facet` or `vertices`; `cull` and `winding` describe
+`material_sample` records `facet`, `vertices`, or native `texels`; `cull` and `winding` describe
 the culling fixture. Successful `frame/*` rows also have `frame_budget_ms`
 (66.667 ms) and `frame_budget_fraction` (`total_ms` divided by that budget).
 Those two fields are empty for skipped and non-frame cases. A fraction below
 one only means this synthetic render workload fits the reference budget;
 it does not establish 15 FPS in Quake. Portable/mock results have no hardware
 performance meaning even when their fractions are small.
+
+Native texture cases use `material_sample=texels`. The additional
+`texture_mapping`, `texture_filter`, `texture_execution`, `texture_width`
+and `texture_height` columns identify the requested native mode and image
+size. They describe the requested configuration even for a skipped case;
+always check `status` before using its timing fields. A successful mapped row
+uses `native-xgl`, its filter name, `unclassified`, and `64,64`. Untextured
+rows use `none,off,none` and empty dimensions. Browser/WebGL performance is
+not measured by this executable.
 
 The `nominal_area_*` columns report geometric pixel area under the reference
 orthographic mapping, before model transforms or clipping. They do not

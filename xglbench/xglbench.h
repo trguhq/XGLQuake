@@ -5,13 +5,14 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define XB_VERSION "0.4"
+#define XB_VERSION "0.5"
 #define XB_MAX_QUEUE 8
 #define XB_MAX_LIGHTS 4
 #define XB_STYLE_LAYERS 4
 #define XB_MAX_RESULTS 512
 #define XB_MAX_REPEATS 31
 #define XB_METHODS 4
+#define XB_TEXTURE_WIDTH 64
 
 typedef struct { float x, y, z; } xb_point;
 typedef struct { float r, g, b; } xb_rgb;
@@ -42,6 +43,8 @@ enum xb_work { XB_DRAW, XB_COLOR_CLEAR, XB_DEPTH_CLEAR, XB_SWAP,
 enum xb_update { XB_STATIC, XB_TRANSFORM, XB_COLORS, XB_REBUILD, XB_LIGHT_UPDATE };
 enum xb_shade { XB_FLAT, XB_SMOOTH };
 enum xb_light_model { XB_LIGHT_OFF, XB_LIGHT_BAKED, XB_LIGHT_LAMBERT, XB_LIGHT_QUAKE };
+enum xb_texture_filter { XB_TEXTURE_OFF, XB_TEXTURE_POINT,
+                         XB_TEXTURE_BILINEAR, XB_TEXTURE_TRILINEAR };
 
 typedef struct {
     int count, directional;
@@ -61,11 +64,12 @@ typedef struct {
     enum xb_update update;
     int batch, depth, zbuffer, overdraw, perspective, connected, retained, clipping, reverse;
     int streaming;
-    int vertex_material, cull, mixed_winding;
+    int vertex_material, cull, mixed_winding, texture_compare;
     float size;
     double area, aspect; /* positive area requests calibrated projected geometry */
     enum xb_shade shade;
     enum xb_light_model lighting;
+    enum xb_texture_filter texture_filter;
     int xgl_lighting, lights, directional, styles, moving;
 } xb_case;
 
@@ -108,6 +112,13 @@ int xb_mesh_reverse_draw_order(xb_mesh *mesh);
 /* Cache material samples before lighting init; also creates unlit vertex RGB.
  * Call once on a generated mesh. Rejected input leaves the mesh unchanged. */
 int xb_mesh_vertex_materials(xb_mesh *mesh, int depth);
+/* Texture-comparison controls share untinted RGB with the native texture.
+ * Replaces facet colors and resets UV gains; vertex!=0 also caches corners.
+ * Run once before lighting. Failure leaves all existing mesh data unchanged. */
+int xb_mesh_texture_materials(xb_mesh *mesh, int depth, int vertex);
+/* Copy the base image as row-major normalized RGB, beginning at UV (0,0).
+ * Requires capacity for XB_TEXTURE_WIDTH squared pixels; extra space is untouched. */
+int xb_texture_image(xb_rgb *pixels, size_t count);
 void xb_mesh_free(xb_mesh *mesh);
 void xb_mesh_colors(xb_mesh *mesh, unsigned long frame);
 size_t xb_mesh_expected_triangles(int base_triangles, int depth);

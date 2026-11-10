@@ -45,6 +45,13 @@ typedef struct {
     Xgl_ctx ctx;
     Xgl_trans model, view;
     Xgl_mem_ras hud, mask;
+    Xgl_mem_ras texture_rasters[7];
+    Xgl_mipmap_texture texture_mipmap;
+    Xgl_tmap texture_map;
+    Xgl_boolean texture_switch;
+    int texture_attached;
+    enum xb_texture_filter texture_filter;
+    float *texture_points; /* packed XYZUV, five floats per corner */
     Xgl_inquire inquiry;
     Xgl_usgn32 buffers;
     char device[160], error[256], version[160];
@@ -73,6 +80,9 @@ static int validate_raster(int masked);
 static int validate_stream(void);
 static int validate_lighting(void);
 static int validate_culling(void);
+static int pixel_matches(int x, int y, const xb_rgb *expected);
+static int configure_texture(const xb_case *test);
+static int texture_enable(int enabled);
 
 static void free_stream_slots(void)
 {
@@ -208,6 +218,306 @@ static int make_hud(void)
     xgl_object_set(b.ctx, XGL_CTX_RASTER_FPAT, b.mask,
                    XGL_CTX_ROP, XGL_ROP_COPY, 0);
     return !b.errors;
+}
+
+/* XGL 3.1+ Texture Map objects, Reference pp.106-110,118,339-340,374-378,
+ * 461; Programmer's Guide pp.469-482. This is pixel-level texturing. The
+ * NO_INTERP (vertex-only texture sampling) mode is deliberately never used.
+ */
+static int texture_enable(int enabled)
+{
+    if (b.errors) return 0;
+    if (!b.texture_attached) return !enabled;
+    b.texture_switch = enabled ? TRUE : FALSE;
+    xgl_object_set(b.ctx, XGL_3D_CTX_SURF_FRONT_TMAP_SWITCHES,
+                   &b.texture_switch, 0);
+    return !b.errors;
+}
+
+static Xgl_usgn32 *texture_raster_pixels(int level)
+{
+    Xgl_usgn32 *pixels;
+    int side;
+    side = XB_TEXTURE_WIDTH >> level;
+    if (!b.texture_rasters[level])
+        b.texture_rasters[level] = xgl_object_create(b.system, XGL_MEM_RAS, NULL,
+                XGL_RAS_DEPTH, 32, XGL_RAS_WIDTH, side, XGL_RAS_HEIGHT, side,
+                XGL_DEV_COLOR_TYPE, XGL_COLOR_RGB, 0);
+    if (!b.texture_rasters[level] || b.errors) return NULL;
+    pixels = NULL;
+    xgl_object_get(b.texture_rasters[level], XGL_MEM_RAS_IMAGE_BUFFER_ADDR, &pixels);
+    return b.errors ? NULL : pixels;
+}
+
+static Xgl_usgn32 texture_word(const xb_rgb *rgb)
+{
+    return ((Xgl_usgn32)(rgb->b * 255.0f + .5f) << 16) |
+           ((Xgl_usgn32)(rgb->g * 255.0f + .5f) << 8) |
+           (Xgl_usgn32)(rgb->r * 255.0f + .5f);
+}
+
+static int texture_build_image(int pattern)
+{
+    xb_rgb image[XB_TEXTURE_WIDTH * XB_TEXTURE_WIDTH], rgb;
+    Xgl_usgn32 *pixels;
+    int x, y;
+    pixels = texture_raster_pixels(0);
+    if (!pixels) { if (!b.errors) fail("cannot access texture memory raster"); return 0; }
+    if (!pattern && !xb_texture_image(image, XB_TEXTURE_WIDTH * XB_TEXTURE_WIDTH)) {
+        fail("cannot obtain benchmark texture image");
+        return 0;
+    }
+    for (y = 0; y < XB_TEXTURE_WIDTH; ++y) {
+        for (x = 0; x < XB_TEXTURE_WIDTH; ++x) {
+            if (pattern == 1) {
+                /* Asymmetric UV quadrants: red, green, blue, yellow. */
+                rgb.r = (x < XB_TEXTURE_WIDTH / 2) == (y < XB_TEXTURE_WIDTH / 2);
+                rgb.g = x >= XB_TEXTURE_WIDTH / 2;
+                rgb.b = x < XB_TEXTURE_WIDTH / 2 && y >= XB_TEXTURE_WIDTH / 2;
+            } else if (pattern == 2) rgb.r = rgb.g = rgb.b = (float)(x & 1);
+            else rgb = image[y * XB_TEXTURE_WIDTH + x];
+            /* CPU row zero denotes v=0. Memory Raster row zero is the top;
+             * XGL texture v=0 is the bottom. Native word layout is 0x00BBGGRR.
+             */
+            pixels[(XB_TEXTURE_WIDTH - 1 - y) * XB_TEXTURE_WIDTH + x] = texture_word(&rgb);
+        }
+    }
+    if (!b.texture_mipmap)
+        b.texture_mipmap = xgl_object_create(b.system, XGL_MIPMAP_TEXTURE, NULL,
+                             XGL_MIPMAP_TEXTURE_LEVELS, 7, 0);
+    if (!b.texture_mipmap || b.errors) return 0;
+    xgl_mipmap_texture_build(b.texture_mipmap, b.texture_rasters[0],
+                             XGL_TEXTURE_BOUNDARY_WRAP, XGL_TEXTURE_BOUNDARY_WRAP);
+    return !b.errors;
+}
+
+static int texture_set_descriptor(void)
+{
+    Xgl_texture_general_desc desc;
+    Xgl_texture_interp_method min_filter, mag_filter;
+    if (!b.texture_attached) {
+        /* TMAP_NUM owns the map object. Keep it attached but switched off
+         * between cases; xgl_close ultimately releases the entire graph.
+         */
+        xgl_object_set(b.ctx, XGL_3D_CTX_SURF_FRONT_TMAP_NUM, 1, 0);
+        if (b.errors) return 0;
+        b.texture_attached = 1;
+    }
+    if (!b.texture_map) {
+        xgl_object_get(b.ctx, XGL_3D_CTX_SURF_FRONT_TMAP, &b.texture_map);
+        if (!b.texture_map || b.errors) return 0;
+    }
+    min_filter = b.texture_filter == XB_TEXTURE_POINT ? XGL_TEXTURE_INTERP_POINT :
+                 b.texture_filter == XB_TEXTURE_BILINEAR ? XGL_TEXTURE_INTERP_BILINEAR :
+                 XGL_TEXTURE_INTERP_MIPMAP_TRILINEAR;
+    mag_filter = b.texture_filter == XB_TEXTURE_POINT ? XGL_TEXTURE_INTERP_POINT :
+                                                       XGL_TEXTURE_INTERP_BILINEAR;
+    memset(&desc, 0, sizeof(desc));
+    desc.texture_type = XGL_TEXTURE_TYPE_MIPMAP;
+    desc.comp_info.color_info.num_render_comp_desc = 1;
+    desc.comp_info.color_info.num_channels[0] = 3;
+    desc.comp_info.color_info.render_component_desc[0].comp = XGL_RENDER_COMP_FINAL_COLOR;
+    desc.comp_info.color_info.render_component_desc[0].texture_op = XGL_TEXTURE_OP_REPLACE;
+    desc.texture_info.mipmap.texture_map = b.texture_mipmap;
+    desc.texture_info.mipmap.max_u_freq = desc.texture_info.mipmap.max_v_freq = 1;
+    desc.texture_info.mipmap.u_boundary = desc.texture_info.mipmap.v_boundary = XGL_TEXTURE_BOUNDARY_WRAP;
+    desc.texture_info.mipmap.interp_info.filter1 = min_filter;
+    desc.texture_info.mipmap.interp_info.filter2 = mag_filter;
+    desc.texture_info.mipmap.orientation_matrix[0][0] = 1;
+    desc.texture_info.mipmap.orientation_matrix[1][1] = 1;
+    xgl_object_set(b.texture_map, XGL_TMAP_COORD_SOURCE, XGL_TEXTURE_COORD_DATA,
+                   XGL_TMAP_T0_INDEX, 0, XGL_TMAP_T1_INDEX, 1,
+                   XGL_TMAP_DESCRIPTOR, &desc, 0);
+    return !b.errors && texture_enable(1);
+}
+
+static int texture_probe(float *points)
+{
+    Xgl_pt_list list;
+    memset(&list, 0, sizeof(list));
+    list.pt_type = XGL_PT_DATA_F3D;
+    list.num_pts = 3;
+    list.num_data_values = 2;
+    list.pts.data_f3d = (Xgl_pt_data_f3d *)points;
+    xb_backend_clear(1, 1);
+    if (b.errors) return 0;
+    xgl_multi_simple_polygon(b.ctx,
+        XGL_FACET_FLAG_SIDES_ARE_3 | XGL_FACET_FLAG_SHAPE_CONVEX,
+        NULL, NULL, 1, &list);
+    xb_backend_sync();
+    return !b.errors;
+}
+
+static int texture_read(int x, int y, xb_rgb *rgb)
+{
+    Xgl_pt_i2d point;
+    Xgl_color color;
+    point.x = x; point.y = y;
+    if (b.errors) return 0;
+    if (xgl_context_get_pixel(b.ctx, &point, &color)) {
+        fail("texture validation pixel is obscured");
+        return 0;
+    }
+    if (b.errors) return 0;
+    rgb->r = color.rgb.r; rgb->g = color.rgb.g; rgb->b = color.rgb.b;
+    return 1;
+}
+
+static int validate_texture(void)
+{
+    float points[15];
+    Xgl_color fallback;
+    Xgl_usgn32 *pixels;
+    xb_rgb expected, sample;
+    double px, py, u, v, z, w, du, dv, lo, hi;
+    static const double bary[5][2] = {{.1,.1},{.35,.1},{.1,.35},{.65,.2},{.2,.65}};
+    static const double weights[3] = {.27,.58,.15};
+    static const double footprint[4] = {1.1,1.25,1.5,1.75};
+    int i, j, phase, level, side, middle, mixed;
+    memset(&fallback, 0, sizeof(fallback));
+    fallback.rgb.r = fallback.rgb.b = 1;
+    xgl_object_set(b.ctx, XGL_CTX_SURF_FRONT_COLOR_SELECTOR, XGL_SURF_COLOR_CONTEXT,
+                   XGL_CTX_SURF_FRONT_COLOR, &fallback,
+                   XGL_CTX_GEOM_DATA_IS_VOLATILE, TRUE,
+                   XGL_3D_CTX_SURF_TMAP_PERSP_CORRECTION, XGL_TEXTURE_PERSP_PIXEL, 0);
+    if (b.errors) return 0;
+    identity(b.model);
+    view_matrix(0);
+    memset(points, 0, sizeof(points));
+    for (i = 0; i < 3; ++i) {
+        points[i * 5] = i == 1 ? .9f : -.9f;
+        points[i * 5 + 1] = i == 2 ? .9f : -.9f;
+        points[i * 5 + 2] = .5f;
+    }
+    for (phase = 0; phase < 2; ++phase) {
+        for (i = 0; i < 3; ++i) {
+            points[i * 5 + 3] = (i == 1 ? 2.0f : 0.0f) - phase;
+            points[i * 5 + 4] = (i == 2 ? 2.0f : 0.0f) - phase;
+        }
+        if (!texture_probe(points)) return 0;
+        for (i = 0; i < 5; ++i) {
+            u = 2 * bary[i][0]; v = 2 * bary[i][1];
+            u -= floor(u); v -= floor(v);
+            expected.r = (u < .5) == (v < .5);
+            expected.g = u >= .5;
+            expected.b = u < .5 && v >= .5;
+            px = (-.9 + 1.8 * bary[i][0] + 1) * .5 * (b.width - 1);
+            py = (-.9 + 1.8 * bary[i][1] + 1) * .5 * (b.height - 1);
+            if (!pixel_matches((int)px, (int)py, &expected)) {
+                if (!b.errors) fail("texture RGB, UV orientation or wrapping readback failed");
+                return 0;
+            }
+        }
+    }
+    if (b.perspective) {
+        view_matrix(1);
+        px = py = 0;
+        for (i = 0; i < 3; ++i) {
+            z = i == 1 ? .9 : .1;
+            w = 1 + .75 * z;
+            points[i * 5 + 2] = (float)z;
+            points[i * 5 + 3] = i == 1 ? 2.0f : 0;
+            points[i * 5 + 4] = i == 2 ? 2.0f : 0;
+            px += weights[i] * points[i * 5] / w;
+            py += weights[i] * points[i * 5 + 1] / w;
+        }
+        if (!texture_probe(points)) return 0;
+        /* Correct projective interpolation gives UV about (.94,.38), green;
+         * affine interpolation gives (1.16,.30), which wraps to red.
+         */
+        expected.r = expected.b = 0; expected.g = 1;
+        if (!pixel_matches((int)((px + 1) * .5 * (b.width - 1)),
+                           (int)((py + 1) * .5 * (b.height - 1)), &expected)) {
+            if (!b.errors) fail("texture perspective-correction readback failed");
+            return 0;
+        }
+        view_matrix(0);
+    }
+    if (!texture_build_image(2)) return 0;
+    for (i = 0; i < 3; ++i) {
+        points[i * 5] = i == 1 ? .8f : -.8f;
+        points[i * 5 + 1] = i == 2 ? .8f : -.8f;
+        points[i * 5 + 2] = .5f;
+        points[i * 5 + 3] = (float)(i == 1 ? 12.0 / 64 : 10.0 / 64);
+        points[i * 5 + 4] = .25f;
+    }
+    if (!texture_probe(points)) return 0;
+    lo = 1; hi = 0; middle = 0;
+    for (i = 0; i < 17; ++i) {
+        px = (-.72 + 1.28 * i / 16 + 1) * .5 * (b.width - 1);
+        py = .15 * (b.height - 1);
+        if (!texture_read((int)px, (int)py, &sample)) return 0;
+        if (sample.r < lo) lo = sample.r;
+        if (sample.r > hi) hi = sample.r;
+        if (sample.r > .1 && sample.r < .9) ++middle;
+        if (fabs(sample.r - sample.g) > .065 || fabs(sample.r - sample.b) > .065) {
+            fail("texture filter calibration is not grayscale"); return 0;
+        }
+    }
+    if (hi - lo < .5 || (b.texture_filter == XB_TEXTURE_POINT ? middle != 0 : middle < 3)) {
+        fail("texture point/bilinear magnification readback failed"); return 0;
+    }
+    if (b.texture_filter == XB_TEXTURE_TRILINEAR) {
+        /* Diagnostic pyramid: red base, green lower levels. This proves
+         * blending BETWEEN levels, which a blurred checker alone cannot.
+         * Several sub-two-texel footprints accommodate LOD conventions;
+         * nearest-level selection can never produce both red and green.
+         */
+        for (level = 0; level < 7; ++level) {
+            pixels = texture_raster_pixels(level);
+            if (!pixels) return 0;
+            side = XB_TEXTURE_WIDTH >> level;
+            for (j = 0; j < side * side; ++j) pixels[j] = level ? 0x0000ff00UL : 0x000000ffUL;
+        }
+        xgl_object_set(b.texture_mipmap, XGL_MIPMAP_TEXTURE_MEM_RAS_LIST,
+                       b.texture_rasters, 0);
+        if (b.errors) return 0;
+        mixed = 0;
+        for (phase = 0; phase < 4; ++phase) {
+            du = .8 * (b.width - 1) * footprint[phase] / XB_TEXTURE_WIDTH;
+            dv = .8 * (b.height - 1) * footprint[phase] / XB_TEXTURE_WIDTH;
+            for (i = 0; i < 3; ++i) {
+                points[i * 5 + 3] = i == 1 ? (float)du : 0;
+                points[i * 5 + 4] = i == 2 ? (float)dv : 0;
+            }
+            if (!texture_probe(points) ||
+                !texture_read(b.width / 3, b.height / 3, &sample)) return 0;
+            if (sample.r > .1 && sample.r < .9 && sample.g > .1 && sample.g < .9 &&
+                sample.b < .065 && fabs(sample.r + sample.g - 1) < .1) mixed = 1;
+        }
+        if (!mixed) { fail("trilinear mip-level blending readback failed"); return 0; }
+    }
+    if (!texture_enable(0) || !texture_probe(points)) return 0;
+    expected.r = expected.b = 1; expected.g = 0;
+    if (!pixel_matches(b.width / 3, b.height / 3, &expected)) {
+        if (!b.errors) fail("texture-off recovery readback failed");
+        return 0;
+    }
+    view_matrix(b.perspective);
+    xgl_object_set(b.ctx, XGL_CTX_SURF_FRONT_COLOR_SELECTOR, XGL_SURF_COLOR_FACET, 0);
+    return !b.errors;
+}
+
+static int configure_texture(const xb_case *test)
+{
+    if (test->texture_filter == XB_TEXTURE_OFF) return 1;
+    if (test->texture_filter < XB_TEXTURE_POINT || test->texture_filter > XB_TEXTURE_TRILINEAR ||
+        test->method != XB_MULTI || test->shade != XB_FLAT || test->lighting != XB_LIGHT_OFF ||
+        test->xgl_lighting || test->cull || test->retained || test->streaming ||
+        (test->work != XB_DRAW && test->work != XB_FRAME) ||
+        (test->update != XB_STATIC && test->update != XB_TRANSFORM)) {
+        fail("native texturing requires unlit static/transformed multi draws or frames, without culling/retention/streaming");
+        return 0;
+    }
+    if (b.width < 128 || b.height < 128) {
+        fail("texture readback gates require at least a 128x128 drawable"); return 0;
+    }
+    b.texture_filter = test->texture_filter;
+    if (!texture_build_image(1) || !texture_set_descriptor() || !validate_texture()) return 0;
+    /* Each selected filter is proved on calibration images above; restore the
+     * shared procedural image and build its full 64..1 pyramid before timing.
+     */
+    return texture_build_image(0) && texture_enable(1);
 }
 
 static int wait_window(int width, int height)
@@ -452,6 +762,8 @@ int xb_backend_open(const xb_options *options, int width, int height)
 
 static void free_geometry(void)
 {
+    free(b.texture_points);
+    b.texture_points = NULL;
     free(b.points); free(b.strip_points); free(b.lists);
     free(b.color_points); free(b.lit_points); free(b.lit_facets);
     free(b.facets); free(b.restart_facets); free(b.strips);
@@ -548,6 +860,10 @@ void xb_backend_info(FILE *out)
                  "supplied unit normals, both normal-flip options off, specular disabled.\n");
     fprintf(out, "Reported lighting support is coarse; it does not prove every light "
                  "type/count remains accelerated. XGL point positions use double precision.\n");
+    fprintf(out, "Native texture cases: 64x64 RGB mipmap, explicit XYZUV, pixel-level "
+                 "perspective correction, REPLACE final RGB; point/bilinear/trilinear filters.\n");
+    fprintf(out, "Texture execution unclassified; may use software. RGB/shading inquiry "
+                 "does not identify the texture implementation. Texture preparation is untimed.\n");
     fprintf(out, "Input bytes count referenced native points/facet colors, including "
                  "strip overlaps and list padding, excluding descriptors; "
                  "not measured SBus/DMA traffic.\n");
@@ -568,10 +884,15 @@ int xb_backend_upload(const xb_mesh *mesh)
     if (b.batch <= 0) b.batch = 128;
     /* Full rebuild is intentionally measurable; static workloads upload once. */
     free_geometry();
-    needs_points = b.method != XB_STRIP && b.shading != XB_SMOOTH;
+    needs_points = b.method != XB_STRIP && b.shading != XB_SMOOTH &&
+                   b.texture_filter == XB_TEXTURE_OFF;
     needs_lists = b.method == XB_POLYGON || b.method == XB_MULTI;
     if (needs_points)
         b.points = (Xgl_pt_f3d *)calloc(mesh->point_count, sizeof(*b.points));
+    if (b.texture_filter != XB_TEXTURE_OFF) {
+        if (!mesh->texcoords) { fail("texturing requires per-corner UV data"); return 0; }
+        b.texture_points = (float *)calloc(mesh->point_count * 5, sizeof(float));
+    }
     if (b.shading == XB_SMOOTH) {
         if (!mesh->vertex_colors || (b.hardware_lighting && !mesh->vertex_normals)) {
             fail("smooth shading requires vertex colors and lit vertices require normals");
@@ -602,6 +923,7 @@ int xb_backend_upload(const xb_mesh *mesh)
     if (b.method == XB_MULTI)
         b.batch_facets = (Xgl_facet_list *)calloc(batch_count, sizeof(*b.batch_facets));
     if ((needs_points && !b.points) || (needs_lists && !b.lists) || !b.facets ||
+        (b.texture_filter != XB_TEXTURE_OFF && !b.texture_points) ||
         (b.shading == XB_SMOOTH && !(b.hardware_lighting ? (void *)b.lit_points :
                                                           (void *)b.color_points)) ||
         (b.shading != XB_SMOOTH && b.hardware_lighting && !b.lit_facets) ||
@@ -622,6 +944,13 @@ int xb_backend_upload(const xb_mesh *mesh)
         b.points[i].x = mesh->points[i].x;
         b.points[i].y = mesh->points[i].y;
         b.points[i].z = mesh->points[i].z;
+    }
+    for (i = 0; b.texture_points && i < mesh->point_count; ++i) {
+        b.texture_points[i * 5] = mesh->points[i].x;
+        b.texture_points[i * 5 + 1] = mesh->points[i].y;
+        b.texture_points[i * 5 + 2] = mesh->points[i].z;
+        b.texture_points[i * 5 + 3] = mesh->texcoords[i].u;
+        b.texture_points[i * 5 + 4] = mesh->texcoords[i].v;
     }
     for (i = 0; b.color_points && i < mesh->point_count; ++i) {
         b.color_points[i].x = mesh->points[i].x;
@@ -650,7 +979,11 @@ int xb_backend_upload(const xb_mesh *mesh)
         b.lists[i].pt_type = XGL_PT_F3D;
         b.lists[i].num_pts = 3;
         b.lists[i].num_data_values = 0;
-        if (b.lit_points) {
+        if (b.texture_points) {
+            b.lists[i].pt_type = XGL_PT_DATA_F3D;
+            b.lists[i].num_data_values = 2;
+            b.lists[i].pts.data_f3d = (Xgl_pt_data_f3d *)(b.texture_points + i * 15);
+        } else if (b.lit_points) {
             b.lists[i].pt_type = XGL_PT_COLOR_NORMAL_F3D;
             b.lists[i].pts.color_normal_f3d = &b.lit_points[i * 3];
         } else if (b.color_points) {
@@ -710,6 +1043,7 @@ size_t xb_backend_input_bytes(enum xb_method method, int batch)
 {
     size_t i, count, batches, points, facets;
     if (method != b.method) return 0;
+    if (b.texture_points) return b.point_count * 5 * sizeof(float);
     if (b.lit_points) return b.point_count * sizeof(*b.lit_points);
     if (b.color_points) return b.point_count * sizeof(*b.color_points);
     if (b.lit_facets)
@@ -901,6 +1235,7 @@ int xb_backend_stream_begin(const xb_mesh *mesh, int slots,
     xb_backend_stream_end();
     if (b.stream_active || b.errors) goto bad;
     if (b.method != XB_MULTI || b.hardware_lighting ||
+        b.texture_filter != XB_TEXTURE_OFF ||
         slots < 1 || slots > XB_MAX_QUEUE || !mesh ||
         !mesh->triangles || mesh->point_count != mesh->triangles * 3 ||
         !mesh->points || (b.shading == XB_SMOOTH ? !mesh->vertex_colors : !mesh->colors)) {
@@ -1053,6 +1388,8 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
      */
     xb_backend_sync();
     if (b.errors) { copy_text(reason, size, b.error); return 0; }
+    if (!texture_enable(0)) { copy_text(reason, size, b.error); return 0; }
+    b.texture_filter = XB_TEXTURE_OFF;
     xb_backend_stream_end();
     if (b.stream_active || b.errors) {
         copy_text(reason, size, b.error);
@@ -1094,6 +1431,10 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
     }
     xgl_object_set(b.ctx, XGL_3D_CTX_SURF_FACE_CULL,
                    b.cull ? XGL_CULL_BACK : XGL_CULL_OFF, 0);
+    if (!configure_texture(test)) {
+        copy_text(reason, size, b.error);
+        return 0;
+    }
     if (mesh && mesh->triangles && !xb_backend_upload(mesh)) {
         copy_text(reason, size, b.error);
         return 0;
@@ -1115,6 +1456,9 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
     if (test->xgl_lighting && b.inquiry.lighting != XGL_INQ_HARDWARE)
         copy_text(reason, size,
             "diagnostic fallback: lighting not reported in hardware; readback passed");
+    if (b.texture_filter != XB_TEXTURE_OFF)
+        copy_text(reason, size,
+            "texture RGB/UV/wrap/filter/off gates passed; execution unclassified, may use software");
     return 1;
 }
 
@@ -1209,7 +1553,8 @@ size_t xb_backend_draw(enum xb_method method, int batch)
         if (method == XB_MULTI) {
             xgl_multi_simple_polygon(b.ctx,
                 XGL_FACET_FLAG_SIDES_ARE_3 | XGL_FACET_FLAG_SHAPE_CONVEX,
-                b.shading == XB_SMOOTH ? NULL : &b.batch_facets[calls],
+                b.shading == XB_SMOOTH || b.texture_filter != XB_TEXTURE_OFF ?
+                    NULL : &b.batch_facets[calls],
                 NULL, (Xgl_usgn32)count, b.lists + start);
         } else {
             points.num_pts = (Xgl_usgn32)(count * 3);
@@ -1245,13 +1590,17 @@ void xb_backend_swap(void)
 void xb_backend_raster(int masked)
 {
     Xgl_pt_i2d position;
+    int restore_texture;
     if (b.errors) return;
+    restore_texture = b.texture_switch;
+    if (!texture_enable(0)) return;
     position.x = (b.width - XB_RASTER_W) / 2;
     position.y = b.height - XB_RASTER_H;
     xgl_object_set(b.ctx, XGL_CTX_RASTER_FILL_STYLE,
                    masked ? XGL_RAS_FILL_STIPPLE : XGL_RAS_FILL_COPY,
                    XGL_CTX_RASTER_FPAT_POSITION, &position, 0);
     if (!b.errors) xgl_context_copy_buffer(b.ctx, NULL, &position, b.hud);
+    if (!b.errors && restore_texture) (void)texture_enable(1);
 }
 
 int xb_backend_events(void)

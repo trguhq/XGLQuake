@@ -13,6 +13,10 @@ typedef void *Xgl_mem_ras;
 typedef void *Xgl_ras;
 typedef void *Xgl_light;
 typedef void *Xgl_object;
+typedef void *Xgl_mipmap_texture;
+typedef void *Xgl_texture;
+typedef void *Xgl_tmap;
+typedef unsigned char Xgl_usgn8;
 typedef unsigned int Xgl_usgn32;
 typedef unsigned short Xgl_usgn16;
 typedef int Xgl_sgn32;
@@ -22,12 +26,16 @@ typedef int Xgl_facet_type;
 typedef int Xgl_facet_flags;
 typedef int Xgl_tlist_flags;
 typedef int Xgl_flush_action;
+typedef int Xgl_texture_boundary;
+typedef int Xgl_texture_interp_method;
+typedef int Xgl_texture_persp_correction;
 typedef struct { float x, y, z; } Xgl_pt_f3d;
 typedef struct { double x, y, z; } Xgl_pt_d3d;
 typedef struct { int x, y; } Xgl_pt_i2d;
 typedef struct { double xmin, xmax, ymin, ymax, zmin, zmax; } Xgl_bounds_d3d;
 typedef struct { int xmin, xmax, ymin, ymax; } Xgl_bounds_i2d;
 typedef float Xgl_matrix_f3d[4][4];
+typedef float Xgl_matrix_f2d[3][2];
 typedef struct xb_contract_bbox Xgl_bbox;
 typedef struct { float r, g, b; } Xgl_color_rgb;
 typedef union { Xgl_usgn32 index; float gray; Xgl_color_rgb rgb; Xgl_usgn32 z; } Xgl_color;
@@ -35,6 +43,42 @@ typedef struct { Xgl_color color; } Xgl_color_facet;
 typedef struct { Xgl_color color; Xgl_pt_f3d normal; } Xgl_color_normal_facet;
 typedef struct { float x, y, z; Xgl_color color; } Xgl_pt_color_f3d;
 typedef struct { float x, y, z; Xgl_color color; Xgl_pt_f3d normal; } Xgl_pt_color_normal_f3d;
+typedef struct { float x, y, z, data[1]; } Xgl_pt_data_f3d;
+typedef struct { Xgl_color_rgb c1, c2; } Xgl_texture_blend_rgb;
+typedef union { Xgl_texture_blend_rgb rgb; } Xgl_texture_blend_op;
+typedef struct { Xgl_color_rgb c; } Xgl_texture_decal_rgb;
+typedef union { Xgl_texture_decal_rgb rgb; } Xgl_texture_decal_op;
+typedef struct { Xgl_color_rgb c; } Xgl_texture_blend_intrinsic_rgb;
+typedef union { Xgl_texture_blend_intrinsic_rgb rgb; } Xgl_texture_blend_intrinsic_op;
+typedef struct {
+    int comp, texture_op;
+    union {
+        Xgl_texture_blend_op blend;
+        Xgl_texture_decal_op decal;
+        Xgl_texture_blend_intrinsic_op blend_int;
+    } op;
+} Xgl_render_component_desc;
+typedef struct {
+    Xgl_usgn32 num_render_comp_desc;
+    Xgl_render_component_desc render_component_desc[2];
+    Xgl_usgn32 num_channels[2], channel_number[2];
+} Xgl_texture_color_comp_info;
+typedef union { Xgl_texture_color_comp_info color_info; } Xgl_texture_comp_info;
+typedef struct { Xgl_texture_interp_method filter1, filter2; } Xgl_texture_interp_info;
+typedef struct {
+    Xgl_texture texture_map;
+    float max_u_freq, max_v_freq;
+    Xgl_texture_boundary u_boundary, v_boundary;
+    Xgl_usgn8 boundary_values[4];
+    float depth_interp_factor;
+    Xgl_texture_interp_info interp_info;
+    Xgl_matrix_f2d orientation_matrix;
+} Xgl_texture_general_mipmap_desc;
+typedef struct {
+    int texture_type;
+    Xgl_texture_comp_info comp_info;
+    union { Xgl_texture_general_mipmap_desc mipmap; } texture_info;
+} Xgl_texture_general_desc;
 typedef union {
     Xgl_color_facet color_facet;
     Xgl_color_normal_facet color_normal_facet;
@@ -49,7 +93,8 @@ typedef struct {
     Xgl_bbox *bbox;
     Xgl_usgn32 num_pts, num_data_values;
     union { Xgl_pt_f3d *f3d; Xgl_pt_color_f3d *color_f3d;
-            Xgl_pt_color_normal_f3d *color_normal_f3d; } pts;
+            Xgl_pt_color_normal_f3d *color_normal_f3d;
+            Xgl_pt_data_f3d *data_f3d; } pts;
 } Xgl_pt_list;
 typedef union { struct { float z_value; } z_buffer; } Xgl_hlhsr_data;
 typedef struct {
@@ -117,7 +162,19 @@ enum {
     XGL_LIGHT_AMBIENT, XGL_LIGHT_DIRECTIONAL, XGL_LIGHT_POSITIONAL,
     XGL_LIGHT_TYPE, XGL_LIGHT_COLOR, XGL_LIGHT_DIRECTION, XGL_LIGHT_POSITION,
     XGL_LIGHT_ATTENUATION_1, XGL_LIGHT_ATTENUATION_2,
-    XGL_LIGHT_ENABLE_COMP_AMBIENT, XGL_LIGHT_ENABLE_COMP_DIFFUSE
+    XGL_LIGHT_ENABLE_COMP_AMBIENT, XGL_LIGHT_ENABLE_COMP_DIFFUSE,
+    XGL_PT_DATA_F3D, XGL_MIPMAP_TEXTURE, XGL_MIPMAP_TEXTURE_LEVELS,
+    XGL_MIPMAP_TEXTURE_MEM_RAS_LIST, XGL_TMAP,
+    XGL_TMAP_DESCRIPTOR, XGL_TMAP_COORD_SOURCE, XGL_TMAP_PARAM_TYPE,
+    XGL_TMAP_T0_INDEX, XGL_TMAP_T1_INDEX, XGL_TEXTURE_COORD_DATA,
+    XGL_TEXTURE_PARAM_EXPLICIT, XGL_TEXTURE_TYPE_MIPMAP,
+    XGL_TEXTURE_BOUNDARY_WRAP, XGL_TEXTURE_INTERP_POINT,
+    XGL_TEXTURE_INTERP_BILINEAR, XGL_TEXTURE_INTERP_MIPMAP_TRILINEAR,
+    XGL_RENDER_COMP_FINAL_COLOR, XGL_TEXTURE_OP_REPLACE,
+    XGL_3D_CTX_SURF_FRONT_TMAP_NUM, XGL_3D_CTX_SURF_FRONT_TMAP,
+    XGL_3D_CTX_SURF_FRONT_TMAP_SWITCHES,
+    XGL_3D_CTX_SURF_TMAP_PERSP_CORRECTION, XGL_TEXTURE_PERSP_PIXEL,
+    XGL_TEXTURE_PERSP_NONE, XGL_SURF_COLOR_CONTEXT, XGL_CTX_SURF_FRONT_COLOR
 };
 Xgl_sys_state xgl_open(void *);
 void xgl_close(Xgl_sys_state);
@@ -135,6 +192,8 @@ void xgl_multi_simple_polygon(Xgl_ctx, Xgl_facet_flags, Xgl_facet_list *,
 void xgl_triangle_list(Xgl_ctx, Xgl_facet_list *, Xgl_pt_list *, Xgl_tlist_flags);
 void xgl_triangle_strip(Xgl_ctx, Xgl_facet_list *, Xgl_pt_list *);
 void xgl_context_flush(Xgl_ctx, Xgl_flush_action);
+void xgl_mipmap_texture_build(Xgl_mipmap_texture, Xgl_mem_ras,
+                             Xgl_texture_boundary, Xgl_texture_boundary);
 void xgl_context_copy_buffer(Xgl_ctx, Xgl_bounds_i2d *, Xgl_pt_i2d *, Xgl_ras);
 Xgl_boolean xgl_context_get_pixel(Xgl_ctx, Xgl_pt_i2d *, Xgl_color *);
 #endif

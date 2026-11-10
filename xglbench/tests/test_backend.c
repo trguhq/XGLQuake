@@ -27,6 +27,11 @@ static xb_rgb *test_native_colors;
 static size_t test_native_color_count;
 static unsigned long test_native_color_checksum;
 static xb_light_state test_lights;
+static float *test_native_texture_points;
+static size_t test_texture_point_count;
+static unsigned long test_texture_checksum;
+static int test_texture_active;
+static int test_texture_bad;
 
 typedef struct {
     xb_rgb *colors;
@@ -48,6 +53,28 @@ static double test_drain_delay;
 static int test_stream_bad;
 static int test_stream_fail(const char *error);
 static unsigned long test_checksum(const xb_rgb *colors, size_t count);
+static unsigned long test_bytes_checksum(const void *data, size_t count);
+static void test_log(const char *operation, int width, int height);
+
+static const char *test_filter_name(enum xb_texture_filter filter)
+{
+    if (filter == XB_TEXTURE_POINT) return "point";
+    if (filter == XB_TEXTURE_BILINEAR) return "bilinear";
+    if (filter == XB_TEXTURE_TRILINEAR) return "trilinear";
+    return "off";
+}
+
+static int test_texture_fail(const char *error, char *reason, size_t size)
+{
+    test_error = error;
+    test_texture_bad = 1;
+    test_log("texture-error", (int)test_case.texture_filter, 0);
+    if (size) {
+        strncpy(reason, error, size - 1);
+        reason[size - 1] = '\0';
+    }
+    return 0;
+}
 
 static void test_log(const char *operation, int width, int height)
 {
@@ -75,6 +102,9 @@ int xb_backend_open(const xb_options *options, int width, int height)
     test_light_updates = 0;
     test_native_colors = NULL;
     test_native_color_count = 0;
+    test_native_texture_points = NULL;
+    test_texture_point_count = 0;
+    test_texture_active = test_texture_bad = 0;
     memset(&test_case, 0, sizeof(test_case));
     memset(&test_lights, 0, sizeof(test_lights));
     test_slot_count = test_outstanding = test_peak = 0;
@@ -101,6 +131,8 @@ void xb_backend_close(void)
     test_slot_count = 0;
     free(test_native_colors);
     test_native_colors = NULL;
+    free(test_native_texture_points);
+    test_native_texture_points = NULL;
     test_log("close", test_width, test_height);
 }
 
@@ -209,12 +241,36 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
     test_lighting_bad = 0;
     test_error = "";
     test_light_updates = 0;
+    test_texture_active = 0;
+    test_texture_bad = 0;
     memset(&test_lights, 0, sizeof(test_lights));
     test_log("lighting-configure", (int)test->lighting, (int)test->shade);
     test_log("lighting-compute", test->xgl_lighting, test->lights);
     test_log("lighting-style", test->styles, test->moving);
     test_log("culling-configure", test->cull, (int)test->method);
     test_log("material-configure", test->vertex_material, (int)test->shade);
+    test_log("texture-configure", (int)test->texture_filter, test->texture_compare);
+    if (test->texture_compare) {
+        if (!mesh || mesh->point_count != mesh->triangles * 3 || !mesh->texcoords)
+            return test_texture_fail("texture comparison lacks per-corner UV coordinates", reason, size);
+        for (i = 0; i < mesh->point_count; ++i)
+            if (!(mesh->texcoords[i].u > -1000000 && mesh->texcoords[i].u < 1000000 &&
+                  mesh->texcoords[i].v > -1000000 && mesh->texcoords[i].v < 1000000) ||
+                mesh->texcoords[i].gain != 1)
+                return test_texture_fail("texture comparison has invalid UV or unmatched material gain", reason, size);
+    }
+    if (test->texture_filter != XB_TEXTURE_OFF) {
+        if (!test->texture_compare || test->method != XB_MULTI || test->shade != XB_FLAT ||
+            test->lighting != XB_LIGHT_OFF || test->vertex_material || test->cull ||
+            (test->work != XB_DRAW && test->work != XB_FRAME) ||
+            (test->update != XB_STATIC && test->update != XB_TRANSFORM))
+            return test_texture_fail("unsupported mock native texture workload", reason, size);
+        failed = getenv("XB_TEST_FAIL_TEXTURE");
+        if (failed && (!strcmp(failed, "all") ||
+                       !strcmp(failed, test_filter_name(test->texture_filter))))
+            return test_texture_fail("injected texture mapping unavailable; no untextured fallback", reason, size);
+        test_log("texture-setup", (int)test->texture_filter, XB_TEXTURE_WIDTH);
+    }
     if (!strncmp(test->name, "cull/", 5)) {
         positive = negative = 0;
         for (i = 0; i < mesh->triangles; ++i) {
@@ -264,17 +320,42 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
             memcmp(mesh->vertex_colors, mesh->vertex_materials, mesh->point_count * sizeof(xb_rgb)))
             return test_lighting_fail("unlit texture case changed sampled vertex material");
     }
-    return xb_backend_upload(mesh);
+    if (!xb_backend_upload(mesh)) return 0;
+    if (test->texture_filter != XB_TEXTURE_OFF && size) {
+        strncpy(reason, "TEST DOUBLE: native texture scheduling only; acceleration unclassified", size - 1);
+        reason[size - 1] = '\0';
+    }
+    return 1;
 }
 
 int xb_backend_upload(const xb_mesh *mesh)
 {
     const xb_rgb *colors;
+    size_t i;
     free(test_native_colors);
     test_native_colors = NULL;
     test_native_color_count = 0;
     test_triangles = mesh->triangles;
     test_strips = mesh->strip_count;
+    free(test_native_texture_points);
+    test_native_texture_points = NULL;
+    test_texture_point_count = 0;
+    if (test_case.texture_filter != XB_TEXTURE_OFF) {
+        test_texture_point_count = mesh->point_count;
+        test_native_texture_points = (float *)malloc(mesh->point_count * 5 * sizeof(float));
+        if (!test_native_texture_points)
+            return test_texture_fail("mock texture payload allocation failed", NULL, 0);
+        for (i = 0; i < mesh->point_count; ++i) {
+            test_native_texture_points[i * 5] = mesh->points[i].x;
+            test_native_texture_points[i * 5 + 1] = mesh->points[i].y;
+            test_native_texture_points[i * 5 + 2] = mesh->points[i].z;
+            test_native_texture_points[i * 5 + 3] = mesh->texcoords[i].u;
+            test_native_texture_points[i * 5 + 4] = mesh->texcoords[i].v;
+        }
+        test_texture_checksum = test_bytes_checksum(test_native_texture_points,
+                                   mesh->point_count * 5 * sizeof(float));
+        test_log("texture-payload", (int)mesh->point_count, 5);
+    }
     if (test_case.lighting != XB_LIGHT_OFF || test_case.vertex_material) {
         test_native_color_count = test_case.shade == XB_SMOOTH ?
                                   mesh->point_count : mesh->triangles;
@@ -333,7 +414,12 @@ int xb_backend_lighting(const xb_light_state *state)
     test_lights = *state;
     return 1;
 }
-void xb_backend_transform(unsigned long frame) { (void)frame; }
+void xb_backend_transform(unsigned long frame)
+{
+    (void)frame;
+    if (test_case.texture_compare)
+        test_log("texture-transform", test_case.perspective, (int)test_case.texture_filter);
+}
 void xb_backend_clear(int color, int depth)
 {
     if (test_slot_count) test_log("queue-clear", color, depth);
@@ -344,6 +430,17 @@ size_t xb_backend_draw(enum xb_method method, int batch)
 {
     double until;
     ++test_draws;
+    test_texture_active = test_case.texture_filter != XB_TEXTURE_OFF;
+    if (test_case.texture_compare) {
+        test_log("texture-draw", test_texture_active, (int)test_case.texture_filter);
+        if (test_texture_active && (method != XB_MULTI || !test_native_texture_points ||
+            test_texture_point_count != test_triangles * 3 ||
+            test_texture_checksum != test_bytes_checksum(test_native_texture_points,
+                test_texture_point_count * 5 * sizeof(float)))) {
+            test_texture_fail("mock native texture input changed during timed drawing", NULL, 0);
+            return 0;
+        }
+    }
     if (test_case.work == XB_FRAME) test_log("frame-draw", (int)method, batch);
     if (test_fault && !test_fault_fired) {
         /* Force the .001-second regression trial to end at its minimum
@@ -373,12 +470,17 @@ void xb_backend_swap(void)
 }
 void xb_backend_raster(int masked)
 {
+    int texture_was_active;
+    texture_was_active = test_texture_active;
+    test_texture_active = 0;
+    if (test_case.texture_compare) test_log("texture-hud", test_texture_active, masked);
     if (test_slot_count) test_stream_fail("streaming test unexpectedly drew a HUD");
     if (test_case.work == XB_FRAME) test_log("frame-hud", masked, 0);
+    test_texture_active = texture_was_active;
 }
 int xb_backend_events(void)
 {
-    if (test_stream_bad || test_lighting_bad) return 0;
+    if (test_stream_bad || test_lighting_bad || test_texture_bad) return 0;
     if (!test_fault_pending) return 1;
     test_fault_pending = 0;
     if (!strcmp(test_fault, "native-error")) {
@@ -405,6 +507,7 @@ size_t xb_backend_input_bytes(enum xb_method method, int batch)
     /* A test-double payload estimate only, never native transfer bandwidth. */
     points = method == XB_STRIP ? test_triangles + test_strips * 2 : test_triangles * 3;
     facets = method == XB_TLIST ? test_triangles * 3 : test_triangles;
+    if (test_case.texture_filter != XB_TEXTURE_OFF) return points * 5 * sizeof(float);
     if (test_case.lighting != XB_LIGHT_OFF || test_case.vertex_material) {
         if (test_case.shade == XB_SMOOTH)
             return points * (sizeof(xb_point) + sizeof(xb_rgb) +
@@ -425,12 +528,17 @@ static int test_stream_fail(const char *error)
 
 static unsigned long test_checksum(const xb_rgb *colors, size_t count)
 {
+    return test_bytes_checksum(colors, count * sizeof(*colors));
+}
+
+static unsigned long test_bytes_checksum(const void *data, size_t count)
+{
     const unsigned char *bytes;
     size_t i;
     unsigned long checksum;
-    bytes = (const unsigned char *)colors;
+    bytes = (const unsigned char *)data;
     checksum = 0;
-    for (i = 0; i < count * sizeof(*colors); ++i)
+    for (i = 0; i < count; ++i)
         checksum = checksum * 33UL + bytes[i];
     return checksum;
 }
@@ -444,7 +552,8 @@ int xb_backend_stream_begin(const xb_mesh *mesh, int slots, char *reason, size_t
         return test_stream_fail("invalid mock stream setup");
     if (test_slot_count || test_outstanding)
         return test_stream_fail("previous mock stream was not released");
-    if (test_case.xgl_lighting || test_case.method != XB_MULTI)
+    if (test_case.xgl_lighting || test_case.method != XB_MULTI ||
+        test_case.texture_filter != XB_TEXTURE_OFF)
         return test_stream_fail("unsupported mock streaming lighting or primitive");
     if (test_case.lighting != XB_LIGHT_OFF && !test_lighting_mesh(mesh)) return 0;
     test_stream_triangles = mesh->triangles;

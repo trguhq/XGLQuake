@@ -127,6 +127,17 @@ for winding in all-front mixed; do
     done
 done
 
+for path in facet-flat vertex-smooth point bilinear trilinear; do
+    for work in draw frame; do
+        for depth in 0 1 2; do
+            grep -x "texture-map/$path/$work/depth-$depth" "$test_dir/output" >/dev/null ||
+                fail "missing texture-map $path/$work/depth-$depth case"
+        done
+    done
+    grep -x "texture-map/$path/perspective-motion/depth-1" "$test_dir/output" >/dev/null ||
+        fail "missing moving perspective texture-map $path case"
+done
+
 XB_TEST_LOG="$test_dir/default.log" "$bench" -quick -allow-fallback \
     -test submit/multi_polygon/batch-128 -triangles 8 -seconds .002 -warmup 0 \
     -repeats 1 -csv "$test_dir/default.csv" >"$test_dir/output" 2>&1
@@ -813,4 +824,108 @@ awk -F, '
     }
 ' "$test_dir/culling.csv" || fail "culling CSV lost rejection/winding metadata"
 
-echo 'CLI tests: arguments, resize, geometry, queues, sampled materials, lighting, full frames, culling and fault rejection passed'
+# Native texture cases use XYZUV corner payloads and build their texture once
+# before the first draw. CPU-sampled controls use the same image without native
+# mapping. The test double verifies scheduling, never actual texture pixels.
+XB_TEST_LOG="$test_dir/mapping.log" "$bench" -winsize 320 240 \
+    -test texture-map/ -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
+    -csv "$test_dir/mapping.csv" >"$test_dir/output" 2>&1
+awk '
+    /^texture-configure / {
+        if (configured && (!draws || (filter && (setups != 1 || payloads != 1)))) bad++
+        filter=$2; configured++; draws=0; setups=0; payloads=0
+        if ($3 != 1 || filter < 0 || filter > 3) bad++
+        if (filter) mapped++; else controls++
+    }
+    /^texture-setup / {
+        if (!filter || $2 != filter || $3 != 64 || draws || setups) bad++
+        setups++
+    }
+    /^texture-payload / {
+        if (!filter || !setups || draws || $3 != 5 || ($2 != 24 && $2 != 96 && $2 != 384)) bad++
+        payloads++
+    }
+    /^texture-draw / {
+        if ($2 != (filter != 0) || $3 != filter || (filter && (!setups || !payloads))) bad++
+        draws++
+    }
+    /^texture-hud / { if ($2 != 0 || $3 != 1 || !draws) bad++; hud++ }
+    /^texture-transform / { if ($2 != 1 || $3 != filter) bad++; motion[filter]++ }
+    /^texture-error / { bad++ }
+    END {
+        for (f=0; f<=3; ++f) if (!motion[f]) bad++
+        if (bad || configured != 35 || mapped != 21 || controls != 14 || !hud || !draws ||
+            (filter && (setups != 1 || payloads != 1))) exit 1
+    }
+' "$test_dir/mapping.log" || fail "native mapping setup, payload, HUD isolation or moving transforms are invalid"
+awk -F, '
+    NR == 1 {
+        for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+        record=col["record"]; status=col["status"]; test=col["test"]
+        mapping=col["texture_mapping"]; filter=col["texture_filter"]
+        execution=col["texture_execution"]; width=col["texture_width"]; height=col["texture_height"]
+        material=col["material_sample"]; shade=col["shading"]; model=col["lighting_model"]
+        payload=col["input_payload_bytes"]; facets=col["triangles"]; budget=col["frame_budget_ms"]
+        reason=col["reason"]; next
+    }
+    $record == "summary" {
+        name=$test; gsub(/"/, "", name); split(name, part, "/")
+        native=part[2] == "point" || part[2] == "bilinear" || part[2] == "trilinear"
+        if ($status != "ok" || $model != "none" || $payload <= 0) bad++
+        if (native) {
+            if ($mapping != "native-xgl" || $filter != part[2] || $execution != "unclassified" ||
+                $width != 64 || $height != 64 || $material != "texels" || $shade != "flat" ||
+                $payload != $facets*60 || $reason !~ /unclassified/) bad++
+            mapped++
+        } else {
+            if ($mapping != "none" || $filter != "off" || $execution != "none" ||
+                $width != "" || $height != "" ||
+                $material != (part[2] == "vertex-smooth" ? "vertices" : "facet")) bad++
+            controls++
+        }
+        if (part[3] == "frame") { if ($budget < 66.666 || $budget > 66.667) bad++; frames++ }
+        else if ($budget != "") bad++
+    }
+    END {
+        if (!record || !status || !test || !mapping || !filter || !execution || !width || !height ||
+            !material || !shade || !model || !payload || !facets || !budget || !reason ||
+            mapped != 21 || controls != 14 || frames != 15 || bad) exit 1
+    }
+' "$test_dir/mapping.csv" || fail "native mapping report claimed acceleration or mislabeled controls/payloads"
+
+# Unsupported filtering remains a skipped mapping result, while other filters
+# and ordinary CPU controls still complete. Never relabel an untextured draw
+# as successful native texture mapping.
+XB_TEST_FAIL_TEXTURE=bilinear "$bench" -winsize 320 240 \
+    -test texture-map/ -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
+    -csv "$test_dir/mapping-unavailable.csv" >"$test_dir/output" 2>&1
+awk -F, '
+    NR == 1 {
+        for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+        record=col["record"]; status=col["status"]; filter=col["texture_filter"]
+        mapping=col["texture_mapping"]; total=col["total_ms"]; reason=col["reason"]
+        next
+    }
+    $filter == "bilinear" {
+        if ($record != "summary" || $status != "skipped" || $mapping != "native-xgl" ||
+            $total != 0 || $reason !~ /injected texture mapping unavailable/) bad++
+        rejected++; next
+    }
+    $record == "summary" { if ($status != "ok") bad++; accepted++ }
+    END {
+        if (!record || !status || !filter || !mapping || !total || !reason ||
+            rejected != 7 || accepted != 28 || bad) exit 1
+    }
+' "$test_dir/mapping-unavailable.csv" || fail "unavailable mapping produced timings or suppressed independent controls"
+
+if XB_TEST_FAIL_TEXTURE=all "$bench" -winsize 320 240 \
+    -test texture-map/point/draw/depth-0 -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
+    -csv "$test_dir/mapping-rejected.csv" >"$test_dir/output" 2>&1; then
+    fail "all-unavailable texture mapping run reported success"
+fi
+check_lighting_rejected "$test_dir/mapping-rejected.csv"
+grep 'injected texture mapping unavailable' "$test_dir/output" >/dev/null ||
+    fail "native texture setup failure reason was lost"
+fault_case native-error texture-map/point/draw/depth-0 5
+
+echo 'CLI tests: arguments, resize, geometry, queues, sampled materials, lighting, full frames, culling, native texture scheduling and fault rejection passed'
