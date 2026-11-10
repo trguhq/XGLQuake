@@ -8,9 +8,10 @@
  * not a BSP-lightmap renderer or a claim of pixel equivalence to Quake.
  *
  * Geometry lies on a shallow analytic curved surface. Facet normals come
- * from its triangles; vertex normals come from the analytic surface. Smooth
- * shading changes lighting only: all corners of a triangle retain the same
- * material RGB, and independent corners preserve material discontinuities.
+ * from its triangles; vertex normals come from the analytic surface.
+ * Default smooth cases vary lighting only. vertex_material cases retain
+ * independently sampled corner material RGB through every lighting update.
+ * Independent corners preserve discontinuities at material boundaries.
  */
 #include "xglbench.h"
 
@@ -43,7 +44,9 @@ static int valid_case(const xb_case *test)
         (test->moving != 0 && test->moving != 1) ||
         (test->xgl_lighting != 0 && test->xgl_lighting != 1) ||
         (test->directional != 0 && test->directional != 1) ||
-        test->styles < 0 || test->styles > XB_STYLE_LAYERS)
+        test->styles < 0 || test->styles > XB_STYLE_LAYERS ||
+        (test->vertex_material != 0 && test->vertex_material != 1) ||
+        (test->vertex_material && test->shade != XB_SMOOTH))
         return 0;
     if (test->xgl_lighting && test->lighting != XB_LIGHT_LAMBERT)
         return 0;
@@ -251,6 +254,7 @@ static int apply_lighting(xb_mesh *mesh, const xb_case *test,
     const float *samples;
     const xb_point *position, *normal;
     xb_rgb *color;
+    const xb_rgb *material;
     double brightness;
     xb_lighting_state(test, sequence, state);
     if (test->xgl_lighting)
@@ -280,6 +284,8 @@ static int apply_lighting(xb_mesh *mesh, const xb_case *test,
             position = &mesh->centers[i]; normal = &mesh->facet_normals[i];
             color = &mesh->colors[i];
         }
+        material = test->vertex_material ? &mesh->vertex_materials[i] :
+                                          &mesh->base_colors[triangle];
         if (test->lighting == XB_LIGHT_BAKED) {
             dirty = !mesh->style_cache_valid;
             for (layer = 0; layer < XB_STYLE_LAYERS; ++layer)
@@ -288,15 +294,15 @@ static int apply_lighting(xb_mesh *mesh, const xb_case *test,
             brightness = 0.0;
             for (layer = 0; layer < XB_STYLE_LAYERS; ++layer)
                 brightness += samples[layer] * weights[layer];
-            color->r = unit_color(mesh->base_colors[triangle].r * brightness);
-            color->g = unit_color(mesh->base_colors[triangle].g * brightness);
-            color->b = unit_color(mesh->base_colors[triangle].b * brightness);
+            color->r = unit_color(material->r * brightness);
+            color->g = unit_color(material->g * brightness);
+            color->b = unit_color(material->b * brightness);
         } else if (test->lighting == XB_LIGHT_QUAKE) {
             *color = quake_evaluate(state, position, normal,
-                                    &mesh->base_colors[triangle], samples[0]);
+                                    material, samples[0]);
         } else {
             *color = xb_lighting_evaluate(state, position, normal,
-                                          &mesh->base_colors[triangle]);
+                                          material);
         }
         any = 1;
     }
@@ -312,7 +318,8 @@ int xb_lighting_update(xb_mesh *mesh, const xb_case *test,
 {
     if (!mesh || !state || !valid_case(test) || !mesh->lighting_ready ||
         !mesh->facet_normals || !mesh->vertex_normals || !mesh->centers ||
-        !mesh->vertex_colors || !mesh->facet_styles || !mesh->vertex_styles)
+        !mesh->vertex_colors || !mesh->facet_styles || !mesh->vertex_styles ||
+        (test->vertex_material && !mesh->vertex_materials))
         return -1;
     return apply_lighting(mesh, test, sequence, state, 0);
 }
@@ -330,7 +337,9 @@ int xb_lighting_init(xb_mesh *mesh, const xb_case *test)
         !mesh->triangles || mesh->triangles > XB_LIGHTING_MAX_TRIANGLES ||
         mesh->point_count != mesh->triangles * 3 || mesh->lighting_ready ||
         mesh->facet_normals || mesh->vertex_normals || mesh->centers ||
-        mesh->vertex_colors || mesh->facet_styles || mesh->vertex_styles)
+        mesh->facet_styles || mesh->vertex_styles ||
+        (test->vertex_material ? (!mesh->vertex_materials || !mesh->vertex_colors) :
+                                 (mesh->vertex_materials || mesh->vertex_colors)))
         return 0;
     for (i = 0; i < mesh->point_count; ++i)
         if (!finite_point(&mesh->points[i])) return 0;
@@ -340,11 +349,17 @@ int xb_lighting_init(xb_mesh *mesh, const xb_case *test)
         if (!(mesh->base_colors[i].r >= 0.0f && mesh->base_colors[i].r <= 1.0f &&
               mesh->base_colors[i].g >= 0.0f && mesh->base_colors[i].g <= 1.0f &&
               mesh->base_colors[i].b >= 0.0f && mesh->base_colors[i].b <= 1.0f)) return 0;
+    if (test->vertex_material)
+        for (i = 0; i < mesh->point_count; ++i)
+            if (!(mesh->vertex_materials[i].r >= 0.0f && mesh->vertex_materials[i].r <= 1.0f &&
+                  mesh->vertex_materials[i].g >= 0.0f && mesh->vertex_materials[i].g <= 1.0f &&
+                  mesh->vertex_materials[i].b >= 0.0f && mesh->vertex_materials[i].b <= 1.0f)) return 0;
     count = mesh->triangles;
     /* The conservative triangle cap keeps each product safe on 32-bit SPARC. */
     extra = (count * 2 + mesh->point_count) * sizeof(xb_point) +
             mesh->point_count * sizeof(xb_rgb) +
             (count + mesh->point_count) * XB_STYLE_LAYERS * sizeof(float);
+    if (mesh->vertex_colors) extra -= mesh->point_count * sizeof(xb_rgb);
     if (mesh->bytes > (size_t)-1 - extra) return 0;
     facet_normals = (xb_point *)malloc(count * sizeof(*facet_normals));
     centers = (xb_point *)malloc(count * sizeof(*centers));
@@ -358,7 +373,8 @@ int xb_lighting_init(xb_mesh *mesh, const xb_case *test)
         for (j = 0; j < 3; ++j) {
             points[j] = surface_point(&mesh->points[i * 3 + j]);
             vertex_normals[i * 3 + j] = surface_normal(&points[j]);
-            vertex_colors[i * 3 + j] = mesh->base_colors[i];
+            vertex_colors[i * 3 + j] = test->vertex_material ?
+                mesh->vertex_materials[i * 3 + j] : mesh->base_colors[i];
             baked_samples(&points[j], vertex_styles + (i * 3 + j) * XB_STYLE_LAYERS);
         }
         if (!facet_normal(&points[0], &points[1], &points[2], &facet_normals[i])) goto failed;
@@ -374,6 +390,7 @@ int xb_lighting_init(xb_mesh *mesh, const xb_case *test)
         mesh->strip_points[i] = surface_point(&mesh->strip_points[i]);
     memcpy(mesh->colors, mesh->base_colors, count * sizeof(*mesh->colors));
     mesh->facet_normals = facet_normals; mesh->vertex_normals = vertex_normals;
+    free(mesh->vertex_colors);
     mesh->centers = centers; mesh->vertex_colors = vertex_colors;
     mesh->facet_styles = facet_styles; mesh->vertex_styles = vertex_styles;
     mesh->lighting_ready = 1; mesh->style_cache_valid = 0;

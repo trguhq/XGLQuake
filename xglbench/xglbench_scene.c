@@ -4,7 +4,8 @@
  * Procedural geometry and material sampling. No Quake assets or renderer code
  * are required. The 64x64 brick/checker image and its averaged RGB mip levels
  * live in CPU memory only. A facet receives a small filtered sample around its
- * UV centroid; no per-pixel texturing is performed by either this file or XGL.
+ * UV centroid. Optional per-corner samples use the same CPU filter at each
+ * corner; no per-pixel texturing is performed by either this file or XGL.
  *
  * Each base square contributes two triangles. Uniform edge subdivision yields
  * 2 * 4^depth triangles per square. The strip and independent-triangle arrays
@@ -152,6 +153,8 @@ xb_mesh_free(xb_mesh *mesh)
     free(mesh->strip_points);
     free(mesh->colors);
     free(mesh->base_colors);
+    free(mesh->texcoords);
+    free(mesh->vertex_materials);
     free(mesh->strips);
     free(mesh->facet_normals);
     free(mesh->vertex_normals);
@@ -169,6 +172,7 @@ xb_mesh_allocate(xb_mesh *mesh)
 
     max_size = (size_t)-1;
     if (mesh->point_count > max_size / sizeof(xb_point) ||
+        mesh->point_count > max_size / sizeof(xb_texcoord) ||
         mesh->strip_point_count > max_size / sizeof(xb_point) ||
         mesh->triangles > max_size / sizeof(xb_rgb) ||
         mesh->strip_count > max_size / sizeof(xb_strip))
@@ -177,16 +181,72 @@ xb_mesh_allocate(xb_mesh *mesh)
     mesh->strip_points = (xb_point *)malloc(mesh->strip_point_count * sizeof(xb_point));
     mesh->colors = (xb_rgb *)malloc(mesh->triangles * sizeof(xb_rgb));
     mesh->base_colors = (xb_rgb *)malloc(mesh->triangles * sizeof(xb_rgb));
+    mesh->texcoords = (xb_texcoord *)malloc(mesh->point_count * sizeof(xb_texcoord));
     mesh->strips = (xb_strip *)malloc(mesh->strip_count * sizeof(xb_strip));
     if (mesh->points == NULL || mesh->strip_points == NULL ||
-        mesh->colors == NULL || mesh->base_colors == NULL || mesh->strips == NULL) {
+        mesh->colors == NULL || mesh->base_colors == NULL || mesh->texcoords == NULL ||
+        mesh->strips == NULL) {
         xb_mesh_free(mesh);
         return 0;
     }
-    mesh->bytes = mesh->point_count * sizeof(xb_point) +
+    mesh->bytes = mesh->point_count * (sizeof(xb_point) + sizeof(xb_texcoord)) +
                   mesh->strip_point_count * sizeof(xb_point) +
                   2 * mesh->triangles * sizeof(xb_rgb) +
                   mesh->strip_count * sizeof(xb_strip);
+    return 1;
+}
+
+/* Strip rows have alternating top/bottom points. Preserve their unwrapped UV
+ * coordinates independently of later clipping, transforms or lighting curves. */
+static void
+xb_store_texcoords(xb_mesh *mesh, size_t corner, size_t strip_start,
+                    size_t a, size_t b, size_t c, size_t row, int divisions,
+                    double origin_u, double origin_v, float gain)
+{
+    size_t indices[3], index;
+    int j;
+    indices[0] = a; indices[1] = b; indices[2] = c;
+    for (j = 0; j < 3; ++j) {
+        index = indices[j] - strip_start;
+        mesh->texcoords[corner + j].u =
+            (float)((double)(index / 2) / divisions + origin_u);
+        mesh->texcoords[corner + j].v =
+            (float)((double)(row + 1 - index % 2) / divisions + origin_v);
+        mesh->texcoords[corner + j].gain = gain;
+    }
+}
+
+int
+xb_mesh_vertex_materials(xb_mesh *mesh, int depth)
+{
+    xb_rgb *materials, *colors;
+    const xb_texcoord *coord;
+    size_t i, extra;
+    if (!mesh || depth < 0 || depth > 2 || !mesh->triangles ||
+        mesh->triangles > XB_SCENE_MAX_TRIANGLES ||
+        mesh->point_count != mesh->triangles * 3 || !mesh->texcoords ||
+        mesh->vertex_materials || mesh->vertex_colors || mesh->lighting_ready)
+        return 0;
+    for (i = 0; i < mesh->point_count; ++i) {
+        coord = mesh->texcoords + i;
+        if (!(coord->u >= -FLT_MAX && coord->u <= FLT_MAX &&
+              coord->v >= -FLT_MAX && coord->v <= FLT_MAX &&
+              coord->gain >= 0.0f && coord->gain <= 1.0f)) return 0;
+    }
+    extra = mesh->point_count * 2 * sizeof(xb_rgb);
+    if (mesh->bytes > (size_t)-1 - extra) return 0;
+    materials = (xb_rgb *)malloc(mesh->point_count * sizeof(*materials));
+    colors = (xb_rgb *)malloc(mesh->point_count * sizeof(*colors));
+    if (!materials || !colors) { free(materials); free(colors); return 0; }
+    xb_texture_init();
+    for (i = 0; i < mesh->point_count; ++i) {
+        coord = mesh->texcoords + i;
+        materials[i] = xb_material_sample(coord->u, coord->v, depth, coord->gain);
+        colors[i] = materials[i];
+    }
+    mesh->vertex_materials = materials;
+    mesh->vertex_colors = colors;
+    mesh->bytes += extra;
     return 1;
 }
 
@@ -274,6 +334,10 @@ xb_mesh_build(xb_mesh *mesh, int base_triangles, int depth,
                 result.points[facet_number * 3] = result.strip_points[a];
                 result.points[facet_number * 3 + 1] = result.strip_points[b];
                 result.points[facet_number * 3 + 2] = result.strip_points[c];
+                xb_store_texcoords(&result, facet_number * 3, strip_start,
+                    a, b, c, (size_t)row, divisions,
+                    (double)(patch % 5) * 0.23 - 0.37,
+                    (double)(patch % 3) * 0.19 - 0.21, light);
                 col = triangle / 2;
                 if (triangle & 1) {
                     u = ((double)col + 2.0 / 3.0) / divisions;
@@ -364,6 +428,8 @@ xb_mesh_build_connected(xb_mesh *mesh, int base_triangles, int depth)
             result.points[facet_number * 3] = result.strip_points[a];
             result.points[facet_number * 3 + 1] = result.strip_points[b];
             result.points[facet_number * 3 + 2] = result.strip_points[c];
+            xb_store_texcoords(&result, facet_number * 3, strip_start,
+                a, b, c, row, divisions, -0.37, -0.21, 0.85f);
             col = triangle / 2;
             if (triangle & 1) {
                 u = ((double)col + 2.0 / 3.0) / divisions;
@@ -521,6 +587,9 @@ xb_mesh_build_calibrated(xb_mesh *mesh, int triangles, int width,
             result.points[(first_facet + triangle) * 3] = result.strip_points[a];
             result.points[(first_facet + triangle) * 3 + 1] = result.strip_points[b];
             result.points[(first_facet + triangle) * 3 + 2] = result.strip_points[c];
+            xb_store_texcoords(&result, (first_facet + triangle) * 3, first_point,
+                a, b, c, 0, 1, (double)(patch % 13) * 0.37,
+                (double)(patch % 7) * 0.21, 0.85f);
             u = (double)(patch % 13) * 0.37 + (triangle ? 2.0 : 1.0) / 3.0;
             v = (double)(patch % 7) * 0.21 + (triangle ? 1.0 : 2.0) / 3.0;
             result.base_colors[first_facet + triangle] =
@@ -556,7 +625,9 @@ xb_mesh_reverse_draw_order(xb_mesh *mesh)
         mesh->strip_count == 0 || mesh->strip_count > mesh->triangles ||
         mesh->strip_point_count > 3 * mesh->triangles ||
         mesh->points == NULL || mesh->strip_points == NULL ||
-        mesh->colors == NULL || mesh->base_colors == NULL || mesh->strips == NULL)
+        mesh->colors == NULL || mesh->base_colors == NULL || mesh->texcoords == NULL ||
+        mesh->strips == NULL || mesh->lighting_ready || mesh->vertex_materials ||
+        mesh->vertex_colors)
         return 0;
     memset(&result, 0, sizeof(result));
     result.triangles = mesh->triangles;
@@ -597,6 +668,9 @@ xb_mesh_reverse_draw_order(xb_mesh *mesh)
         memcpy(result.points + facet_number * 3,
                mesh->points + source->first_facet * 3,
                triangles * 3 * sizeof(xb_point));
+        memcpy(result.texcoords + facet_number * 3,
+               mesh->texcoords + source->first_facet * 3,
+               triangles * 3 * sizeof(xb_texcoord));
         memcpy(result.colors + facet_number,
                mesh->colors + source->first_facet,
                triangles * sizeof(xb_rgb));

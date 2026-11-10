@@ -55,9 +55,9 @@ static void check_mesh(const xb_mesh *mesh, int base, int depth,
     assert(mesh->strip_point_count == mesh->strip_count * 2 * (columns + 1));
     assert(mesh->points != NULL && mesh->strip_points != NULL);
     assert(mesh->colors != NULL && mesh->base_colors != NULL);
-    assert(mesh->strips != NULL);
+    assert(mesh->strips != NULL && mesh->texcoords != NULL);
 
-    bytes = mesh->point_count * sizeof(*mesh->points)
+    bytes = mesh->point_count * (sizeof(*mesh->points) + sizeof(*mesh->texcoords))
           + mesh->strip_point_count * sizeof(*mesh->strip_points)
           + 2 * mesh->triangles * sizeof(*mesh->colors)
           + mesh->strip_count * sizeof(*mesh->strips);
@@ -563,6 +563,72 @@ static void test_projected_area(void)
     assert(mean == 8.0 && minimum == 0.0 && maximum == 16.0);
 }
 
+static void test_vertex_materials(void)
+{
+    xb_mesh mesh, duplicate, before;
+    xb_rgb *saved;
+    size_t i, bytes;
+    int varied, depth;
+    memset(&mesh, 0, sizeof(mesh)); memset(&duplicate, 0, sizeof(duplicate));
+    assert(!xb_mesh_vertex_materials(NULL, 0));
+    assert(!xb_mesh_vertex_materials(&mesh, 0));
+    for (depth = 0; depth <= 2; ++depth) {
+        assert(xb_mesh_build(&mesh, 10, depth, 0.85f, 0));
+        assert(xb_mesh_build(&duplicate, 10, depth, 0.85f, 0));
+        /* A deformation after mesh creation must not move its material UVs. */
+        for (i = 0; i < duplicate.point_count; ++i) {
+            duplicate.points[i].x += 17.0f;
+            duplicate.points[i].y *= 0.125f;
+            duplicate.points[i].z = 0.1f;
+        }
+        bytes = mesh.bytes;
+        before = mesh;
+        assert(!xb_mesh_vertex_materials(&mesh, -1));
+        assert(!xb_mesh_vertex_materials(&mesh, 3));
+        assert(!memcmp(&mesh, &before, sizeof(mesh)));
+        assert(xb_mesh_vertex_materials(&mesh, depth));
+        assert(xb_mesh_vertex_materials(&duplicate, depth));
+        assert(mesh.bytes == bytes + mesh.point_count * 2 * sizeof(xb_rgb));
+        assert(!memcmp(mesh.vertex_materials, duplicate.vertex_materials,
+                       mesh.point_count * sizeof(xb_rgb)));
+        assert(!memcmp(mesh.vertex_colors, mesh.vertex_materials,
+                       mesh.point_count * sizeof(xb_rgb)));
+        assert(!xb_mesh_vertex_materials(&mesh, depth));
+        varied = 0;
+        for (i = 0; i < mesh.point_count; ++i) {
+            check_color(mesh.vertex_colors + i);
+            if (memcmp(mesh.vertex_materials + i, mesh.vertex_materials + (i / 3) * 3,
+                       sizeof(xb_rgb))) varied = 1;
+        }
+        if (depth == 2) assert(varied);
+        xb_mesh_free(&mesh); xb_mesh_free(&duplicate);
+    }
+    /* Negative and positive coordinates separated by a period must sample
+     * identically. Exact binary fractions avoid a boundary-rounding test. */
+    assert(xb_mesh_build_connected(&mesh, 4, 1));
+    for (i = 0; i < mesh.point_count; ++i) {
+        mesh.texcoords[i].u = i & 1 ? -0.125f : 0.875f;
+        mesh.texcoords[i].v = i & 1 ? -0.25f : 0.75f;
+    }
+    assert(xb_mesh_vertex_materials(&mesh, 2));
+    for (i = 1; i < mesh.point_count; ++i)
+        assert(!memcmp(mesh.vertex_materials, mesh.vertex_materials + i, sizeof(xb_rgb)));
+    xb_mesh_free(&mesh);
+    /* Draw-order reversal must carry UVs with each primitive. */
+    assert(xb_mesh_build(&mesh, 8, 2, 0.85f, 1));
+    assert(xb_mesh_build(&duplicate, 8, 2, 0.85f, 1));
+    assert(xb_mesh_reverse_draw_order(&duplicate));
+    assert(xb_mesh_reverse_draw_order(&duplicate));
+    assert(!memcmp(mesh.texcoords, duplicate.texcoords, mesh.point_count * sizeof(xb_texcoord)));
+    assert(xb_mesh_vertex_materials(&mesh, 2));
+    saved = (xb_rgb *)malloc(mesh.point_count * sizeof(*saved)); assert(saved);
+    memcpy(saved, mesh.vertex_materials, mesh.point_count * sizeof(*saved));
+    assert(!xb_mesh_reverse_draw_order(&mesh));
+    assert(!memcmp(saved, mesh.vertex_materials, mesh.point_count * sizeof(*saved)));
+    free(saved); xb_mesh_free(&mesh); xb_mesh_free(&duplicate);
+    assert(!mesh.texcoords && !mesh.vertex_materials && !mesh.vertex_colors && !mesh.bytes);
+}
+
 int main(void)
 {
     int method;
@@ -573,9 +639,10 @@ int main(void)
     test_reverse_draw_order();
     test_calibrated_geometry();
     test_projected_area();
+    test_vertex_materials();
     for (method = 0; method < XB_METHODS; ++method)
         assert(xb_method_name((enum xb_method)method)[0] != '\0');
     puts("scene tests: geometry equivalence, subdivision coverage, color caches,"
-         " calibrated pixel areas, allocation accounting and invalid inputs passed");
+         " vertex texture samples, calibrated pixel areas, allocation accounting and invalid inputs passed");
     return 0;
 }

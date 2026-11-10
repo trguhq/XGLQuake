@@ -8,6 +8,10 @@
 #include <sys/utsname.h>
 
 #define XB_MAX_CASES 192
+#define XB_TARGET_FRAME_SECONDS (1.0 / 15.0)
+#if XB_MAX_RESULTS < 2 * XB_MAX_CASES
+#error Result capacity must cover both default resolutions
+#endif
 static int xb_quit;
 
 static void usage(FILE *f)
@@ -266,6 +270,59 @@ static int make_cases(xb_case *cases)
             add_lighting_case(cases, &n, name, path, XB_LIGHT_QUAKE, lights, 0, 1, 0, 1, 0);
         }
     }
+    /* Compare material interpolation separately from lighting interpolation.
+     * Geometry and CPU texture image match; only the sampling policy changes. */
+    for (path = 0; path < 2; ++path) {
+        for (d = 0; d <= 2; ++d) {
+            sprintf(name, "texture/%s/depth-%d", path ? "vertex-smooth" : "facet-flat", d);
+            c = add_case(cases, &n, name); c->depth = d;
+            c->shade = path ? XB_SMOOTH : XB_FLAT;
+            c->vertex_material = path;
+        }
+    }
+    /* Completed frames include moving lights, color/Z clear, HUD and swap.
+     * The Quake-like model remains separate from the matched Lambert model. */
+    for (path = 0; path < 4; ++path) {
+        for (d = 0; d <= 2; ++d) {
+            sprintf(name, "frame/lighting/%s/point-1/depth-%d", paths[path], d);
+            add_lighting_case(cases, &n, name, path, XB_LIGHT_LAMBERT, 1, 0, 1, 0, d, 0);
+            c = &cases[n - 1]; c->work = XB_FRAME; c->vertex_material = path & 1;
+            if (path < 2) {
+                sprintf(name, "frame/lighting/%s/quake-point-1/depth-%d", paths[path], d);
+                add_lighting_case(cases, &n, name, path, XB_LIGHT_QUAKE, 1, 0, 1, 0, d, 0);
+                c = &cases[n - 1]; c->work = XB_FRAME; c->vertex_material = path & 1;
+            }
+        }
+    }
+    /* One application thread, overlapping CPU relighting with device work.
+     * Native light-state mutation is deliberately outside this experiment. */
+    for (mode = 0; mode <= 1; ++mode) {
+        for (path = 0; path < 2; ++path) {
+            for (d = 0; d <= 2; ++d) {
+                sprintf(name, "pipeline/%s/quake-%s/depth-%d",
+                    mode ? "streaming" : "serialized", paths[path], d);
+                add_lighting_case(cases, &n, name, path, XB_LIGHT_QUAKE, 1, 0, 1, 0, d, 0);
+                c = &cases[n - 1]; c->work = XB_PIPELINE;
+                c->streaming = mode; c->vertex_material = path & 1;
+            }
+        }
+    }
+    for (m = XB_POLYGON; m <= XB_MULTI; ++m) {
+        for (path = 0; path < 4; ++path) {
+            sprintf(name, "lighting/submit/%s/%s/point-1/depth-1",
+                xb_method_name((enum xb_method)m), paths[path]);
+            add_lighting_case(cases, &n, name, path, XB_LIGHT_LAMBERT, 1, 0, 1, 0, 1, 0);
+            c = &cases[n - 1]; c->method = (enum xb_method)m;
+            c->batch = m == XB_POLYGON ? 1 : 128; c->vertex_material = path & 1;
+        }
+    }
+    for (path = 0; path < 2; ++path) {
+        for (mode = 0; mode < 2; ++mode) {
+            sprintf(name, "cull/%s/%s", path ? "mixed" : "all-front", mode ? "back" : "off");
+            c = add_case(cases, &n, name);
+            c->mixed_winding = path; c->cull = mode;
+        }
+    }
     return n;
 }
 
@@ -274,16 +331,33 @@ static int build_mesh(xb_mesh *mesh, const xb_options *o, const xb_case *c,
 {
     int ok;
     size_t i;
+    xb_point point;
     if (c->area > 0) ok = xb_mesh_build_calibrated(mesh, o->base_triangles,
                                                  width, height, c->area, c->aspect);
     else if (c->connected) ok = xb_mesh_build_connected(mesh, o->base_triangles, c->depth);
     else ok = xb_mesh_build(mesh, o->base_triangles, c->depth, c->size, c->overdraw);
     if (ok && c->reverse) ok = xb_mesh_reverse_draw_order(mesh);
+    if (ok && !strncmp(c->name, "cull/", 5)) {
+        /* Only unlit multi-polygon cases use this independent-corner fixture;
+         * the strip representation is deliberately not submitted. Under the
+         * XGL Y_DOWN_Z_AWAY view, -Z faces the viewer. The ordinary generator
+         * produces +Z normals, so reverse all corners for all-front, or only
+         * even facets to leave the odd half back-facing in the mixed fixture. */
+        for (i = 0; i < mesh->triangles; i += c->mixed_winding ? 2 : 1) {
+            point = mesh->points[i * 3 + 1];
+            mesh->points[i * 3 + 1] = mesh->points[i * 3 + 2];
+            mesh->points[i * 3 + 2] = point;
+        }
+    }
     if (ok && c->clipping) {
         for (i = 0; i < mesh->point_count; ++i)
             mesh->points[i].z = (mesh->points[i].x + .2f) * .8f;
         for (i = 0; i < mesh->strip_point_count; ++i)
             mesh->strip_points[i].z = (mesh->strip_points[i].x + .2f) * .8f;
+    }
+    if (ok && c->vertex_material && !xb_mesh_vertex_materials(mesh, c->depth)) {
+        xb_mesh_free(mesh);
+        return 0;
     }
     if (ok && c->lighting != XB_LIGHT_OFF && !xb_lighting_init(mesh, c)) {
         xb_mesh_free(mesh);
@@ -396,7 +470,8 @@ static void backend_reason(xb_result *r, const char *fallback)
 static int pipeline_window(xb_result *r, xb_mesh *mesh,
                            unsigned long *sequence, xb_window *window)
 {
-    int slot, okay;
+    int slot, okay, changes;
+    xb_light_state state;
     size_t calls;
     double start;
     memset(window, 0, sizeof(*window));
@@ -408,6 +483,16 @@ static int pipeline_window(xb_result *r, xb_mesh *mesh,
             xb_mesh_colors(mesh, *sequence);
             if (!xb_backend_stream_prepare(slot, mesh)) {
                 backend_reason(r, "stream color preparation failed"); okay = 0; break;
+            }
+        } else if (r->test.update == XB_LIGHT_UPDATE) {
+            changes = xb_lighting_update(mesh, &r->test, *sequence, &state);
+            if (changes < 0 || (changes & XB_UPDATE_LIGHTS)) {
+                backend_reason(r, "stream lighting requires CPU-computed colors"); okay = 0; break;
+            }
+            /* Each reusable slot may contain an older sequence's colors,
+             * including when a cached lightstyle did not change this item. */
+            if (!xb_backend_stream_prepare(slot, mesh)) {
+                backend_reason(r, "stream lighting color preparation failed"); okay = 0; break;
             }
         }
         window->prepare += xb_now() - start;
@@ -662,9 +747,16 @@ static void csv_row(FILE *f, const xb_result *r, const char *record, int trial,
             (r->test.lighting != XB_LIGHT_OFF ? "lighting-serialized" : "serialized"),
         r->queue_limit, r->max_outstanding, r->drains, enqueue * 1000, drain * 1000,
         r->area_mean, r->area_min, r->area_max, (unsigned long)r->input_bytes);
-    fprintf(f, "%s,%s,%s,%d,%d,%d,%s\n", r->test.shade == XB_SMOOTH ? "smooth" : "flat",
+    fprintf(f, "%s,%s,%s,%d,%d,%d,%s,%s,%s,%s,", r->test.shade == XB_SMOOTH ? "smooth" : "flat",
         lighting_name(&r->test), lighting_compute(&r->test), r->test.lights,
-        r->test.moving, style_layers(&r->test), lighting_sample(&r->test));
+        r->test.moving, style_layers(&r->test), lighting_sample(&r->test),
+        r->test.vertex_material ? "vertices" : "facet",
+        r->test.cull ? "back" : "off", r->test.mixed_winding ? "mixed" : "front");
+    if (r->passed && r->test.work == XB_FRAME)
+        fprintf(f, "%.9f,%.9f", XB_TARGET_FRAME_SECONDS * 1000,
+                total / XB_TARGET_FRAME_SECONDS);
+    else fputc(',', f);
+    fputc('\n', f);
 }
 
 static void print_result(FILE *csv, const xb_result *r)
@@ -708,6 +800,17 @@ static void print_result(FILE *csv, const xb_result *r)
             lighting_sample(&r->test));
         printf("  lighting facets/sec uses total_ms (CPU preparation + reset + completed draw).\n");
     }
+    if (r->test.vertex_material)
+        printf("  Material RGB sampled at each corner; interpolation includes texture color.\n");
+    if (!strncmp(r->test.name, "cull/", 5))
+        printf("  Backface culling %s; %s winding. Facet rate counts submitted triangles,\n"
+               "  including rejected backfaces; this is not a CPU-culling comparison.\n",
+               r->test.cull ? "on" : "off", r->test.mixed_winding ? "mixed" : "all-front");
+    if (r->test.work == XB_FRAME)
+        printf("  15 FPS reference: %.1f%% of 66.667 ms; %.3f ms budget remaining.\n"
+               "  Synthetic render workload only; engine work and polling still need time.\n",
+               100.0 * r->median / XB_TARGET_FRAME_SECONDS,
+               (XB_TARGET_FRAME_SECONDS - r->median) * 1000);
     for (i = 0; i < r->samples; ++i)
         csv_row(csv, r, "trial", i + 1, r->total[i], r->prepare[i],
                 r->render[i], r->present[i], r->cpu[i]);
@@ -910,7 +1013,8 @@ int main(int argc, char **argv)
                      "present_ms,cpu_ms,triangles_per_second,reason,");
         fprintf(csv, "timing_mode,queue_limit,max_queued,drain_calls,enqueue_ms,drain_ms,"
                      "nominal_area_mean_px,nominal_area_min_px,nominal_area_max_px,input_payload_bytes,");
-        fprintf(csv, "shading,lighting_model,lighting_compute,light_count,light_motion,style_layers,lighting_sample\n");
+        fprintf(csv, "shading,lighting_model,lighting_compute,light_count,light_motion,style_layers,lighting_sample,"
+                     "material_sample,cull,winding,frame_budget_ms,frame_budget_fraction\n");
     }
     results = (xb_result *)calloc(XB_MAX_RESULTS, sizeof(*results));
     if (!results) { if (csv) fclose(csv); fprintf(stderr, "Out of memory.\n"); return 1; }
@@ -950,7 +1054,7 @@ int main(int argc, char **argv)
            "was a VRAM-limited historical result. These tests do not reproduce that exact\n"
            "workload; treat it as context, not an expected result or a pass/fail threshold.\n");
     printf("Lighting cases separate CPU flat/smooth colors from XGL facet/vertex illumination.\n"
-           "Smooth colors interpolate lighting while preserving each triangle's material color.\n"
+           "Original smooth cases preserve facet material; vertex-material cases also interpolate texture color.\n"
            "Compare completed total_ms: XGL light-state changes and CPU recoloring are preparation.\n"
            "Lighting facets/sec also uses total_ms. Point-lit flat pairs share equations but\n"
            "not sample locations (CPU centroid vs device-chosen XGL vertex).\n");
@@ -960,6 +1064,9 @@ int main(int argc, char **argv)
            "Normals and sample caches are built before timing; updated RGB/native light state is timed.\n");
     printf("Animated-style trials reset their cache before timing, run at least 24 items,\n"
            "and finish a six-item tick so even short trials exercise actual color changes.\n");
+    printf("All cases use one application thread; no SMP or worker-thread tests are included.\n"
+           "Full-frame budget reference is 15 FPS (66.667 ms), not a promised Quake frame rate.\n"
+           "Allow time for engine logic, visibility, audio, input and workloads absent here.\n");
     if (!xb_backend_has_hardware())
         printf("FALLBACK/TEST RUN: results do not establish the accelerated ZX performance path.\n");
     nresult = 0; successes = 0;

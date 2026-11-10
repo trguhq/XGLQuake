@@ -24,6 +24,7 @@
  */
 typedef struct {
     Xgl_pt_f3d *points;
+    Xgl_pt_color_f3d *color_points;
     Xgl_pt_list *lists;
     Xgl_color_facet *facets;
     Xgl_facet_list *batch_facets;
@@ -58,7 +59,7 @@ typedef struct {
     size_t triangles, point_count, strip_point_count, strip_count;
     enum xb_method method;
     int batch, perspective, errors, fatal;
-    int shading, hardware_lighting, allow_fallback, light_count;
+    int shading, hardware_lighting, allow_fallback, light_count, cull;
     Xgl_light lights[XB_MAX_LIGHTS + 1];
     xb_light_state light_state;
     int raster_checked, raster_ok, mask_checked, mask_ok;
@@ -71,12 +72,14 @@ static xb_native b;
 static int validate_raster(int masked);
 static int validate_stream(void);
 static int validate_lighting(void);
+static int validate_culling(void);
 
 static void free_stream_slots(void)
 {
     int i;
     for (i = 0; i < XB_MAX_QUEUE; ++i) {
         free(b.stream[i].points);
+        free(b.stream[i].color_points);
         free(b.stream[i].lists);
         free(b.stream[i].facets);
         free(b.stream[i].batch_facets);
@@ -416,6 +419,7 @@ int xb_backend_open(const xb_options *options, int width, int height)
                 XGL_CTX_SURF_FRONT_FILL_STYLE, XGL_SURF_FILL_SOLID,
                 XGL_CTX_SURF_EDGE_FLAG, FALSE,
                 XGL_3D_CTX_SURF_FACE_CULL, XGL_CULL_OFF,
+                XGL_3D_CTX_SURF_GEOM_NORMAL, XGL_GEOM_NORMAL_FIRST_POINTS,
                 XGL_3D_CTX_SURF_FACE_DISTINGUISH, FALSE,
                 XGL_3D_CTX_Z_BUFFER_COMP_METHOD, XGL_Z_COMP_LESS_THAN_OR_EQUAL,
                 XGL_3D_CTX_Z_BUFFER_WRITE_MASK, (Xgl_usgn32)0xffffffffUL,
@@ -536,8 +540,10 @@ void xb_backend_info(FILE *out)
     fprintf(out, "Strip inputs share vertex records; batch caps split strips "
                  "with two overlapping vertices. Raster copies: %dx%d.\n",
             XB_RASTER_W, XB_RASTER_H);
-    fprintf(out, "Pipeline: one thread/context; stable native slots; BUFFERS posts, "
+    fprintf(out, "Pipeline: CPU facet or vertex RGB; one thread/context; stable native slots; BUFFERS posts, "
                  "SYNCHRONIZE drains before slot reuse; no presentation.\n");
+    fprintf(out, "Culling comparisons use unlit multi-polygon geometry with explicit "
+                 "first-point normals; opposite-winding color readback gates back-face culling.\n");
     fprintf(out, "Lighting cases: CPU facet/vertex RGB or XGL facet/vertex ambient+diffuse; "
                  "supplied unit normals, both normal-flip options off, specular disabled.\n");
     fprintf(out, "Reported lighting support is coarse; it does not prove every light "
@@ -735,28 +741,49 @@ static int allocate_stream_slot(int index, const xb_mesh *mesh)
     slot->point_count = mesh->point_count;
     batches = (mesh->triangles + (size_t)b.stream_batch - 1) /
               (size_t)b.stream_batch;
-    slot->points = (Xgl_pt_f3d *)calloc(mesh->point_count, sizeof(*slot->points));
+    if (b.shading == XB_SMOOTH)
+        slot->color_points = (Xgl_pt_color_f3d *)calloc(mesh->point_count,
+                                                      sizeof(*slot->color_points));
+    else slot->points = (Xgl_pt_f3d *)calloc(mesh->point_count, sizeof(*slot->points));
     slot->lists = (Xgl_pt_list *)calloc(mesh->triangles, sizeof(*slot->lists));
-    slot->facets = (Xgl_color_facet *)calloc(mesh->triangles, sizeof(*slot->facets));
-    slot->batch_facets = (Xgl_facet_list *)calloc(batches, sizeof(*slot->batch_facets));
-    if (!slot->points || !slot->lists || !slot->facets || !slot->batch_facets) {
+    if (b.shading != XB_SMOOTH) {
+        slot->facets = (Xgl_color_facet *)calloc(mesh->triangles, sizeof(*slot->facets));
+        slot->batch_facets = (Xgl_facet_list *)calloc(batches, sizeof(*slot->batch_facets));
+    }
+    if (!(slot->points || slot->color_points) || !slot->lists ||
+        (b.shading != XB_SMOOTH && (!slot->facets || !slot->batch_facets))) {
         fail("out of memory allocating stable native stream slots");
         return 0;
     }
     for (i = 0; i < mesh->point_count; ++i) {
-        slot->points[i].x = mesh->points[i].x;
-        slot->points[i].y = mesh->points[i].y;
-        slot->points[i].z = mesh->points[i].z;
+        if (slot->color_points) {
+            slot->color_points[i].x = mesh->points[i].x;
+            slot->color_points[i].y = mesh->points[i].y;
+            slot->color_points[i].z = mesh->points[i].z;
+            slot->color_points[i].color.rgb.r = mesh->vertex_colors[i].r;
+            slot->color_points[i].color.rgb.g = mesh->vertex_colors[i].g;
+            slot->color_points[i].color.rgb.b = mesh->vertex_colors[i].b;
+        } else {
+            slot->points[i].x = mesh->points[i].x;
+            slot->points[i].y = mesh->points[i].y;
+            slot->points[i].z = mesh->points[i].z;
+        }
     }
     for (i = 0; i < mesh->triangles; ++i) {
-        slot->lists[i].pt_type = XGL_PT_F3D;
         slot->lists[i].num_pts = 3;
-        slot->lists[i].pts.f3d = slot->points + i * 3;
-        slot->facets[i].color.rgb.r = mesh->colors[i].r;
-        slot->facets[i].color.rgb.g = mesh->colors[i].g;
-        slot->facets[i].color.rgb.b = mesh->colors[i].b;
+        if (slot->color_points) {
+            slot->lists[i].pt_type = XGL_PT_COLOR_F3D;
+            slot->lists[i].pts.color_f3d = slot->color_points + i * 3;
+        } else {
+            slot->lists[i].pt_type = XGL_PT_F3D;
+            slot->lists[i].pts.f3d = slot->points + i * 3;
+            slot->facets[i].color.rgb.r = mesh->colors[i].r;
+            slot->facets[i].color.rgb.g = mesh->colors[i].g;
+            slot->facets[i].color.rgb.b = mesh->colors[i].b;
+        }
     }
-    for (i = 0, start = 0; start < mesh->triangles; ++i, start += count) {
+    for (i = 0, start = 0; slot->batch_facets && start < mesh->triangles;
+         ++i, start += count) {
         count = mesh->triangles - start;
         if (count > (size_t)b.stream_batch) count = (size_t)b.stream_batch;
         slot->batch_facets[i].facet_type = XGL_FACET_COLOR;
@@ -781,16 +808,22 @@ int xb_backend_stream_prepare(int index, const xb_mesh *mesh)
         fail("stream slot is pending; synchronize before replacing its colors");
         return 0;
     }
-    if (!mesh || !mesh->colors || mesh->triangles != slot->triangles ||
+    if (!mesh || (slot->color_points ? !mesh->vertex_colors : !mesh->colors) ||
+        mesh->triangles != slot->triangles ||
         mesh->point_count != slot->point_count) {
         fail("stream preparation requires the original static geometry dimensions");
         return 0;
     }
     /* No allocation or source-mesh reference survives this call. */
-    for (i = 0; i < slot->triangles; ++i) {
+    for (i = 0; slot->facets && i < slot->triangles; ++i) {
         slot->facets[i].color.rgb.r = mesh->colors[i].r;
         slot->facets[i].color.rgb.g = mesh->colors[i].g;
         slot->facets[i].color.rgb.b = mesh->colors[i].b;
+    }
+    for (i = 0; slot->color_points && i < slot->point_count; ++i) {
+        slot->color_points[i].color.rgb.r = mesh->vertex_colors[i].r;
+        slot->color_points[i].color.rgb.g = mesh->vertex_colors[i].g;
+        slot->color_points[i].color.rgb.b = mesh->vertex_colors[i].b;
     }
     slot->prepared = 1;
     return 1;
@@ -821,7 +854,8 @@ static size_t draw_stream_slot(int index, int clear)
         if (count > (size_t)b.stream_batch) count = (size_t)b.stream_batch;
         xgl_multi_simple_polygon(b.ctx,
                 XGL_FACET_FLAG_SIDES_ARE_3 | XGL_FACET_FLAG_SHAPE_CONVEX,
-                &slot->batch_facets[calls], NULL, (Xgl_usgn32)count,
+                slot->color_points ? NULL : &slot->batch_facets[calls],
+                NULL, (Xgl_usgn32)count,
                 slot->lists + start);
         ++calls;
     }
@@ -866,10 +900,11 @@ int xb_backend_stream_begin(const xb_mesh *mesh, int slots,
     if (b.errors || b.fatal || b.quit) goto bad;
     xb_backend_stream_end();
     if (b.stream_active || b.errors) goto bad;
-    if (b.method != XB_MULTI || slots < 1 || slots > XB_MAX_QUEUE || !mesh ||
+    if (b.method != XB_MULTI || b.hardware_lighting ||
+        slots < 1 || slots > XB_MAX_QUEUE || !mesh ||
         !mesh->triangles || mesh->point_count != mesh->triangles * 3 ||
-        !mesh->points || !mesh->colors) {
-        fail("streaming requires multi-polygon geometry and 1..8 stable slots");
+        !mesh->points || (b.shading == XB_SMOOTH ? !mesh->vertex_colors : !mesh->colors)) {
+        fail("streaming requires CPU facet/vertex RGB, multi-polygon geometry and 1..8 stable slots");
         goto bad;
     }
     xb_backend_sync();
@@ -886,7 +921,9 @@ int xb_backend_stream_begin(const xb_mesh *mesh, int slots,
     b.stream_slots = slots;
     for (i = 0; i < slots; ++i)
         if (!allocate_stream_slot(i, mesh)) goto bad;
-    copy_text(reason, size, "independent queued slot colors and per-item color/Z clear readback passed");
+    copy_text(reason, size, b.shading == XB_SMOOTH ?
+              "queued vertex colors, interpolation and per-item color/Z clear readback passed" :
+              "independent queued facet colors and per-item color/Z clear readback passed");
     return 1;
 bad:
     copy_text(reason, size, b.error);
@@ -949,8 +986,13 @@ static int configure_lighting(const xb_case *test)
     b.hardware_lighting = test->xgl_lighting;
     b.light_count = test->xgl_lighting ? test->lights : 0;
     if ((test->shade != XB_FLAT || test->lighting != XB_LIGHT_OFF) &&
-        (test->method != XB_MULTI || test->work == XB_PIPELINE)) {
-        fail("lighting and smooth-color cases require serialized multi-polygon draws");
+        (test->method != XB_MULTI && test->method != XB_POLYGON)) {
+        fail("lighting and smooth-color cases require polygon or multi-polygon draws");
+        return 0;
+    }
+    if (test->work == XB_PIPELINE &&
+        (test->method != XB_MULTI || test->xgl_lighting)) {
+        fail("streaming requires multi-polygon CPU colors; hardware-lighting streams are not validated");
         return 0;
     }
     if (b.hardware_lighting && (test->lighting != XB_LIGHT_LAMBERT ||
@@ -1019,6 +1061,13 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
     b.batch = test->batch > 0 ? test->batch : 128;
     b.method = test->method;
     b.perspective = test->perspective;
+    b.cull = test->cull;
+    if (b.cull < 0 || b.cull > 1 ||
+        (b.cull && (test->method != XB_MULTI || test->shade != XB_FLAT ||
+                    test->lighting != XB_LIGHT_OFF || test->work == XB_PIPELINE))) {
+        copy_text(reason, size, "back-face culling is validated only for unlit flat multi-polygon cases");
+        return 0;
+    }
     if (test->retained && (test->method != XB_MULTI || test->update != XB_STATIC)) {
         copy_text(reason, size, "retained-array test requires static multi-polygon geometry");
         return 0;
@@ -1030,6 +1079,7 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
     b.current_z = test->zbuffer;
     xgl_object_set(b.ctx, XGL_CTX_GEOM_DATA_IS_VOLATILE,
                    test->retained ? FALSE : TRUE,
+                   XGL_3D_CTX_SURF_FACE_CULL, XGL_CULL_OFF,
                    XGL_3D_CTX_HLHSR_MODE,
                    b.current_z ? XGL_HLHSR_Z_BUFFER : XGL_HLHSR_NONE, 0);
     identity(b.model);
@@ -1038,6 +1088,12 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
         copy_text(reason, size, b.error);
         return 0;
     }
+    if (b.cull && !validate_culling()) {
+        copy_text(reason, size, b.error);
+        return 0;
+    }
+    xgl_object_set(b.ctx, XGL_3D_CTX_SURF_FACE_CULL,
+                   b.cull ? XGL_CULL_BACK : XGL_CULL_OFF, 0);
     if (mesh && mesh->triangles && !xb_backend_upload(mesh)) {
         copy_text(reason, size, b.error);
         return 0;
@@ -1116,8 +1172,15 @@ size_t xb_backend_draw(enum xb_method method, int batch)
     points.pt_type = XGL_PT_F3D;
     if (method == XB_POLYGON) {
         for (i = 0; i < b.triangles && !b.errors; ++i) {
-            facet.color_facet = b.facets[i];
-            xgl_polygon(b.ctx, XGL_FACET_COLOR, &facet, NULL, 1, &b.lists[i]);
+            if (b.shading == XB_SMOOTH)
+                xgl_polygon(b.ctx, XGL_FACET_NONE, NULL, NULL, 1, &b.lists[i]);
+            else if (b.lit_facets) {
+                facet.color_normal_facet = b.lit_facets[i];
+                xgl_polygon(b.ctx, XGL_FACET_COLOR_NORMAL, &facet, NULL, 1, &b.lists[i]);
+            } else {
+                facet.color_facet = b.facets[i];
+                xgl_polygon(b.ctx, XGL_FACET_COLOR, &facet, NULL, 1, &b.lists[i]);
+            }
         }
         return i;
     }
@@ -1272,9 +1335,92 @@ static int lighting_probe_draw(const xb_mesh *mesh)
 {
     if (b.errors || !xb_backend_upload(mesh)) return 0;
     xb_backend_clear(1, 1);
-    if (!xb_backend_draw(XB_MULTI, b.batch)) return 0;
+    if (!xb_backend_draw(b.method, b.batch)) return 0;
     xb_backend_sync();
     return !b.errors;
+}
+
+static int validate_culling(void)
+{
+    Xgl_pt_f3d points[6];
+    Xgl_pt_list lists[2];
+    Xgl_color_facet colors[2];
+    Xgl_facet_list facets;
+    Xgl_boolean previous_volatile;
+    xb_rgb expected[2], black;
+    int i, mode, px, py, result;
+    /* With Y_DOWN_Z_AWAY, the viewer lies along negative Z. FIRST_POINTS
+     * therefore makes the left (-Z) triangle front-facing and the right
+     * (+Z) triangle back-facing. Use no supplied normal or lighting so this
+     * gate tests exactly the winding convention of the timed culling cases.
+     */
+    memset(points, 0, sizeof(points));
+    memset(lists, 0, sizeof(lists));
+    memset(colors, 0, sizeof(colors));
+    memset(&facets, 0, sizeof(facets));
+    memset(expected, 0, sizeof(expected));
+    memset(&black, 0, sizeof(black));
+    expected[0].r = 1.0f;
+    expected[1].g = 1.0f;
+    points[0].x = -.9f; points[0].y = -.6f;
+    points[1].x = -.9f; points[1].y =  .6f;
+    points[2].x = -.1f; points[2].y = -.6f;
+    points[3].x =  .1f; points[3].y = -.6f;
+    points[4].x =  .9f; points[4].y = -.6f;
+    points[5].x =  .1f; points[5].y =  .6f;
+    for (i = 0; i < 6; ++i) points[i].z = .5f;
+    for (i = 0; i < 2; ++i) {
+        lists[i].pt_type = XGL_PT_F3D;
+        lists[i].num_pts = 3;
+        lists[i].pts.f3d = points + i * 3;
+        colors[i].color.rgb.r = expected[i].r;
+        colors[i].color.rgb.g = expected[i].g;
+        colors[i].color.rgb.b = expected[i].b;
+    }
+    facets.facet_type = XGL_FACET_COLOR;
+    facets.num_facets = 2;
+    facets.facets.color_facets = colors;
+    previous_volatile = TRUE;
+    xgl_object_get(b.ctx, XGL_CTX_GEOM_DATA_IS_VOLATILE, &previous_volatile);
+    if (b.errors) return 0;
+    /* The tiny probe uses stack descriptors. Unlike retained timed arrays,
+     * these must never remain reachable after an error returns to our caller.
+     */
+    xgl_object_set(b.ctx, XGL_CTX_GEOM_DATA_IS_VOLATILE, TRUE, 0);
+    if (b.errors) return 0;
+    identity(b.model);
+    view_matrix(0);
+    result = 0;
+    for (mode = 0; mode < 2; ++mode) {
+        xgl_object_set(b.ctx, XGL_3D_CTX_SURF_FACE_CULL,
+                       mode ? XGL_CULL_BACK : XGL_CULL_OFF, 0);
+        if (b.errors) goto done;
+        xb_backend_clear(1, 1);
+        xgl_multi_simple_polygon(b.ctx,
+                XGL_FACET_FLAG_SIDES_ARE_3 | XGL_FACET_FLAG_SHAPE_CONVEX,
+                &facets, NULL, 2, lists);
+        xb_backend_sync();
+        for (i = 0; i < 2; ++i) {
+            px = (int)(((i ? .366666667 : -.633333333) + 1.0) *
+                       .5 * (b.width - 1));
+            py = (int)(.4 * (b.height - 1));
+            if (!pixel_matches(px, py, mode && i ? &black : &expected[i])) {
+                if (!b.errors)
+                    fail("front/back winding readback failed with culling off or back-face culling");
+                goto done;
+            }
+        }
+    }
+    result = 1;
+done:
+    /* Every draw completed before its local descriptors leave this scope. */
+    xb_backend_sync();
+    if (!b.errors) {
+        xgl_object_set(b.ctx, XGL_3D_CTX_SURF_FACE_CULL, XGL_CULL_OFF,
+                       XGL_CTX_GEOM_DATA_IS_VOLATILE, previous_volatile, 0);
+        view_matrix(b.perspective);
+    }
+    return result && !b.errors;
 }
 
 static int validate_lighting(void)
@@ -1354,7 +1500,7 @@ static int validate_lighting(void)
             expected.b += (float)(weight[i] * reflected[i].b);
         }
         xb_backend_clear(1, 1);
-        if (!xb_backend_draw(XB_MULTI, b.batch)) goto done;
+        if (!xb_backend_draw(b.method, b.batch)) goto done;
         xb_backend_sync();
         if (!pixel_matches(px, py, &expected)) goto done;
     }
@@ -1402,19 +1548,27 @@ static int validate_stream(void)
 {
     xb_mesh mesh;
     xb_point points[6];
+    xb_rgb vertex_colors[6];
     xb_rgb colors[2], expected[2], black;
-    float x;
-    int i, j, px, py, saved_z, result;
+    xb_rgb interpolated;
+    float x, scale;
+    int i, j, px, py, probe_x, probe_y, saved_z, result;
     memset(&mesh, 0, sizeof(mesh));
     mesh.triangles = 2; mesh.point_count = 6;
     mesh.points = points; mesh.colors = colors;
+    mesh.vertex_colors = vertex_colors;
     expected[0].r = 1; expected[0].g = expected[0].b = 0;
     expected[1].r = 0; expected[1].g = expected[1].b = 1;
+    if (b.shading == XB_SMOOTH) {
+        expected[0].r = .6f;
+        expected[1].g = expected[1].b = .6f;
+    }
     black.r = black.g = black.b = 0;
     saved_z = b.current_z;
     result = 0;
     b.current_z = 1;
-    xgl_object_set(b.ctx, XGL_3D_CTX_HLHSR_MODE, XGL_HLHSR_Z_BUFFER, 0);
+    xgl_object_set(b.ctx, XGL_3D_CTX_HLHSR_MODE, XGL_HLHSR_Z_BUFFER,
+                   XGL_3D_CTX_SURF_FACE_CULL, XGL_CULL_OFF, 0);
     identity(b.model);
     view_matrix(0);
     /* Even the depth-one control exercises two independent native slots in
@@ -1432,13 +1586,26 @@ static int validate_stream(void)
         points[5].x = 0;     points[5].y = 0.4f;
         for (j = 0; j < 6; ++j) points[j].z = i ? 0.8f : 0.2f;
         colors[0] = colors[1] = black;
+        for (j = 0; j < 6; ++j) vertex_colors[j] = black;
         if (!allocate_stream_slot(i, &mesh)) goto done;
     }
     xb_backend_clear(1, 1);
     for (i = 0; i < 2; ++i) {
         colors[0] = colors[1] = expected[i];
+        /* Each disjoint patch has .2/.6/1 corner intensities, whose interior
+         * centroid must be .6. This rejects accidentally flat vertex colors
+         * independently of the serialized shading gate. Overlapping depth
+         * patches use constant vertex colors for an unambiguous Z check.
+         */
+        for (j = 0; j < 6; ++j) {
+            scale = j < 3 ? (float)(2 * j + 1) / 3.0f : 1.0f;
+            vertex_colors[j].r = scale * expected[i].r;
+            vertex_colors[j].g = scale * expected[i].g;
+            vertex_colors[j].b = scale * expected[i].b;
+        }
         if (!xb_backend_stream_prepare(i, &mesh)) goto done;
         colors[0] = colors[1] = black; /* CPU source must not be retained. */
+        for (j = 0; j < 6; ++j) vertex_colors[j] = black;
         if (!draw_stream_slot(i, 0)) goto done;
         xb_backend_post();
     }
@@ -1448,6 +1615,22 @@ static int validate_stream(void)
         x = i ? 0.5f : -0.7f;
         px = (int)((x + 1.0) * 0.5 * (b.width - 1));
         if (!pixel_matches(px, py, &expected[i])) goto done;
+        if (b.shading == XB_SMOOTH) {
+            /* A second, noncentral sample distinguishes interpolation from
+             * any constant corner or average color. Evaluate its exact pixel
+             * barycentrics to avoid a resolution-dependent expected value.
+             */
+            x = i ? .3f : -.9f;
+            probe_x = (int)((x + .12 + 1.0) * .5 * (b.width - 1));
+            probe_y = (int)((-.78 + 1.0) * .5 * (b.height - 1));
+            scale = (float)((.2 + .4 *
+                ((2.0 * probe_x / (b.width - 1) - 1.0 - x) / .6) + .8 *
+                ((2.0 * probe_y / (b.height - 1) - 1.0 + .85) / .35)) / .6);
+            interpolated.r = expected[i].r * scale;
+            interpolated.g = expected[i].g * scale;
+            interpolated.b = expected[i].b * scale;
+            if (!pixel_matches(probe_x, probe_y, &interpolated)) goto done;
+        }
     }
     if (!pixel_matches(b.width / 2, b.height / 2, &expected[0])) goto done;
     /* Reuse only after completion. The second far central triangle must
@@ -1470,7 +1653,9 @@ done:
     if (!b.errors) {
         b.current_z = saved_z;
         xgl_object_set(b.ctx, XGL_3D_CTX_HLHSR_MODE,
-                       saved_z ? XGL_HLHSR_Z_BUFFER : XGL_HLHSR_NONE, 0);
+                       saved_z ? XGL_HLHSR_Z_BUFFER : XGL_HLHSR_NONE,
+                       XGL_3D_CTX_SURF_FACE_CULL,
+                       b.cull ? XGL_CULL_BACK : XGL_CULL_OFF, 0);
         view_matrix(b.perspective);
     }
     return result && !b.errors;

@@ -3,13 +3,22 @@
 `xglbench` is a standalone Sun XGL benchmark for choosing the rendering path
 for XGLQuake. It uses procedural geometry and CPU-sampled material colors;
 it needs no Quake executable, PAK files, OpenGL library, or texture-mapping
-support. It lives beside `WinQuake` so either Quake client can use its findings.
+support. Its current scope is the future `WinQuake`-based `xglquake` renderer.
 
 The intended measurement machine is Solaris 2.6 on a SPARCstation 10 with a
 Sun ZX/Leo board and the corresponding XGL runtime/device pipeline. The
 benchmark does not assume that every XGL operation is hardware accelerated.
 No measured ZX results from this program are supplied with the source. The
 historical rates discussed below are reference points from the Leo whitepaper.
+
+The reference workstation has two 60 MHz processors and 512 MB RAM, but every
+case uses **one application thread**. There are no SMP tests or worker threads.
+That workstation is an upper-end example, not a minimum requirement: start
+with the default 512 base triangles, 320x240, and a small queue on slower or
+smaller systems. No allocation is sized from the reference machine's RAM.
+The initial goal is 15 FPS, a 66.667 ms whole-engine frame budget. Full-frame
+results report their share of that budget; gameplay, visibility, audio and
+other engine work still require time.
 
 ## Build on Solaris
 
@@ -45,6 +54,14 @@ The default GCC options use `-ansi` and `-W` for older toolchain compatibility.
 
 `gmake sdk-check` checks the configured header locations. Compilation and
 linking against the real installed SDK remain the authoritative API check.
+
+Use the XGL installation supplied for the target Solaris system; do not
+assume a newer SDK or a particular release from the OS name alone. The
+benchmark records the runtime version and device capabilities. The new cases
+use the same documented XGL interfaces as the existing backend, and retain
+ANSI C and the native 32-bit build. Older/other device pipelines may skip
+unsupported or incorrect paths. Actual cross-version compatibility still
+requires builds and readback checks against those installed SDKs/runtimes.
 
 ## Run
 
@@ -93,8 +110,8 @@ is supplied by the caller. Keep the window fully visible and unobscured, and
 avoid moving or resizing it during a trial. Run on the workstation's local
 OpenWindows display rather than through SSH X forwarding. Background work
 and window-system activity can materially affect a 60 MHz machine.
-The full suite has 134 cases per resolution. At the default duration and
-repeat count, its two resolutions require at least 13.4 minutes of measured
+The full suite has 182 cases per resolution. At the default duration and
+repeat count, its two resolutions require at least 18.2 minutes of measured
 work, plus setup, warm-up and validation. Use `-list`
 to inspect the current case list, `-quick` for a smoke run, or `-test` to
 investigate a particular family. There is no randomized test order, so rerun
@@ -142,8 +159,9 @@ close comparisons and control changes in background load.
   exact replacement for Quake's world lighting.
 * **Does smooth shading help?** CPU-supplied vertex RGB with XGL interpolation
   is distinct from XGL-calculated vertex lighting. Both are compared with
-  flat facets. The material color remains constant within each triangle, so
-  these tests smooth lighting without blending colors across material edges.
+  flat facets. Original lighting cases keep material constant within each
+  triangle. Separate vertex-material cases sample the CPU image at each
+  corner, so interpolation can approximate texture variation as well.
 * **What does baked lighting cost?** Cached procedural lighting samples are
   separate from recombining animated lightstyle layers. This tests the work
   needed to update supplied colors without reconstructing the baked field
@@ -153,11 +171,65 @@ close comparisons and control changes in background load.
   Full-frame cases include a masked HUD copy as well as the scene and swap.
 * **Can a practical HUD be cheap?** Opaque and one-bit-masked raster-copy
   cases exercise 2D images without creating a triangle per image pixel.
+* **Does hardware backface rejection help?** Paired `cull/*` cases submit
+  identical all-front or mixed-winding independent triangles with culling
+  off or backface culling on. These measure device rejection, not CPU-side
+  visibility or BSP traversal.
 
 The generated scenes deliberately include conditions that are expensive or
 unrepresentative of an ordinary frame. A large-overlap test is a stress test,
 not an estimate of average Quake overdraw. No test result is a prediction of
 whole-engine frame rate.
+
+## Texture sampling and combined workloads
+
+The added cases keep the original measurements available for comparison:
+
+| Cases | What changes |
+| --- | --- |
+| `texture/{facet-flat,vertex-smooth}/depth-{0,1,2}` | Compare one filtered material color per triangle with independently sampled corner colors, with XGL lighting disabled. |
+| `frame/lighting/{cpu-flat,cpu-smooth,xgl-flat,xgl-smooth}/point-1/depth-{0,1,2}` | Moving Lambert light, color/Z clear, geometry, masked HUD, buffer swap and completion. |
+| `frame/lighting/{cpu-flat,cpu-smooth}/quake-point-1/depth-{0,1,2}` | The same complete-frame path with CPU baked-plus-dynamic Quake-like lighting. |
+| `pipeline/{serialized,streaming}/quake-{cpu-flat,cpu-smooth}/depth-{0,1,2}` | Bounded one-thread CPU/device overlap with actual CPU light evaluation and native color updates; no swaps. |
+| `lighting/submit/{polygon,multi_polygon}/{cpu-flat,cpu-smooth,xgl-flat,xgl-smooth}/point-1/depth-1` | Matched lit geometry/materials using individual calls or batches of 128 polygons. |
+| `cull/{all-front,mixed}/{off,back}` | Device backface rejection; mixed cases reverse every other independent triangle. |
+
+Smooth variants in these new combined workloads use vertex-sampled material
+RGB. Their flat variants use the existing facet samples. Compare matching
+CPU/XGL smooth cases or matching serialized/streaming cases to isolate the
+compute or scheduling choice. Flat versus smooth also changes sample count,
+material interpolation and payload; it is not a pure lighting-offload comparison.
+
+Vertex samples use unwrapped UV coordinates and the same CPU image/filter as
+facet samples. RGB materials are cached before timing; dynamic illumination
+is always applied to those immutable colors, never to the previous lit result.
+Independent corners keep distinct UVs at material boundaries. Sampling/filter
+detail is tied to the subdivision level here, not a perspective-aware pixel
+footprint. These fixtures measure costs and show approximations; they do not
+choose an adaptive LOD policy or eliminate the need to inspect texture seams,
+shadow edges and motion on actual Quake geometry.
+
+The culling probe verifies that front and back winding behave as intended
+before accepting a case. With mixed winding, backface culling intentionally
+changes the visible image. Rates still count **submitted** triangles, including
+those rejected; do not interpret the improvement as faster rasterization of
+the same number of visible triangles. The all-front pair measures overhead
+when there is nothing to reject. CPU culling and strip culling are not tested.
+
+For an initial run on a smaller machine, select one family at a time:
+
+```sh
+./xglbench -test texture/ -winsize 320 240 -quick
+./xglbench -test frame/lighting/ -winsize 320 240 -triangles 128 -csv frames.csv
+./xglbench -test quake-cpu-smooth -winsize 320 240 -queue 1
+./xglbench -test quake-cpu-smooth -winsize 320 240 -queue 2
+./xglbench -test cull/ -winsize 320 240
+```
+
+The queue is immutable application geometry storage awaiting device completion,
+not a thread count. Queue one is the serialized reference. No test uses the
+second host processor explicitly. Real SDK and on-device readback validation
+remain required before treating any timings as hardware evidence.
 
 ## Calibrated geometry and the whitepaper
 
@@ -257,11 +329,11 @@ sweep, not an asserted XGL hardware limit.
 
 The lighting scene has a shallow curved profile. Flat paths use geometric
 facet normals; smooth paths use unit normals from the underlying curved
-surface. Each triangle retains one CPU-sampled material RGB value, copied
-to all three corners before lighting. Corners are duplicated at material
-boundaries, so smooth shading does not average neighboring texture samples
-together. It can reduce subdivision needed for lighting gradients, but it
-cannot restore texture detail absent from the geometry. The projected
+surface. In the original lighting cases each triangle retains one CPU-sampled
+material RGB value, copied to all three corners before lighting. Those smooth
+cases interpolate lighting only. The new vertex-material variants described
+above also interpolate texture samples. Independent corners preserve material
+boundaries. Neither approach restores detail absent from its samples. The projected
 triangle areas still describe geometric coverage, not a count of shaded
 pixels. Baked shadow edges can also soften when vertex interpolation spans
 them; extra geometry is still needed to preserve a sharp boundary.
@@ -332,8 +404,11 @@ every frame just because XGL can calculate it. The reported input payload
 includes the vertex colors and normals used by each path; smoother or
 hardware-lit variants can require more input data.
 
-These cases remain serialized, single-threaded batched-polygon tests. They
-do not extend the bounded streaming cases to every lighting mode. The
+The original `lighting/*` cases remain serialized, single-threaded tests.
+The new `lighting/submit/*` pairs add individual polygons, and `frame/lighting/*`
+includes presentation. CPU Quake-like lighting also has bounded streaming
+cases; native XGL light-state updates are deliberately excluded from streaming.
+Lit or interpolated strips and restart lists remain untested. The
 device's reported lighting/shading support is a coarse capability indication,
 not proof that every selected light configuration runs entirely in Leo
 hardware. Unsupported or incorrect paths remain skipped results, and real
@@ -351,6 +426,12 @@ color and depth, then draws the mesh. There is no HUD copy or buffer swap in
 these cases, so presentation synchronization does not obscure the comparison.
 They are separate from the existing `frame/*` tests, which include both HUD
 and presentation.
+
+The `quake-cpu-flat` and `quake-cpu-smooth` pipeline variants use the same
+finite-radius light evaluation as the corresponding new frame cases, instead
+of the original relight fixture's simple brightness ramp. Each slot owns its
+facet or vertex RGB array. Native readback checks include both flat and smooth
+queued-color paths, and a pending slot cannot be recolored before completion.
 
 The serialized control completes each item before preparing another. The
 streaming version posts each item with `XGL_FLUSH_BUFFERS` and drains after
@@ -427,6 +508,14 @@ drain across all measured trials; it is a software bound, not a measured
 hardware queue depth. `drain_calls` is the total number of measured drains
 across those trials. Like `frames_all_trials`, both fields repeat the case's
 aggregate metadata on individual trial rows.
+
+`material_sample` records `facet` or `vertices`; `cull` and `winding` describe
+the culling fixture. Successful `frame/*` rows also have `frame_budget_ms`
+(66.667 ms) and `frame_budget_fraction` (`total_ms` divided by that budget).
+Those two fields are empty for skipped and non-frame cases. A fraction below
+one only means this synthetic render workload fits the reference budget;
+it does not establish 15 FPS in Quake. Portable/mock results have no hardware
+performance meaning even when their fractions are small.
 
 The `nominal_area_*` columns report geometric pixel area under the reference
 orthographic mapping, before model transforms or clipping. They do not

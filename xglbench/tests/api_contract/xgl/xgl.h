@@ -35,7 +35,10 @@ typedef struct { Xgl_color color; } Xgl_color_facet;
 typedef struct { Xgl_color color; Xgl_pt_f3d normal; } Xgl_color_normal_facet;
 typedef struct { float x, y, z; Xgl_color color; } Xgl_pt_color_f3d;
 typedef struct { float x, y, z; Xgl_color color; Xgl_pt_f3d normal; } Xgl_pt_color_normal_f3d;
-typedef union { Xgl_color_facet color_facet; } Xgl_facet;
+typedef union {
+    Xgl_color_facet color_facet;
+    Xgl_color_normal_facet color_normal_facet;
+} Xgl_facet;
 typedef struct {
     Xgl_facet_type facet_type;
     Xgl_usgn32 num_facets;
@@ -87,7 +90,7 @@ enum {
     XGL_CTX_ROP, XGL_CTX_SURF_EDGE_FLAG, XGL_CTX_SURF_FRONT_COLOR_SELECTOR,
     XGL_CTX_SURF_FRONT_FILL_STYLE, XGL_CTX_VDC_MAP, XGL_CTX_VDC_ORIENTATION,
     XGL_CTX_VDC_WINDOW, XGL_CTX_VIEW_CLIP_BOUNDS, XGL_CTX_VIEW_TRANS,
-    XGL_CULL_OFF, XGL_DATA_FLT, XGL_DEFER_ASTI, XGL_DEV_COLOR_TYPE,
+    XGL_CULL_OFF, XGL_CULL_BACK, XGL_DATA_FLT, XGL_DEFER_ASTI, XGL_DEV_COLOR_TYPE,
     XGL_DEV_MAXIMUM_COORDINATES, XGL_ERROR_NONRECOVERABLE, XGL_FACET_COLOR,
     XGL_FACET_FLAG_SHAPE_CONVEX, XGL_FACET_FLAG_SIDES_ARE_3,
     XGL_FLUSH_SYNCHRONIZE, XGL_FLUSH_BUFFERS,
@@ -109,7 +112,8 @@ enum {
     XGL_3D_CTX_SURF_LIGHTING_NORMAL_FLIP, XGL_3D_CTX_SURF_NORMAL_FLIP,
     XGL_ILLUM_NONE_INTERP_COLOR, XGL_ILLUM_PER_FACET, XGL_ILLUM_PER_VERTEX,
     XGL_SURF_COLOR_VERTEX_ILLUM_DEP, XGL_PT_COLOR_F3D,
-    XGL_PT_COLOR_NORMAL_F3D, XGL_FACET_COLOR_NORMAL,
+    XGL_PT_COLOR_NORMAL_F3D, XGL_FACET_COLOR_NORMAL, XGL_FACET_NONE,
+    XGL_3D_CTX_SURF_GEOM_NORMAL, XGL_GEOM_NORMAL_FIRST_POINTS,
     XGL_LIGHT_AMBIENT, XGL_LIGHT_DIRECTIONAL, XGL_LIGHT_POSITIONAL,
     XGL_LIGHT_TYPE, XGL_LIGHT_COLOR, XGL_LIGHT_DIRECTION, XGL_LIGHT_POSITION,
     XGL_LIGHT_ATTENUATION_1, XGL_LIGHT_ATTENUATION_2,

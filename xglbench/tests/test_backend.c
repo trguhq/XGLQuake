@@ -20,6 +20,7 @@ static int test_zbuffer;
 static xb_case test_case;
 static int test_lighting_bad;
 static unsigned long test_material_checksum;
+static unsigned long test_vertex_material_checksum;
 static unsigned long test_light_updates;
 static unsigned long test_fail_light_update;
 static xb_rgb *test_native_colors;
@@ -38,6 +39,7 @@ static int test_slot_count;
 static int test_outstanding;
 static int test_peak;
 static size_t test_stream_triangles;
+static size_t test_stream_color_count;
 static unsigned long test_submitted;
 static unsigned long test_completed;
 static unsigned long test_nonempty_drains;
@@ -171,7 +173,7 @@ static int test_lighting_mesh(const xb_mesh *mesh)
         mesh->point_count != mesh->triangles * 3 || !mesh->base_colors ||
         !mesh->colors || !mesh->facet_normals || !mesh->vertex_normals ||
         !mesh->centers || !mesh->vertex_colors || !mesh->facet_styles ||
-        !mesh->vertex_styles)
+        !mesh->vertex_styles || (test_case.vertex_material && !mesh->vertex_materials))
         return test_lighting_fail("mock lighting geometry is incomplete");
     for (i = 0; i < mesh->triangles; ++i) {
         if (!test_unit_normal(&mesh->facet_normals[i]) ||
@@ -187,7 +189,8 @@ static int test_lighting_mesh(const xb_mesh *mesh)
             !test_color_valid(&mesh->vertex_colors[i]))
             return test_lighting_fail("mock vertex normal/color is invalid");
         if (test_case.xgl_lighting &&
-            memcmp(&mesh->vertex_colors[i], &mesh->base_colors[i / 3], sizeof(xb_rgb)))
+            memcmp(&mesh->vertex_colors[i], test_case.vertex_material ?
+                   &mesh->vertex_materials[i] : &mesh->base_colors[i / 3], sizeof(xb_rgb)))
             return test_lighting_fail("hardware lighting received already-lit vertex RGB");
     }
     return 1;
@@ -197,6 +200,9 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
                          char *reason, size_t size)
 {
     const char *failed;
+    size_t i, positive, negative;
+    const xb_point *p;
+    double cross;
     test_case = *test;
     test_batch = test->batch > 0 ? test->batch : 128;
     test_zbuffer = test->zbuffer;
@@ -207,6 +213,22 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
     test_log("lighting-configure", (int)test->lighting, (int)test->shade);
     test_log("lighting-compute", test->xgl_lighting, test->lights);
     test_log("lighting-style", test->styles, test->moving);
+    test_log("culling-configure", test->cull, (int)test->method);
+    test_log("material-configure", test->vertex_material, (int)test->shade);
+    if (!strncmp(test->name, "cull/", 5)) {
+        positive = negative = 0;
+        for (i = 0; i < mesh->triangles; ++i) {
+            p = mesh->points + i * 3;
+            cross = (double)(p[1].x - p[0].x) * (p[2].y - p[0].y) -
+                    (double)(p[1].y - p[0].y) * (p[2].x - p[0].x);
+            if (cross > 0) ++positive;
+            if (cross < 0) ++negative;
+        }
+        test_log("culling-winding", (int)positive, (int)negative);
+        if (positive + negative != mesh->triangles ||
+            (test->mixed_winding ? positive != negative : positive != 0))
+            return test_lighting_fail("culling fixture has incorrect triangle winding");
+    }
     if (size) reason[0] = '\0';
     failed = getenv("XB_TEST_FAIL_LIGHTING");
     if (test->lighting != XB_LIGHT_OFF && failed && *failed) {
@@ -218,7 +240,8 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
         return 0;
     }
     if (test->lighting != XB_LIGHT_OFF) {
-        if (test->method != XB_MULTI || !test_lighting_mesh(mesh)) {
+        if ((test->method != XB_MULTI && test->method != XB_POLYGON) ||
+            !test_lighting_mesh(mesh)) {
             if (size) {
                 strncpy(reason, test_error, size - 1);
                 reason[size - 1] = '\0';
@@ -226,7 +249,20 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
             return 0;
         }
         test_material_checksum = test_checksum(mesh->base_colors, mesh->triangles);
+        test_vertex_material_checksum = test->vertex_material ?
+            test_checksum(mesh->vertex_materials, mesh->point_count) : 0;
         xb_lighting_state(test, 0, &test_lights);
+    }
+    if (test->vertex_material) {
+        if (test->shade != XB_SMOOTH || !mesh || !mesh->vertex_colors ||
+            !mesh->vertex_materials || mesh->point_count != mesh->triangles * 3)
+            return test_lighting_fail("invalid mock vertex-material geometry");
+        for (i = 0; i < mesh->point_count; ++i)
+            if (!test_color_valid(&mesh->vertex_colors[i]))
+                return test_lighting_fail("invalid mock vertex-material color");
+        if (test->lighting == XB_LIGHT_OFF &&
+            memcmp(mesh->vertex_colors, mesh->vertex_materials, mesh->point_count * sizeof(xb_rgb)))
+            return test_lighting_fail("unlit texture case changed sampled vertex material");
     }
     return xb_backend_upload(mesh);
 }
@@ -239,7 +275,7 @@ int xb_backend_upload(const xb_mesh *mesh)
     test_native_color_count = 0;
     test_triangles = mesh->triangles;
     test_strips = mesh->strip_count;
-    if (test_case.lighting != XB_LIGHT_OFF) {
+    if (test_case.lighting != XB_LIGHT_OFF || test_case.vertex_material) {
         test_native_color_count = test_case.shade == XB_SMOOTH ?
                                   mesh->point_count : mesh->triangles;
         test_native_colors = (xb_rgb *)malloc(test_native_color_count * sizeof(xb_rgb));
@@ -248,6 +284,7 @@ int xb_backend_upload(const xb_mesh *mesh)
         colors = test_case.shade == XB_SMOOTH ? mesh->vertex_colors : mesh->colors;
         memcpy(test_native_colors, colors, test_native_color_count * sizeof(xb_rgb));
         test_native_color_checksum = test_checksum(test_native_colors, test_native_color_count);
+        test_log("native-color-layout", (int)test_case.shade, (int)test_native_color_count);
     }
     return 1;
 }
@@ -262,7 +299,9 @@ void xb_backend_colors(const xb_mesh *mesh)
         test_lighting_fail("XGL lighting unexpectedly uploaded CPU-lit colors");
         return;
     }
-    if (test_checksum(mesh->base_colors, mesh->triangles) != test_material_checksum) {
+    if (test_checksum(mesh->base_colors, mesh->triangles) != test_material_checksum ||
+        (test_case.vertex_material && test_checksum(mesh->vertex_materials,
+          mesh->point_count) != test_vertex_material_checksum)) {
         test_lighting_fail("lighting update mutated cached material RGB");
         return;
     }
@@ -298,12 +337,14 @@ void xb_backend_transform(unsigned long frame) { (void)frame; }
 void xb_backend_clear(int color, int depth)
 {
     if (test_slot_count) test_log("queue-clear", color, depth);
+    if (test_case.work == XB_FRAME) test_log("frame-clear", color, depth);
 }
 
 size_t xb_backend_draw(enum xb_method method, int batch)
 {
     double until;
     ++test_draws;
+    if (test_case.work == XB_FRAME) test_log("frame-draw", (int)method, batch);
     if (test_fault && !test_fault_fired) {
         /* Force the .001-second regression trial to end at its minimum
          * frame count. This is test scheduling, not simulated GPU work. */
@@ -328,11 +369,12 @@ void xb_backend_sync(void)
 void xb_backend_swap(void)
 {
     if (test_slot_count) test_stream_fail("streaming test unexpectedly swapped");
+    if (test_case.work == XB_FRAME) test_log("frame-swap", 0, 0);
 }
 void xb_backend_raster(int masked)
 {
-    (void)masked;
     if (test_slot_count) test_stream_fail("streaming test unexpectedly drew a HUD");
+    if (test_case.work == XB_FRAME) test_log("frame-hud", masked, 0);
 }
 int xb_backend_events(void)
 {
@@ -363,7 +405,7 @@ size_t xb_backend_input_bytes(enum xb_method method, int batch)
     /* A test-double payload estimate only, never native transfer bandwidth. */
     points = method == XB_STRIP ? test_triangles + test_strips * 2 : test_triangles * 3;
     facets = method == XB_TLIST ? test_triangles * 3 : test_triangles;
-    if (test_case.lighting != XB_LIGHT_OFF) {
+    if (test_case.lighting != XB_LIGHT_OFF || test_case.vertex_material) {
         if (test_case.shade == XB_SMOOTH)
             return points * (sizeof(xb_point) + sizeof(xb_rgb) +
                    (test_case.xgl_lighting ? sizeof(xb_point) : 0));
@@ -396,38 +438,64 @@ static unsigned long test_checksum(const xb_rgb *colors, size_t count)
 int xb_backend_stream_begin(const xb_mesh *mesh, int slots, char *reason, size_t size)
 {
     int i;
+    const xb_rgb *colors;
     if (size) reason[0] = '\0';
     if (!mesh || !mesh->triangles || !mesh->colors || slots < 1 || slots > XB_MAX_QUEUE)
         return test_stream_fail("invalid mock stream setup");
     if (test_slot_count || test_outstanding)
         return test_stream_fail("previous mock stream was not released");
+    if (test_case.xgl_lighting || test_case.method != XB_MULTI)
+        return test_stream_fail("unsupported mock streaming lighting or primitive");
+    if (test_case.lighting != XB_LIGHT_OFF && !test_lighting_mesh(mesh)) return 0;
     test_stream_triangles = mesh->triangles;
+    test_stream_color_count = test_case.shade == XB_SMOOTH ? mesh->point_count : mesh->triangles;
+    colors = test_case.shade == XB_SMOOTH ? mesh->vertex_colors : mesh->colors;
+    if (!colors) return test_stream_fail("missing mock stream color payload");
     test_outstanding = test_peak = 0;
     test_submitted = test_completed = test_nonempty_drains = 0;
     for (i = 0; i < slots; ++i) {
-        test_slots[i].colors = (xb_rgb *)malloc(mesh->triangles * sizeof(xb_rgb));
+        test_slots[i].colors = (xb_rgb *)malloc(test_stream_color_count * sizeof(xb_rgb));
         if (!test_slots[i].colors) {
             test_slot_count = i;
             xb_backend_stream_end();
             return test_stream_fail("mock stream allocation failed");
         }
-        memcpy(test_slots[i].colors, mesh->colors, mesh->triangles * sizeof(xb_rgb));
+        memcpy(test_slots[i].colors, colors, test_stream_color_count * sizeof(xb_rgb));
         test_slots[i].pending = 0;
     }
     test_slot_count = slots;
     test_log("queue-begin", slots, (int)mesh->triangles);
+    test_log("queue-color-layout", (int)test_case.shade, (int)test_stream_color_count);
     return 1;
 }
 
 int xb_backend_stream_prepare(int slot, const xb_mesh *mesh)
 {
+    const xb_rgb *colors;
+    size_t count;
+    unsigned long checksum;
     if (slot < 0 || slot >= test_slot_count || !mesh ||
         mesh->triangles != test_stream_triangles || !mesh->colors)
         return test_stream_fail("invalid mock stream slot");
     if (test_slots[slot].pending)
         return test_stream_fail("in-flight stream slot overwritten before drain");
+    if (test_case.lighting != XB_LIGHT_OFF) {
+        if (!test_lighting_mesh(mesh)) return 0;
+        if (test_checksum(mesh->base_colors, mesh->triangles) != test_material_checksum ||
+            (test_case.vertex_material && test_checksum(mesh->vertex_materials,
+              mesh->point_count) != test_vertex_material_checksum))
+            return test_lighting_fail("stream update mutated cached material RGB");
+    }
+    count = test_case.shade == XB_SMOOTH ? mesh->point_count : mesh->triangles;
+    colors = test_case.shade == XB_SMOOTH ? mesh->vertex_colors : mesh->colors;
+    if (count != test_stream_color_count || !colors)
+        return test_stream_fail("stream update changed native color layout");
+    checksum = test_checksum(colors, count);
+    if (test_case.lighting != XB_LIGHT_OFF)
+        test_log("lighting-colors", (int)test_case.shade,
+                 checksum != test_checksum(test_slots[slot].colors, count));
     /* The source may be reused immediately. No allocation occurs here. */
-    memcpy(test_slots[slot].colors, mesh->colors, mesh->triangles * sizeof(xb_rgb));
+    memcpy(test_slots[slot].colors, colors, count * sizeof(xb_rgb));
     test_log("queue-prepare", slot, test_outstanding);
     return 1;
 }
@@ -440,7 +508,7 @@ size_t xb_backend_stream_draw(int slot)
     }
     xb_backend_clear(1, test_zbuffer);
     test_slots[slot].pending = 1;
-    test_slots[slot].checksum = test_checksum(test_slots[slot].colors, test_stream_triangles);
+    test_slots[slot].checksum = test_checksum(test_slots[slot].colors, test_stream_color_count);
     ++test_outstanding;
     ++test_submitted;
     if (test_outstanding > test_peak) test_peak = test_outstanding;
@@ -475,7 +543,7 @@ int xb_backend_stream_drain(void)
     }
     for (i = 0; i < test_slot_count; ++i) {
         if (!test_slots[i].pending) continue;
-        if (test_slots[i].checksum != test_checksum(test_slots[i].colors, test_stream_triangles))
+        if (test_slots[i].checksum != test_checksum(test_slots[i].colors, test_stream_color_count))
             return test_stream_fail("native colors changed while mock queue retained them");
         test_slots[i].pending = 0;
         ++test_completed;

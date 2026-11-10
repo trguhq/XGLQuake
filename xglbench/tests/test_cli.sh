@@ -96,6 +96,37 @@ for path in cpu-flat cpu-smooth; do
     done
 done
 
+for depth in 0 1 2; do
+    for material in facet-flat vertex-smooth; do
+        grep -x "texture/$material/depth-$depth" "$test_dir/output" >/dev/null ||
+            fail "missing sampled-material $material/depth-$depth case"
+    done
+    for path in cpu-flat cpu-smooth xgl-flat xgl-smooth; do
+        grep -x "frame/lighting/$path/point-1/depth-$depth" "$test_dir/output" >/dev/null ||
+            fail "missing complete lit frame $path/depth-$depth case"
+    done
+    for path in cpu-flat cpu-smooth; do
+        grep -x "frame/lighting/$path/quake-point-1/depth-$depth" "$test_dir/output" >/dev/null ||
+            fail "missing complete Quake-like frame $path/depth-$depth case"
+        for mode in serialized streaming; do
+            grep -x "pipeline/$mode/quake-$path/depth-$depth" "$test_dir/output" >/dev/null ||
+                fail "missing Quake-like pipeline $mode/$path/depth-$depth case"
+        done
+    done
+done
+for method in polygon multi_polygon; do
+    for path in cpu-flat cpu-smooth xgl-flat xgl-smooth; do
+        grep -x "lighting/submit/$method/$path/point-1/depth-1" "$test_dir/output" >/dev/null ||
+            fail "missing lit submission $method/$path case"
+    done
+done
+for winding in all-front mixed; do
+    for culling in off back; do
+        grep -x "cull/$winding/$culling" "$test_dir/output" >/dev/null ||
+            fail "missing culling $winding/$culling case"
+    done
+done
+
 XB_TEST_LOG="$test_dir/default.log" "$bench" -quick -allow-fallback \
     -test submit/multi_polygon/batch-128 -triangles 8 -seconds .002 -warmup 0 \
     -repeats 1 -csv "$test_dir/default.csv" >"$test_dir/output" 2>&1
@@ -608,4 +639,178 @@ fi
 grep 'injected lighting readback validation failure' "$test_dir/output" >/dev/null || fail "lighting validation failure reason lost"
 check_lighting_rejected "$test_dir/light-validation-failure.csv"
 
-echo 'CLI tests: arguments, resize, calibrated cases, queues, lighting/shading reports, update paths and fault rejection passed'
+# Per-vertex materials must reach the backend as three sampled colors per
+# triangle, and must be labeled distinctly from facet-sampled controls.
+XB_TEST_LOG="$test_dir/texture.log" "$bench" -winsize 320 240 -allow-fallback \
+    -test texture/ -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
+    -csv "$test_dir/texture.csv" >"$test_dir/output" 2>&1
+awk -F, '
+    NR == 1 {
+        for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+        record=col["record"]; status=col["status"]; shade=col["shading"]
+        material=col["material_sample"]; payload=col["input_payload_bytes"]
+        depth=col["depth"]; model=col["lighting_model"]; budget=col["frame_budget_ms"]
+        next
+    }
+    $record == "summary" {
+        if ($status != "ok" || $model != "none" || $payload <= 0 || $budget != "") bad++
+        if ($shade == "smooth") {
+            if ($material != "vertices") bad++
+            smooth[$depth]=$payload
+        } else {
+            if ($shade != "flat" || $material != "facet") bad++
+            flat[$depth]=$payload
+        }
+        rows++
+    }
+    END {
+        for (d=0; d<=2; ++d) if (!(smooth[d] > flat[d] && flat[d] > 0)) bad++
+        if (!record || !status || !shade || !material || !payload || !depth ||
+            !model || !budget || rows != 6 || bad) exit 1
+    }
+' "$test_dir/texture.csv" || fail "texture modes lost sampled-material or payload semantics"
+for count in 24 96 384; do
+    grep "^native-color-layout 1 $count$" "$test_dir/texture.log" >/dev/null ||
+        fail "smooth texture did not supply all $count vertex colors"
+done
+
+# Lit frame trials include real light/color updates, masked HUD and swap.
+# Budget metadata is a fraction of the 15 Hz frame allowance, not engine FPS.
+XB_TEST_LOG="$test_dir/lit-frame.log" "$bench" -winsize 320 240 -allow-fallback \
+    -test frame/lighting/ -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
+    -csv "$test_dir/lit-frame.csv" >"$test_dir/output" 2>&1
+awk '
+    /^lighting-configure / { cases++ }
+    /^frame-clear / { if ($2 != 1 || $3 != 1) bad++; clears++ }
+    /^frame-draw / { draws++ }
+    /^frame-hud / { if ($2 != 1) bad++; hud++ }
+    /^frame-swap / { swaps++ }
+    /^lighting-colors / { colors++; changes+=$3 }
+    /^lighting-update / { lights++ }
+    /^lighting-error / { bad++ }
+    END {
+        if (cases != 18 || !colors || !changes || !lights || hud < cases*4 ||
+            clears != draws || swaps != draws || draws != hud+cases || bad) exit 1
+    }
+' "$test_dir/lit-frame.log" || fail "complete lit frames omitted geometry, lighting, HUD or presentation"
+awk -F, '
+    NR == 1 {
+        for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+        record=col["record"]; status=col["status"]; shade=col["shading"]
+        material=col["material_sample"]; budget=col["frame_budget_ms"]
+        fraction=col["frame_budget_fraction"]; total=col["total_ms"]
+        present=col["present_ms"]; model=col["lighting_model"]
+        facets=col["triangles"]; rate=col["triangles_per_second"]
+        next
+    }
+    $record == "summary" {
+        expected_material=$shade == "smooth" ? "vertices" : "facet"
+        expected_rate=$facets*1000/$total
+        expected_fraction=$total*.015
+        if ($status != "ok" || $material != expected_material ||
+            ($model != "lambert" && $model != "quake-like") ||
+            $budget < 66.666 || $budget > 66.667 || $total <= 0 || $present < 0 ||
+            $fraction < expected_fraction*.999-1e-8 || $fraction > expected_fraction*1.001+1e-8 ||
+            $rate < expected_rate*.999 || $rate > expected_rate*1.001) bad++
+        rows++
+    }
+    END {
+        if (!record || !status || !shade || !material || !budget || !fraction ||
+            !total || !present || !model || !facets || !rate || rows != 18 || bad) exit 1
+    }
+' "$test_dir/lit-frame.csv" || fail "lit frame budget or completed-work metadata is invalid"
+
+# Independent polygons and polygon batches use matching lighting workloads;
+# their API call counts must reflect the actual submitted primitive method.
+"$bench" -winsize 320 240 -allow-fallback -test lighting/submit/ \
+    -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
+    -csv "$test_dir/lit-submit.csv" >"$test_dir/output" 2>&1
+awk -F, '
+    NR == 1 {
+        for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+        record=col["record"]; status=col["status"]; method=col["method"]
+        facets=col["triangles"]; calls=col["calls"]; batch=col["batch"]
+        next
+    }
+    $record == "summary" {
+        if ($status != "ok" || $facets != 32) bad++
+        if ($method == "polygon") { if ($calls != $facets) bad++; polygons++ }
+        else if ($method == "multi_polygon") {
+            if ($calls != int(($facets+$batch-1)/$batch)) bad++
+            batches++
+        } else bad++
+    }
+    END {
+        if (!record || !status || !method || !facets || !calls || !batch ||
+            polygons != 4 || batches != 4 || bad) exit 1
+    }
+' "$test_dir/lit-submit.csv" || fail "lit polygon/batch comparison lost submission semantics"
+
+# CPU Quake-like updates retain independently owned facet or vertex arrays in
+# each outstanding slot. Both serialized and streaming variants fully drain.
+for path in cpu-flat cpu-smooth; do
+    case "$path" in *smooth) smooth=1; count=96 ;; *) smooth=0; count=32 ;; esac
+    for mode in serialized streaming; do
+        case "$mode" in streaming) queue=8 ;; *) queue=1 ;; esac
+        log="$test_dir/quake-stream-$path-$mode.log"
+        csv="$test_dir/quake-stream-$path-$mode.csv"
+        XB_TEST_LOG="$log" "$bench" -winsize 320 240 -allow-fallback \
+            -test "pipeline/$mode/quake-$path/depth-1" -triangles 8 -queue 8 \
+            -seconds .003 -warmup 0 -repeats 1 -csv "$csv" >"$test_dir/output" 2>&1
+        check_queue_log "$log" "$queue"
+        check_pipeline_csv "$csv" "$queue"
+        check_lighting_log "$log" 0 "$smooth" 1
+        grep "^queue-color-layout $smooth $count$" "$log" >/dev/null ||
+            fail "Quake stream retained the wrong number of color samples"
+        awk -F, -v smooth="$smooth" '
+            NR == 1 {
+                for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+                model=col["lighting_model"]; material=col["material_sample"]
+                budget=col["frame_budget_ms"]; next
+            }
+            {
+                if ($model != "quake-like" || $budget != "" ||
+                    $material != (smooth ? "vertices" : "facet")) bad++
+                rows++
+            }
+            END { if (!model || !material || !budget || rows != 2 || bad) exit 1 }
+        ' "$csv" || fail "Quake stream mislabeled lighting, material or no-swap timing"
+    done
+done
+
+# A final completion fault must also invalidate the new smooth stream path.
+fault_case native-error pipeline/streaming/quake-cpu-smooth/depth-0 17
+
+# Inspect the input winding as well as the requested culling state; merely
+# changing a case label cannot turn a front-facing mesh into a mixed fixture.
+XB_TEST_LOG="$test_dir/culling.log" "$bench" -winsize 320 240 -allow-fallback \
+    -test cull/ -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
+    -csv "$test_dir/culling.csv" >"$test_dir/output" 2>&1
+awk '
+    /^culling-configure / { if ($2 == 0) off++; else if ($2 == 1) back++; else bad++ }
+    /^culling-winding / {
+        if ($2 == 4 && $3 == 4) mixed++
+        else if ($2 == 0 && $3 == 8) front++
+        else bad++
+    }
+    END { if (off != 2 || back != 2 || mixed != 2 || front != 2 || bad) exit 1 }
+' "$test_dir/culling.log" || fail "culling comparison did not change winding and rejection state"
+awk -F, '
+    NR == 1 {
+        for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+        status=col["status"]; record=col["record"]; cull=col["cull"]; winding=col["winding"]
+        next
+    }
+    $record == "summary" {
+        if ($status != "ok" || ($cull != "off" && $cull != "back") ||
+            ($winding != "front" && $winding != "mixed")) bad++
+        pairs[$cull "/" $winding]++
+    }
+    END {
+        if (!status || !record || !cull || !winding || bad ||
+            pairs["off/front"] != 1 || pairs["back/front"] != 1 ||
+            pairs["off/mixed"] != 1 || pairs["back/mixed"] != 1) exit 1
+    }
+' "$test_dir/culling.csv" || fail "culling CSV lost rejection/winding metadata"
+
+echo 'CLI tests: arguments, resize, geometry, queues, sampled materials, lighting, full frames, culling and fault rejection passed'

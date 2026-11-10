@@ -321,10 +321,63 @@ static void invalid_inputs(void)
     xb_mesh_free(&mesh);
 }
 
+static void vertex_texture_lighting(void)
+{
+    xb_mesh mesh;
+    xb_case test;
+    xb_light_state state;
+    xb_rgb *materials, *snapshot, expected;
+    size_t i, bytes, before, extra;
+    int model, native;
+    memset(&mesh, 0, sizeof(mesh));
+    for (model = XB_LIGHT_BAKED; model <= XB_LIGHT_QUAKE; ++model) {
+        for (native = 0; native <= (model == XB_LIGHT_LAMBERT); ++native) {
+            assert(xb_mesh_build(&mesh, 6, 2, 0.85f, 0));
+            test_case(&test, (enum xb_light_model)model, XB_SMOOTH);
+            test.vertex_material = 1; test.xgl_lighting = native;
+            assert(!xb_lighting_init(&mesh, &test));
+            assert(xb_mesh_vertex_materials(&mesh, 2));
+            bytes = mesh.point_count * sizeof(xb_rgb);
+            materials = (xb_rgb *)malloc(bytes);
+            snapshot = (xb_rgb *)malloc(bytes);
+            assert(materials && snapshot);
+            memcpy(materials, mesh.vertex_materials, bytes);
+            before = mesh.bytes;
+            extra = (mesh.triangles * 2 + mesh.point_count) * sizeof(xb_point) +
+                    (mesh.triangles + mesh.point_count) * XB_STYLE_LAYERS * sizeof(float);
+            assert(xb_lighting_init(&mesh, &test));
+            assert(mesh.bytes == before + extra);
+            if (native) assert(!memcmp(mesh.vertex_colors, materials, bytes));
+            if (!native && model == XB_LIGHT_LAMBERT) {
+                xb_lighting_state(&test, 0, &state);
+                for (i = 0; i < mesh.point_count; ++i) {
+                    expected = xb_lighting_evaluate(&state, &mesh.points[i],
+                                                    &mesh.vertex_normals[i], &materials[i]);
+                    close_color(mesh.vertex_colors[i], expected);
+                }
+            }
+            if (model == XB_LIGHT_BAKED)
+                for (i = 0; i < mesh.point_count; ++i) {
+                    expected.r = materials[i].r * mesh.vertex_styles[i * XB_STYLE_LAYERS];
+                    expected.g = materials[i].g * mesh.vertex_styles[i * XB_STYLE_LAYERS];
+                    expected.b = materials[i].b * mesh.vertex_styles[i * XB_STYLE_LAYERS];
+                    close_color(mesh.vertex_colors[i], expected);
+                }
+            assert(xb_lighting_update(&mesh, &test, 17, &state) >= 0);
+            memcpy(snapshot, mesh.vertex_colors, bytes);
+            assert(xb_lighting_update(&mesh, &test, 51, &state) >= 0);
+            assert(xb_lighting_update(&mesh, &test, 17, &state) >= 0);
+            assert(!memcmp(snapshot, mesh.vertex_colors, bytes));
+            assert(!memcmp(materials, mesh.vertex_materials, bytes));
+            free(materials); free(snapshot); xb_mesh_free(&mesh);
+        }
+    }
+}
+
 int main(void)
 {
     equations(); geometry_and_materials(); smoothing_and_native_materials();
-    lightstyles(); quake_falloff(); invalid_inputs();
+    lightstyles(); quake_falloff(); invalid_inputs(); vertex_texture_lighting();
     puts("lighting tests: reference equations, smooth normals/colors, material boundaries, style caches, finite falloff and cleanup passed");
     return 0;
 }
