@@ -4,6 +4,12 @@
 set -eu
 
 bench=${1:-./build/xglbench-test}
+
+# Remove the optional minimum pause; mandatory protective rest still applies.
+run_bench()
+{
+    "$bench" -pause 0 "$@"
+}
 test_dir=build/cli-test-$$
 mkdir -p "$test_dir"
 trap 'rm -rf "$test_dir"' 0
@@ -18,7 +24,7 @@ fail()
 
 expect_fail()
 {
-    if "$bench" "$@" >"$test_dir/output" 2>&1; then
+    if run_bench "$@" >"$test_dir/output" 2>&1; then
         fail "unexpected success: $*"
     fi
 }
@@ -47,9 +53,9 @@ expect_fail -queue 2garbage
 expect_fail -queue nan
 expect_fail -test __no_such_case__
 
-XB_TEST_LOG="$test_dir/help.log" "$bench" -help >"$test_dir/output" 2>&1
+XB_TEST_LOG="$test_dir/help.log" run_bench -help >"$test_dir/output" 2>&1
 test ! -e "$test_dir/help.log" || fail "help opened a display"
-XB_TEST_LOG="$test_dir/list.log" "$bench" -list >"$test_dir/output" 2>&1
+XB_TEST_LOG="$test_dir/list.log" run_bench -extralong -list >"$test_dir/output" 2>&1
 test ! -e "$test_dir/list.log" || fail "list opened a display"
 grep 'submit/multi_polygon/batch-128' "$test_dir/output" >/dev/null || fail "missing stable case"
 for area in 4 16 64 100 256 1024; do
@@ -138,7 +144,7 @@ for path in facet-flat vertex-smooth point bilinear trilinear; do
         fail "missing moving perspective texture-map $path case"
 done
 
-XB_TEST_LOG="$test_dir/default.log" "$bench" -quick -allow-fallback \
+XB_TEST_LOG="$test_dir/default.log" run_bench -long -allow-fallback \
     -test submit/multi_polygon/batch-128 -triangles 8 -seconds .002 -warmup 0 \
     -repeats 1 -csv "$test_dir/default.csv" >"$test_dir/output" 2>&1
 grep '^open 320 240$' "$test_dir/default.log" >/dev/null || fail "default initial size"
@@ -163,7 +169,7 @@ awk -F, '
     END { if (!w || !h || !small || !large) exit 1 }
 ' "$test_dir/default.csv" || fail "CSV did not distinguish both resolutions"
 
-XB_TEST_LOG="$test_dir/forced.log" "$bench" -winsize 800 600 -quick \
+XB_TEST_LOG="$test_dir/forced.log" run_bench -winsize 800 600 -quick \
     -allow-fallback -test submit/multi_polygon/batch-128 -triangles 8 \
     -seconds .002 -warmup 0 -repeats 1 -csv "$test_dir/forced.csv" \
     >"$test_dir/output" 2>&1
@@ -182,7 +188,7 @@ awk -F, '
     END { if (!w || !h || !rows || bad) exit 1 }
 ' "$test_dir/forced.csv" || fail "forced size CSV contained other dimensions"
 
-if XB_TEST_FAIL_METHOD=multi_polygon "$bench" -winsize 320 240 \
+if XB_TEST_FAIL_METHOD=multi_polygon run_bench -winsize 320 240 \
     -quick -allow-fallback -test submit/multi_polygon/batch-128 \
     -csv "$test_dir/skipped.csv" >"$test_dir/output" 2>&1; then
     fail "all-invalid run reported success"
@@ -203,7 +209,7 @@ awk -F, '
 ' "$test_dir/skipped.csv" || fail "invalid method had a successful/timed CSV row"
 
 # Explicit timing settings override -quick even when -quick comes last.
-"$bench" -winsize 320 240 -test submit/multi_polygon/batch-128 \
+run_bench -winsize 320 240 -test submit/multi_polygon/batch-128 \
     -triangles 8 -allow-fallback -seconds .002 -warmup 0 -repeats 2 -quick \
     >"$test_dir/output" 2>&1
 grep '0.002 seconds/trial; 2 repeats; 0.000 seconds warm-up' \
@@ -225,7 +231,7 @@ fault_case()
     # The ordinary case uses preview + warm-up + three minimum timed frames.
     # Streaming uses preview + eight warm-up + eight timed work items.
     if XB_TEST_FAULT="$mode" XB_TEST_FAULT_DRAW="$fault_draw" \
-        XB_TEST_LOG="$test_dir/$mode.log" "$bench" "$@" \
+        XB_TEST_LOG="$test_dir/$mode.log" run_bench "$@" \
         -allow-fallback -test "$fault_test" -triangles 8 -queue 8 \
         -seconds .001 -warmup 0 -repeats 1 -csv "$test_dir/$mode.csv" \
         >"$test_dir/output" 2>&1; then
@@ -277,7 +283,7 @@ done
 
 # Fixed screen-space areas stay fixed across the default two resolutions,
 # including the horizontal and vertical skinny-triangle variants.
-"$bench" -allow-fallback -test 100px -triangles 8 -seconds .001 -warmup 0 \
+run_bench -long -allow-fallback -test 100px -triangles 8 -seconds .001 -warmup 0 \
     -repeats 1 -csv "$test_dir/areas.csv" >"$test_dir/output" 2>&1
 awk -F, '
     NR == 1 {
@@ -373,7 +379,7 @@ for queue in 1 2 8; do
     for colors in cached relight; do
         log="$test_dir/queue-$queue-$colors.log"
         csv="$test_dir/queue-$queue-$colors.csv"
-        XB_TEST_LOG="$log" "$bench" -winsize 320 240 -allow-fallback \
+        XB_TEST_LOG="$log" run_bench -winsize 320 240 -allow-fallback \
             -test "pipeline/streaming/$colors/depth-1" -triangles 8 \
             -queue "$queue" -seconds .001 -warmup 0 -repeats 1 -csv "$csv" \
             >"$test_dir/output" 2>&1
@@ -387,7 +393,7 @@ done
 
 # Serialized controls use one retained buffer even when the streaming limit is
 # higher. Both modes exercise the same primitive, clears and native storage.
-XB_TEST_LOG="$test_dir/serialized.log" "$bench" -winsize 320 240 -allow-fallback \
+XB_TEST_LOG="$test_dir/serialized.log" run_bench -winsize 320 240 -allow-fallback \
     -test pipeline/serialized/relight/depth-1 -triangles 8 -queue 8 \
     -seconds .001 -warmup 0 -repeats 1 -csv "$test_dir/serialized.csv" \
     >"$test_dir/output" 2>&1
@@ -395,7 +401,7 @@ check_queue_log "$test_dir/serialized.log" 1
 check_pipeline_csv "$test_dir/serialized.csv" 1
 
 # The default queue is two. The queue option does not change serialized tests.
-XB_TEST_LOG="$test_dir/default-queue.log" "$bench" -winsize 320 240 -allow-fallback \
+XB_TEST_LOG="$test_dir/default-queue.log" run_bench -winsize 320 240 -allow-fallback \
     -test pipeline/streaming/cached/depth-0 -triangles 8 \
     -seconds .001 -warmup 0 -repeats 1 >"$test_dir/output" 2>&1
 check_queue_log "$test_dir/default-queue.log" 2
@@ -403,7 +409,7 @@ check_queue_log "$test_dir/default-queue.log" 2
 # A deliberately slow final mock completion is included in completed wall time
 # and reported as drain time. It is not evidence about hardware performance.
 XB_TEST_LOG="$test_dir/delayed.log" XB_TEST_DRAIN_DELAY_MS=20 \
-    "$bench" -winsize 320 240 -allow-fallback \
+    run_bench -winsize 320 240 -allow-fallback \
     -test pipeline/streaming/relight/depth-0 -triangles 8 -queue 8 \
     -seconds .001 -warmup 0 -repeats 1 -csv "$test_dir/delayed.csv" \
     >"$test_dir/output" 2>&1
@@ -422,7 +428,7 @@ awk -F, '
 ' "$test_dir/delayed.csv" || fail "completed timing excluded the final drain"
 
 if XB_TEST_LOG="$test_dir/drain-failure.log" XB_TEST_FAIL_DRAIN=2 \
-    XB_TEST_DRAIN_DELAY_MS=20 "$bench" -winsize 320 240 -allow-fallback \
+    XB_TEST_DRAIN_DELAY_MS=20 run_bench -winsize 320 240 -allow-fallback \
     -test pipeline/streaming/relight/depth-0 -triangles 8 -queue 8 \
     -seconds .001 -warmup 0 -repeats 1 -csv "$test_dir/drain-failure.csv" \
     >"$test_dir/output" 2>&1; then
@@ -503,7 +509,7 @@ for path in cpu-flat cpu-smooth xgl-flat xgl-smooth; do
         case "$light" in point-2) lights=2 ;; point-4) lights=4 ;; *) lights=1 ;; esac
         log="$test_dir/lighting-$path-$light.log"
         csv="$test_dir/lighting-$path-$light.csv"
-        XB_TEST_LOG="$log" "$bench" -winsize 320 240 -allow-fallback \
+        XB_TEST_LOG="$log" run_bench -winsize 320 240 -allow-fallback \
             -test "lighting/matched/$path/$light/depth-1" -triangles 8 \
             -seconds .005 -warmup 0 -repeats 1 -csv "$csv" >"$test_dir/output" 2>&1
         check_lighting_log "$log" "$hardware" "$smooth" 1
@@ -511,7 +517,7 @@ for path in cpu-flat cpu-smooth xgl-flat xgl-smooth; do
     done
     log="$test_dir/static-$path.log"
     csv="$test_dir/static-$path.csv"
-    XB_TEST_LOG="$log" "$bench" -winsize 320 240 -allow-fallback \
+    XB_TEST_LOG="$log" run_bench -winsize 320 240 -allow-fallback \
         -test "lighting/static/$path/directional/depth-1" -triangles 8 \
         -seconds .001 -warmup 0 -repeats 1 -csv "$csv" >"$test_dir/output" 2>&1
     check_lighting_log "$log" "$hardware" "$smooth" 0
@@ -520,7 +526,7 @@ done
 
 # New lit geometry preserves the requested pixel area while its Z surface and
 # normals vary. Both resolutions must still report the same geometric area.
-"$bench" -allow-fallback -test lighting/area-100/ -triangles 8 \
+run_bench -long -allow-fallback -test lighting/area-100/ -triangles 8 \
     -seconds .001 -warmup 0 -repeats 1 -csv "$test_dir/lit-area.csv" \
     >"$test_dir/output" 2>&1
 awk -F, '
@@ -564,7 +570,7 @@ for path in cpu-flat cpu-smooth; do
         case "$styles" in cached) updates=0; layers=1 ;; styles-1) updates=1; layers=1 ;; *) updates=1; layers=4 ;; esac
         log="$test_dir/baked-$path-$styles.log"
         csv="$test_dir/baked-$path-$styles.csv"
-        XB_TEST_LOG="$log" "$bench" -winsize 320 240 -allow-fallback \
+        XB_TEST_LOG="$log" run_bench -winsize 320 240 -allow-fallback \
             -test "lighting/baked/$path/$styles/depth-1" -triangles 8 \
             -seconds .05 -warmup 0 -repeats 1 -csv "$csv" >"$test_dir/output" 2>&1
         check_lighting_log "$log" 0 "$smooth" "$updates"
@@ -572,7 +578,7 @@ for path in cpu-flat cpu-smooth; do
     done
     log="$test_dir/quake-$path.log"
     csv="$test_dir/quake-$path.csv"
-    XB_TEST_LOG="$log" "$bench" -winsize 320 240 -allow-fallback \
+    XB_TEST_LOG="$log" run_bench -winsize 320 240 -allow-fallback \
         -test "lighting/quake-like/$path/point-2/depth-1" -triangles 8 \
         -seconds .005 -warmup 0 -repeats 1 -csv "$csv" >"$test_dir/output" 2>&1
     check_lighting_log "$log" 0 "$smooth" 1
@@ -583,7 +589,7 @@ done
 # draw itself exceeds the requested duration. Reuse the mock's existing
 # pre-fault delay with an unreachable fault index; no error is injected.
 XB_TEST_LOG="$test_dir/style-minimum.log" XB_TEST_FAULT=native-error \
-    XB_TEST_FAULT_DRAW=1000000 "$bench" -winsize 320 240 -allow-fallback \
+    XB_TEST_FAULT_DRAW=1000000 run_bench -winsize 320 240 -allow-fallback \
     -test lighting/baked/cpu-flat/styles-1/depth-0 -triangles 8 \
     -seconds .001 -warmup 0 -repeats 2 -csv "$test_dir/style-minimum.csv" \
     >"$test_dir/output" 2>&1
@@ -609,7 +615,7 @@ awk '
 ' "$test_dir/style-minimum.log" || fail "short repeated style trials exercised only cached colors"
 
 XB_TEST_LOG="$test_dir/style-cached-control.log" XB_TEST_FAULT=native-error \
-    XB_TEST_FAULT_DRAW=1000000 "$bench" -winsize 320 240 -allow-fallback \
+    XB_TEST_FAULT_DRAW=1000000 run_bench -winsize 320 240 -allow-fallback \
     -test lighting/baked/cpu-flat/cached/depth-0 -triangles 8 \
     -seconds .001 -warmup 0 -repeats 2 >"$test_dir/output" 2>&1
 check_lighting_log "$test_dir/style-cached-control.log" 0 0 0
@@ -632,7 +638,7 @@ check_lighting_rejected()
     ' "$1" || fail "failed lighting operation produced a successful measurement"
 }
 
-if XB_TEST_FAIL_LIGHT_UPDATE=2 "$bench" -winsize 320 240 -allow-fallback \
+if XB_TEST_FAIL_LIGHT_UPDATE=2 run_bench -winsize 320 240 -allow-fallback \
     -test lighting/matched/xgl-flat/point-1/depth-1 -triangles 8 \
     -seconds .001 -warmup 0 -repeats 1 -csv "$test_dir/light-update-failure.csv" \
     >"$test_dir/output" 2>&1; then
@@ -641,7 +647,7 @@ fi
 grep 'injected light-state update failure' "$test_dir/output" >/dev/null || fail "light-state failure reason lost"
 check_lighting_rejected "$test_dir/light-update-failure.csv"
 
-if XB_TEST_FAIL_LIGHTING=1 "$bench" -winsize 320 240 -allow-fallback \
+if XB_TEST_FAIL_LIGHTING=1 run_bench -winsize 320 240 -allow-fallback \
     -test lighting/matched/xgl-smooth/point-1/depth-1 -triangles 8 \
     -seconds .001 -warmup 0 -repeats 1 -csv "$test_dir/light-validation-failure.csv" \
     >"$test_dir/output" 2>&1; then
@@ -652,7 +658,7 @@ check_lighting_rejected "$test_dir/light-validation-failure.csv"
 
 # Per-vertex materials must reach the backend as three sampled colors per
 # triangle, and must be labeled distinctly from facet-sampled controls.
-XB_TEST_LOG="$test_dir/texture.log" "$bench" -winsize 320 240 -allow-fallback \
+XB_TEST_LOG="$test_dir/texture.log" run_bench -winsize 320 240 -allow-fallback \
     -test texture/ -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
     -csv "$test_dir/texture.csv" >"$test_dir/output" 2>&1
 awk -F, '
@@ -687,7 +693,7 @@ done
 
 # Lit frame trials include real light/color updates, masked HUD and swap.
 # Budget metadata is a fraction of the 15 Hz frame allowance, not engine FPS.
-XB_TEST_LOG="$test_dir/lit-frame.log" "$bench" -winsize 320 240 -allow-fallback \
+XB_TEST_LOG="$test_dir/lit-frame.log" run_bench -winsize 320 240 -allow-fallback \
     -test frame/lighting/ -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
     -csv "$test_dir/lit-frame.csv" >"$test_dir/output" 2>&1
 awk '
@@ -733,7 +739,7 @@ awk -F, '
 
 # Independent polygons and polygon batches use matching lighting workloads;
 # their API call counts must reflect the actual submitted primitive method.
-"$bench" -winsize 320 240 -allow-fallback -test lighting/submit/ \
+run_bench -winsize 320 240 -allow-fallback -test lighting/submit/ \
     -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
     -csv "$test_dir/lit-submit.csv" >"$test_dir/output" 2>&1
 awk -F, '
@@ -765,7 +771,7 @@ for path in cpu-flat cpu-smooth; do
         case "$mode" in streaming) queue=8 ;; *) queue=1 ;; esac
         log="$test_dir/quake-stream-$path-$mode.log"
         csv="$test_dir/quake-stream-$path-$mode.csv"
-        XB_TEST_LOG="$log" "$bench" -winsize 320 240 -allow-fallback \
+        XB_TEST_LOG="$log" run_bench -winsize 320 240 -allow-fallback \
             -test "pipeline/$mode/quake-$path/depth-1" -triangles 8 -queue 8 \
             -seconds .003 -warmup 0 -repeats 1 -csv "$csv" >"$test_dir/output" 2>&1
         check_queue_log "$log" "$queue"
@@ -794,7 +800,7 @@ fault_case native-error pipeline/streaming/quake-cpu-smooth/depth-0 17
 
 # Inspect the input winding as well as the requested culling state; merely
 # changing a case label cannot turn a front-facing mesh into a mixed fixture.
-XB_TEST_LOG="$test_dir/culling.log" "$bench" -winsize 320 240 -allow-fallback \
+XB_TEST_LOG="$test_dir/culling.log" run_bench -winsize 320 240 -allow-fallback \
     -test cull/ -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
     -csv "$test_dir/culling.csv" >"$test_dir/output" 2>&1
 awk '
@@ -827,7 +833,7 @@ awk -F, '
 # Native texture cases use XYZUV corner payloads and build their texture once
 # before the first draw. CPU-sampled controls use the same image without native
 # mapping. The test double verifies scheduling, never actual texture pixels.
-XB_TEST_LOG="$test_dir/mapping.log" "$bench" -winsize 320 240 \
+XB_TEST_LOG="$test_dir/mapping.log" run_bench -winsize 320 240 \
     -test texture-map/ -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
     -csv "$test_dir/mapping.csv" >"$test_dir/output" 2>&1
 awk '
@@ -896,7 +902,7 @@ awk -F, '
 # Unsupported filtering remains a skipped mapping result, while other filters
 # and ordinary CPU controls still complete. Never relabel an untextured draw
 # as successful native texture mapping.
-XB_TEST_FAIL_TEXTURE=bilinear "$bench" -winsize 320 240 \
+XB_TEST_FAIL_TEXTURE=bilinear run_bench -winsize 320 240 \
     -test texture-map/ -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
     -csv "$test_dir/mapping-unavailable.csv" >"$test_dir/output" 2>&1
 awk -F, '
@@ -918,7 +924,7 @@ awk -F, '
     }
 ' "$test_dir/mapping-unavailable.csv" || fail "unavailable mapping produced timings or suppressed independent controls"
 
-if XB_TEST_FAIL_TEXTURE=all "$bench" -winsize 320 240 \
+if XB_TEST_FAIL_TEXTURE=all run_bench -winsize 320 240 \
     -test texture-map/point/draw/depth-0 -triangles 8 -seconds .001 -warmup 0 -repeats 1 \
     -csv "$test_dir/mapping-rejected.csv" >"$test_dir/output" 2>&1; then
     fail "all-unavailable texture mapping run reported success"

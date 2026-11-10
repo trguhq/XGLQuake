@@ -5,6 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef XB_PROFILE_TEST_CLOCK
+int xb_test_paused(void);
+void xb_test_advance(double seconds);
+static double test_draw_advance;
+static unsigned long test_draw_advance_at;
+#endif
+
 static int test_width;
 static int test_height;
 static size_t test_triangles;
@@ -120,6 +127,14 @@ int xb_backend_open(const xb_options *options, int width, int height)
     draw = getenv("XB_TEST_FAULT_DRAW");
     test_fault_draw = draw ? strtoul(draw, NULL, 10) : 5;
     test_log("open", width, height);
+#ifdef XB_PROFILE_TEST_CLOCK
+    delay = getenv("XB_TEST_OPEN_ADVANCE");
+    if (delay) xb_test_advance(atof(delay));
+    delay = getenv("XB_TEST_DRAW_ADVANCE");
+    test_draw_advance = delay ? atof(delay) : 0;
+    draw = getenv("XB_TEST_DRAW_ADVANCE_AT");
+    test_draw_advance_at = draw ? strtoul(draw, NULL, 10) : 0;
+#endif
     return 1;
 }
 
@@ -442,6 +457,12 @@ size_t xb_backend_draw(enum xb_method method, int batch)
         }
     }
     if (test_case.work == XB_FRAME) test_log("frame-draw", (int)method, batch);
+#ifdef XB_PROFILE_TEST_CLOCK
+    if (test_draw_advance_at && test_draws == test_draw_advance_at) {
+        test_log("draw-advance", (int)test_draws, (int)test_draw_advance);
+        xb_test_advance(test_draw_advance);
+    }
+#endif
     if (test_fault && !test_fault_fired) {
         /* Force the .001-second regression trial to end at its minimum
          * frame count. This is test scheduling, not simulated GPU work. */
@@ -480,7 +501,17 @@ void xb_backend_raster(int masked)
 }
 int xb_backend_events(void)
 {
-    if (test_stream_bad || test_lighting_bad || test_texture_bad) return 0;
+#ifdef XB_PROFILE_TEST_CLOCK
+    if (getenv("XB_TEST_CANCEL_ON_PAUSE") && xb_test_paused()) {
+        test_log("pause-cancel", test_width, test_height);
+        test_error = "";
+        return 0;
+    }
+#endif
+    if (test_stream_bad || test_lighting_bad) return 0;
+    /* Unsupported mapping is a recoverable case failure, including while the
+     * runner polls during protective rest before reconfiguring the next case. */
+    if (test_texture_bad) return -1;
     if (!test_fault_pending) return 1;
     test_fault_pending = 0;
     if (!strcmp(test_fault, "native-error")) {

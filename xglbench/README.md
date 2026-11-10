@@ -67,43 +67,131 @@ requires builds and readback checks against those installed SDKs/runtimes.
 
 ## Run
 
+Version 0.6 defaults to a roughly one-minute **quick** profile at **320x240**:
+
 ```sh
 ./xglbench | tee zx-results.txt
+./xglbench -medium -csv zx-medium.csv | tee zx-medium.txt
+./xglbench -long -csv zx-long.csv | tee zx-long.txt
+./xglbench -extralong -csv zx-full.csv | tee zx-full.txt
 ```
 
-With no size override, the program opens **320x240**, runs the selected suite,
-resizes the same window to **640x480**, and repeats the suite. Resize and
-warm-up work are outside the measured intervals. Results are kept separate
-for each resolution, then compared.
+The profiles prioritize comparisons, use short measurement intervals, and rest
+the graphics device after setup and between cases. Quick, medium and long aim
+for roughly one, three and seven minutes including rest. Every profile has a
+finite elapsed-time limit and a further ten-second grace period for stopping
+and cleanup. Extra-long selects the complete case registry with a 45-minute
+limit.
 
-An explicit `-winsize` runs only that resolution:
+| Profile | Cases per resolution | Resolutions | Seconds/trial | Repeats | Warm-up/case | Minimum idle pause | Elapsed-time limit |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `-quick` (default) | 26 | 320x240 | 0.2 | 1 | 0.02 s | 1.5 s | 60 s |
+| `-medium` | 52 | 320x240 | 0.25 | 2 | 0.03 s | 2.5 s | 180 s |
+| `-long` | 52 | 320x240, 640x480 | 0.4 | 2 | 0.05 s | 3.0 s | 420 s |
+| `-extralong` | 217 | 320x240, 640x480 | 0.5 | 3 | 0.1 s | 2.0 s | 2700 s (45 min) |
+
+Quick prioritizes five material/texturing draw-only modes at depth
+zero, then four primitive submission methods, five material/texturing
+complete-frame modes at depth zero, six lit-frame variants at depth zero,
+four sampled-color cases at depths one/two, and two cached-frame cases at
+depths one/two. Medium adds four culling cases,
+four single-thread cached/relight pipeline cases at depth one, six baked/style
+lighting cases at depth one, five perspective texturing comparisons, five
+depth-one texturing frame comparisons, and color/depth clears. Long runs the
+same 52 cases at both resolutions with longer trials. Extra-long selects the
+complete registry. The later sections describe all available
+families; a short profile need not include every case described there.
+
+The elapsed-time limits include opening XGL, setup, validation, measurements
+and idle pauses. At the limit, the program stops starting new work and discards
+any incomplete current case. During an orderly stop, that case is marked
+skipped with a reason, and the terminal summary reports how many selected
+cases were not run. Unattempted cases have no CSV rows. Keep that terminal
+summary with the CSV to preserve the coverage information.
+
+A POSIX `SIGALRM` timer runs in the same process, without another application
+thread or SMP work. If a blocked draw or cleanup still prevents termination
+after the additional ten-second grace period, its signal handler calls
+`_exit(124)`. This forced exit bypasses normal XGL cleanup and buffered output
+flushing. Completed cases are flushed as they are reported, but the last CSV
+record or terminal summary can be incomplete after a forced exit. This timer
+depends on OS signal delivery; it cannot recover a kernel/driver hang that
+prevents delivery or guarantee that graphics hardware stops immediately.
+
+After setup and between cases, the scheduled idle period is the greater of
+the configured minimum pause and **twice the preceding active elapsed time**.
+Case activity includes configuration, preview, warm-up and measured trials.
+These pauses follow device completion and stay outside all reported rendering
+and CPU intervals. Events are still polled during pauses, so Escape or closing
+the window can stop the run. `-pause 0` removes only the fixed minimum; the
+two-to-one idle-to-active rule remains in effect.
+
+Setup, readback validation and minimum work counts vary with the machine, so
+profiles may finish early or reach their limits before attempting every
+selected case. Extra-long's default workload and rest periods take roughly
+35 minutes before setup and validation; its 45-minute limit can leave cases
+unattempted on slower systems. These measures reduce continuous benchmark
+activity, but do not measure temperature or guarantee protection for aging
+graphics hardware.
+
+The Leo paper describes 11 custom ASICs plus memory in a compact two-board
+assembly measuring 5.7 x 6.7 x 0.6 inches, fitting a standard 2S SBus slot
+(printed pages 101 and 107, section 9). Its documented 1280x1024, 76 Hz video
+path continues scanning out during application idle (pages 102, 105 and 107,
+section 7). A 320x240 benchmark window changes neither the board's display
+mode nor its power state. Pauses stop benchmark commands; two-to-one rest does
+not imply two-thirds less power or heat. Airflow around this compact assembly
+matters, but the paper supplies no fan layout, required airflow, temperature
+thresholds, or temperature-sensor/shutdown guarantees. Cooling decisions need
+the actual workstation's service information and condition; this benchmark
+cannot infer a safe thermal cutoff.
+
+An explicit `-winsize` runs only that resolution, without changing the profile
+timings. Multi-resolution profiles resize the same
+window between suites and keep each resolution's results separate. Resize and
+warm-up work are outside the measured rendering intervals.
 
 ```sh
 ./xglbench -winsize 800 600
-./xglbench -seconds 5 -repeats 5 -csv zx-results.csv | tee zx-results.txt
-./xglbench -quick
 ./xglbench -list
+./xglbench -extralong -list
 ./xglbench -test submit/multi_polygon/batch-128 -winsize 320 240
-./xglbench -test pipeline/ -queue 2 -csv pipeline.csv | tee pipeline.txt
-./xglbench -test lighting/ -quick -csv lighting.csv | tee lighting.txt
+./xglbench -extralong -test pipeline/ -queue 2 -csv pipeline.csv
+./xglbench -quick -test lighting/ -seconds .2 -warmup .02 -pause 0 -csv lighting.csv
 ```
+
+`-test TEXT` selects matching names from the **full 217-case registry**, even
+when they are outside the profile's usual subset. The chosen profile still
+supplies resolutions, timings, pauses and any elapsed-time limit.
+`-list` shows the selected profile or filter without opening XGL;
+use `-extralong -list` to see the entire registry.
+
+Explicit `-seconds`, `-warmup`, `-repeats` or `-pause` values override that
+setting. This is independent of
+argument order: `-seconds .2 -quick` and `-quick -seconds .2` have the same
+effect. Unspecified settings still come from the selected profile.
+Timing overrides retain the selected profile's elapsed-time limit,
+ten-second grace period and adaptive idle rule. There is no unlimited mode.
+Choose extra-long when a filtered comparison needs more time, up to its
+45-minute limit.
 
 Options:
 
 | Option | Meaning |
 | --- | --- |
-| `-winsize W H` | Run one requested drawable size instead of both defaults; width 128 through 4096, height 64 through 4096. |
-| `-seconds N` | Measured duration per trial; default 1 second. |
-| `-warmup N` | Unmeasured warm-up duration; default 0.15 second. |
-| `-repeats N` | Trials per case; default 3, range 1 through 31. |
+| `-quick`, `-medium`, `-long`, `-extralong` | Choose a profile; quick is the default. |
+| `-winsize W H` | Run one requested drawable size; width 128 through 4096, height 64 through 4096. |
+| `-seconds N` | Override the minimum measured duration per trial. |
+| `-warmup N` | Override unmeasured warm-up duration. |
+| `-repeats N` | Override trials per case, range 1 through 31. |
+| `-pause N` | Override the minimum idle pause in seconds; zero retains the adaptive two-to-one rest period. |
 | `-triangles N` | Positive even base triangle count, at most 16384; default 512. |
 | `-queue N` | Maximum outstanding work items in streaming cases, 1 through 8; default 2. Serialized controls use one slot. |
-| `-test TEXT` | Run cases whose names contain `TEXT`. |
+| `-test TEXT` | Select matching names from the full registry, retaining the profile's other settings. |
 | `-csv PATH` | Save machine-readable results as well as the terminal report. |
 | `-display DISPLAY` | Select an X display. Local DGA is the intended path. |
 | `-allow-fallback` | Permit a software/non-DGA configuration for diagnosis. |
-| `-quick` | Use short trials and one repeat for a smoke run. Explicit timing options override it. |
-| `-list` | List case names without opening a display. |
+| `-list` | List selected case names without opening a display. |
 | `-help` | Print usage without opening a display. |
 
 The graphics window shows test geometry; the launching terminal receives the
@@ -111,13 +199,10 @@ report. Progress goes to standard error. CSV output is optional and its name
 is supplied by the caller. Keep the window fully visible and unobscured, and
 avoid moving or resizing it during a trial. Run on the workstation's local
 OpenWindows display rather than through SSH X forwarding. Background work
-and window-system activity can materially affect a 60 MHz machine.
-The full suite has 217 cases per resolution. At the default duration and
-repeat count, its two resolutions require at least 21.7 minutes of measured
-work, plus setup, warm-up and validation. Use `-list`
-to inspect the current case list, `-quick` for a smoke run, or `-test` to
-investigate a particular family. There is no randomized test order, so rerun
-close comparisons and control changes in background load.
+and window-system activity can materially affect a 60 MHz machine. There is
+no randomized test order, so rerun close comparisons and control changes in
+background load. The quick profile's single trial is an initial comparison,
+not an assessment of run-to-run variation.
 
 ## Questions the suite addresses
 
@@ -437,11 +522,12 @@ This is an approximation of the work involved in sampling and updating
 Quake lighting, not a complete implementation of its surface cache.
 
 Before each animated-style trial, the colors and style cache are reset to
-phase zero outside timing. The measured trial runs at least 24 work items
+phase zero outside timing. A successful measured trial runs at least 24 work items
 and ends on a complete six-item tick. This ensures that even short trials
 exercise actual style changes, including the one-layer pattern's changes at
 items 12 and 18 (zero-based sequence). On slower hardware, this minimum work
-can extend a `-quick` trial beyond its requested minimum duration.
+can extend a trial beyond its requested minimum duration. If the profile's
+elapsed-time limit interrupts this work, the incomplete case is skipped.
 
 The separate Quake-like dynamic-light cases combine baked illumination with
 a finite-radius, surface-distance lighting contribution on the CPU. They
@@ -562,7 +648,11 @@ not to calculate actual bus utilization.
 
 CSV contains `trial` records and a `summary` record per successful case.
 Skipped cases contain a summary with status `skipped` and the reason; zero
-fields on those records are not measurements. The `frames_all_trials` field
+fields on those records are not measurements. Cases not attempted because a
+profile's time limit was reached have no CSV rows; their count appears in the
+terminal summary during an orderly stop. Forced termination after the
+ten-second grace period can leave the final output record incomplete.
+The `frames_all_trials` field
 is the total completed-item count for the case even on individual trial
 rows; for pipeline cases those items are not presented frames. The
 `timing_mode` field distinguishes the timing contracts.
@@ -654,6 +744,12 @@ Fault injection also checks that a native completion error, exposure, user
 interruption, or unexpected resize cannot turn a partial trial into a valid
 measurement. An unexpected size change stops the sequence so that subsequent
 results cannot be labeled with the old dimensions.
+
+A separate `build/xglbench-profile-test` uses a simulated clock to check all
+profile selections, mandatory idle scheduling, fixed limits despite option
+overrides, and rejection of interrupted results without waiting through full
+runs. Watchdog tests exercise real alarm delivery, the ten-second grace timer,
+and forced process exit even when standard error is a full, unread pipe.
 
 On a modern development host, `make syntax-check` checks C syntax and selected
 API usage against the hand-written declarations in `tests/api_contract/`.

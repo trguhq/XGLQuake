@@ -1,5 +1,8 @@
 /* Timer/statistics checks; GPL-2.0-or-later, see COPYING. */
 #include "xglbench.h"
+#include <errno.h>
+#include <float.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -38,7 +41,21 @@ int main(void)
     check(sum > 0, "timed work executed");
     check(after >= before, "elapsed clock moved backward");
     check(cpu_after >= cpu_before, "process CPU clock moved backward");
+    check(xb_sleep(0.0), "zero-length sleep");
+    errno = 0;
+    check(!xb_sleep(-0.01) && errno == EINVAL, "negative sleep rejected");
+    errno = 0;
+    check(!xb_sleep(DBL_MAX) && errno == EINVAL, "oversized sleep rejected");
+    errno = 0;
+    check(!xb_sleep((double)INT_MAX) && errno == EINVAL, "sleep conversion bound rejected");
+    before = xb_now();
+    check(xb_sleep(0.02), "short sleep completed");
+    after = xb_now();
+    /* Allow clock granularity at the lower bound. Scheduler delays are
+     * unbounded, so there is intentionally no elapsed upper-bound assertion.
+     */
+    check(after - before >= 0.01, "short sleep actually paused");
     if (failed) return 1;
-    puts("timer tests: median, input bounds, sample preservation and clock ordering passed");
+    puts("timer tests: median, input bounds, sample preservation, clock ordering and idle sleep passed");
     return 0;
 }

@@ -3,6 +3,8 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "xglbench.h"
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -32,6 +34,32 @@ double xb_cpu_now(void)
     if (getrusage(RUSAGE_SELF, &r) != 0) return 0.0;
     return (double)r.ru_utime.tv_sec + (double)r.ru_stime.tv_sec +
            ((double)r.ru_utime.tv_usec + (double)r.ru_stime.tv_usec) * 1.0e-6;
+}
+
+int xb_sleep(double seconds)
+{
+    struct timeval delay;
+    double micros;
+    /* These comparisons also reject NaN and infinities without relying on
+     * C99 floating-point helpers. Keep conversion safe on 32-bit Solaris.
+     */
+    if (!(seconds >= 0.0 && seconds < (double)INT_MAX)) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (seconds == 0.0) return 1;
+    delay.tv_sec = (long)seconds;
+    micros = (seconds - (double)delay.tv_sec) * 1000000.0;
+    delay.tv_usec = (long)micros;
+    if ((double)delay.tv_usec < micros) ++delay.tv_usec;
+    if (delay.tv_usec >= 1000000) {
+        ++delay.tv_sec;
+        delay.tv_usec = 0;
+    }
+    /* EINTR deliberately returns to the caller, which owns event polling
+     * and any retry. No busy wait, clock adjustment or unbounded retry.
+     */
+    return select(0, NULL, NULL, NULL, &delay) == 0;
 }
 
 static int xb_double_compare(const void *a, const void *b)

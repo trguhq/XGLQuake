@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define XB_VERSION "0.5"
+#define XB_VERSION "0.6"
 #define XB_MAX_QUEUE 8
 #define XB_MAX_LIGHTS 4
 #define XB_STYLE_LAYERS 4
@@ -45,6 +45,7 @@ enum xb_shade { XB_FLAT, XB_SMOOTH };
 enum xb_light_model { XB_LIGHT_OFF, XB_LIGHT_BAKED, XB_LIGHT_LAMBERT, XB_LIGHT_QUAKE };
 enum xb_texture_filter { XB_TEXTURE_OFF, XB_TEXTURE_POINT,
                          XB_TEXTURE_BILINEAR, XB_TEXTURE_TRILINEAR };
+enum xb_profile { XB_QUICK, XB_MEDIUM, XB_LONG, XB_EXTRALONG };
 
 typedef struct {
     int count, directional;
@@ -75,8 +76,9 @@ typedef struct {
 
 typedef struct {
     int width, height, force_size;
-    int repeats, base_triangles, quick, allow_fallback, list_only, queue;
-    double seconds, warmup;
+    int repeats, base_triangles, allow_fallback, list_only, queue, custom_timing;
+    enum xb_profile profile;
+    double seconds, warmup, pause;
     const char *csv_path, *filter, *display;
 } xb_options;
 
@@ -139,6 +141,16 @@ xb_rgb xb_lighting_evaluate(const xb_light_state *state, const xb_point *positio
 double xb_now(void);
 double xb_cpu_now(void);
 double xb_median(const double *values, int count);
+/* Non-busy wall-time delay. Returns 1 on completion, 0 on invalid input or
+ * error (including EINTR); callers can poll events before retrying. */
+int xb_sleep(double seconds);
+/* Independent SIGALRM watchdog: expiration requests cancellation, then a
+ * ten-second grace timer forces _exit(124) without entering XGL from a signal. */
+int xb_watchdog_start(unsigned int seconds);
+void xb_watchdog_stop(void);
+int xb_watchdog_expired(void);
+/* Cheap cancellation query for native submission boundaries; no clock read. */
+int xb_cancel_requested(void);
 
 /* Backend owns all native arrays; these functions never retain mesh pointers. */
 int xb_backend_open(const xb_options *options, int width, int height);

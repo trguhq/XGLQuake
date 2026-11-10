@@ -21,9 +21,9 @@ else
 XGL_RPATH ?=
 endif
 
-COMMON = xglbench.c xglbench_scene.c xglbench_lighting.c xglbench_timer.c
+COMMON = xglbench.c xglbench_scene.c xglbench_lighting.c xglbench_timer.c xglbench_watchdog.c
 NATIVE_OBJS = build/xglbench.o build/xglbench_scene.o \
-              build/xglbench_lighting.o build/xglbench_timer.o build/xglbench_xgl.o
+              build/xglbench_lighting.o build/xglbench_timer.o build/xglbench_watchdog.o build/xglbench_xgl.o
 
 .PHONY: all native sdk-check check syntax-check clean
 all: native
@@ -62,17 +62,30 @@ build/test_lighting: tests/test_lighting.c xglbench_lighting.c xglbench_scene.c 
 	$(CC) $(CPPFLAGS) $(API_CPPFLAGS) -I. $(CFLAGS) $(LANGFLAGS) $(WARNFLAGS) \
 	    -o $@ tests/test_lighting.c xglbench_lighting.c xglbench_scene.c -lm
 
+build/test_watchdog: tests/test_watchdog.c xglbench_watchdog.c xglbench.h
+	@mkdir -p build
+	$(CC) $(CPPFLAGS) $(API_CPPFLAGS) -I. $(CFLAGS) $(LANGFLAGS) $(WARNFLAGS) \
+	    -o $@ tests/test_watchdog.c xglbench_watchdog.c
+
 # This executable tests scheduling and reports, not graphics performance.
 build/xglbench-test: $(COMMON) tests/test_backend.c xglbench.h
 	@mkdir -p build
 	$(CC) $(CPPFLAGS) $(API_CPPFLAGS) -I. $(CFLAGS) $(LANGFLAGS) $(WARNFLAGS) \
 	    -o $@ $(COMMON) tests/test_backend.c -lm
 
-check: build/test_scene build/test_timer build/test_lighting build/xglbench-test
+# A simulated clock exercises minute-scale profiles without long test waits.
+build/xglbench-profile-test: $(COMMON) tests/test_backend.c tests/test_profile_clock.c xglbench.h
+	@mkdir -p build
+	$(CC) $(CPPFLAGS) $(API_CPPFLAGS) -DXB_PROFILE_TEST_CLOCK -I. $(CFLAGS) $(LANGFLAGS) $(WARNFLAGS) \
+	    -o $@ $(filter-out xglbench_timer.c,$(COMMON)) tests/test_backend.c tests/test_profile_clock.c -lm
+
+check: build/test_scene build/test_timer build/test_lighting build/test_watchdog build/xglbench-test build/xglbench-profile-test
 	./build/test_scene
 	./build/test_timer
 	./build/test_lighting
+	./build/test_watchdog
 	sh tests/test_cli.sh ./build/xglbench-test
+	sh tests/test_profiles.sh ./build/xglbench-profile-test
 
 # Modern development host only. The contract headers are NOT the Sun SDK.
 syntax-check:

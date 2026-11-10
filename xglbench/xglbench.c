@@ -13,28 +13,63 @@
 #error Result capacity must cover both default resolutions
 #endif
 static int xb_quit;
+static int xb_budget_reached;
+static double xb_deadline;
+
+static const char *profile_name(enum xb_profile profile)
+{
+    static const char *names[] = {"quick", "medium", "long", "extralong"};
+    return names[profile];
+}
+
+static double profile_budget(const xb_options *o)
+{
+    static const double budgets[] = {60, 180, 420, 2700};
+    return budgets[o->profile];
+}
+
+int xb_cancel_requested(void)
+{
+    return xb_budget_reached || xb_watchdog_expired();
+}
+
+/* Stop new work at completed phase boundaries. The independent watchdog
+ * forces process exit after the grace period if an XGL call never returns. */
+static int budget_expired(void)
+{
+    if (xb_watchdog_expired() || (xb_deadline > 0 && xb_now() >= xb_deadline))
+        xb_budget_reached = 1;
+    return xb_budget_reached;
+}
 
 static void usage(FILE *f)
 {
     fprintf(f,
         "xglbench " XB_VERSION " - native Sun XGL geometry and lighting benchmark\n"
         "Usage: xglbench [options]\n"
-        "  -winsize W H       Run only this drawable size (default: 320x240, 640x480)\n"
-        "  -seconds S         Minimum elapsed time per trial (default 1)\n"
-        "  -warmup S          Warm-up per case, outside measurements (default .15)\n"
-        "  -repeats N         Repeated trials, 1..31 (default 3)\n");
+        "  -quick             Default: representative tests, about 1 minute, 320x240\n"
+        "  -medium            More comparisons at 320x240, about 3 minutes\n"
+        "  -long              Broader comparisons at both sizes, about 7 minutes\n"
+        "  -extralong         Full suite at both sizes; 45-minute maximum\n"
+        "  -winsize W H       Run only this drawable size\n"
+        "  -seconds S         Minimum elapsed time per trial (profile default)\n"
+        "  -warmup S          Warm-up per case, outside measurements\n"
+        "  -repeats N         Repeated trials, 1..31 (profile default)\n"
+        "  -pause S           Minimum idle seconds (always also >= 2x active time)\n");
     fprintf(f, "  -queue N           Streaming window, 1..8 work items (default 2)\n");
     fprintf(f,
         "  -triangles N       Base count, positive even number <=16384 (default 512)\n"
         "  -csv PATH          Write machine-readable per-trial and summary results\n"
-        "  -test TEXT         Run case names containing TEXT\n"
+        "  -test TEXT         Select matching names from the complete case registry\n"
         "  -display DISPLAY   X display (default DISPLAY environment variable)\n"
-        "  -allow-fallback    Permit non-DGA/software/single-buffer investigation\n"
-        "  -quick             Short smoke run (.05 seconds, .02 warm-up, 1 repeat)\n");
+        "  -allow-fallback    Permit non-DGA/software/single-buffer investigation\n");
     fprintf(f,
-        "                     Explicit timing/repeat options override -quick\n"
-        "  -list              List matching cases without opening XGL\n"
+        "  -list              List selected cases without opening XGL\n"
         "  -help              Show this help\n"
+        "Choose one profile. Explicit timing/repeat/pause options override its\n"
+        "defaults regardless of argument order; the profile time limit still applies.\n"
+        "Pauses are outside measurements. A watchdog forces exit after 10 seconds\n"
+        "of shutdown grace if a rendering call or cleanup does not return.\n"
         "Escape or closing the window stops the run. Keep the window unobscured.\n");
 }
 
@@ -64,22 +99,31 @@ static int parse_double(const char *s, double lo, double hi, double *result)
 
 static int options(int argc, char **argv, xb_options *o)
 {
-    int i;
+    int i, profile_seen;
+    enum xb_profile profile;
+    static const double seconds[] = {.2, .25, .4, .5};
+    static const double warmup[] = {.02, .03, .05, .1};
+    static const double pause[] = {1.5, 2.5, 3, 2};
+    static const int repeats[] = {1, 2, 2, 3};
     memset(o, 0, sizeof(*o));
     o->width = 320; o->height = 240;
-    o->seconds = 1.0; o->warmup = .15; o->repeats = 3;
+    o->seconds = o->warmup = o->pause = -1;
+    o->profile = XB_QUICK;
     o->base_triangles = 512;
     o->queue = 2;
-    for (i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "-quick")) {
-            o->quick = 1; o->seconds = .05; o->warmup = .02; o->repeats = 1;
-        }
-    }
+    profile_seen = 0;
     for (i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-help") || !strcmp(argv[i], "--help")) {
             usage(stdout); return 2;
-        } else if (!strcmp(argv[i], "-quick")) {
-            continue;
+        } else if (!strcmp(argv[i], "-quick") || !strcmp(argv[i], "-medium") ||
+                   !strcmp(argv[i], "-long") || !strcmp(argv[i], "-extralong")) {
+            profile = !strcmp(argv[i], "-quick") ? XB_QUICK :
+                      !strcmp(argv[i], "-medium") ? XB_MEDIUM :
+                      !strcmp(argv[i], "-long") ? XB_LONG : XB_EXTRALONG;
+            if (profile_seen && o->profile != profile) {
+                fprintf(stderr, "Choose only one run profile.\n"); return 0;
+            }
+            o->profile = profile; profile_seen = 1;
         } else if (!strcmp(argv[i], "-list")) {
             o->list_only = 1;
         } else if (!strcmp(argv[i], "-allow-fallback")) {
@@ -90,10 +134,16 @@ static int options(int argc, char **argv, xb_options *o)
             i += 2; o->force_size = 1;
         } else if (!strcmp(argv[i], "-seconds")) {
             if (++i >= argc || !parse_double(argv[i], .001, 3600, &o->seconds)) goto invalid;
+            o->custom_timing = 1;
         } else if (!strcmp(argv[i], "-warmup")) {
             if (++i >= argc || !parse_double(argv[i], 0, 3600, &o->warmup)) goto invalid;
+            o->custom_timing = 1;
         } else if (!strcmp(argv[i], "-repeats")) {
             if (++i >= argc || !parse_long(argv[i], 1, XB_MAX_REPEATS, &o->repeats)) goto invalid;
+            o->custom_timing = 1;
+        } else if (!strcmp(argv[i], "-pause")) {
+            if (++i >= argc || !parse_double(argv[i], 0, 3600, &o->pause)) goto invalid;
+            o->custom_timing = 1;
         } else if (!strcmp(argv[i], "-queue")) {
             if (++i >= argc || !parse_long(argv[i], 1, XB_MAX_QUEUE, &o->queue)) goto invalid;
         } else if (!strcmp(argv[i], "-triangles")) {
@@ -112,6 +162,10 @@ static int options(int argc, char **argv, xb_options *o)
             fprintf(stderr, "Unknown option: %s\n", argv[i]); return 0;
         }
     }
+    if (o->seconds < 0) o->seconds = seconds[o->profile];
+    if (o->warmup < 0) o->warmup = warmup[o->profile];
+    if (o->pause < 0) o->pause = pause[o->profile];
+    if (!o->repeats) o->repeats = repeats[o->profile];
     return 1;
 invalid:
     fprintf(stderr, "Invalid or missing argument near %s\n", argv[i < argc ? i : argc - 1]);
@@ -353,6 +407,80 @@ static int make_cases(xb_case *cases)
     return n;
 }
 
+/* Keep comparison groups together and put native texturing early: a slow
+ * machine can exhaust a short profile before reaching the registry's tail.
+ * Medium adds complete groups; long repeats that set at both sizes.
+ */
+static int select_cases(const xb_case *cases, int count, const xb_options *o, int *order)
+{
+    static const char *quick[] = {
+        "texture-map/facet-flat/draw/depth-0",
+        "texture-map/vertex-smooth/draw/depth-0",
+        "texture-map/point/draw/depth-0",
+        "texture-map/bilinear/draw/depth-0",
+        "texture-map/trilinear/draw/depth-0",
+        "submit/polygon/batch-1", "submit/multi_polygon/batch-128",
+        "submit/triangle_list/batch-128", "submit/strip/natural-length",
+        "texture-map/facet-flat/frame/depth-0",
+        "texture-map/vertex-smooth/frame/depth-0",
+        "texture-map/point/frame/depth-0",
+        "texture-map/bilinear/frame/depth-0",
+        "texture-map/trilinear/frame/depth-0",
+        "frame/lighting/cpu-flat/point-1/depth-0",
+        "frame/lighting/cpu-smooth/point-1/depth-0",
+        "frame/lighting/xgl-flat/point-1/depth-0",
+        "frame/lighting/xgl-smooth/point-1/depth-0",
+        "frame/lighting/cpu-flat/quake-point-1/depth-0",
+        "frame/lighting/cpu-smooth/quake-point-1/depth-0",
+        "texture/facet-flat/depth-1", "texture/vertex-smooth/depth-1",
+        "texture/facet-flat/depth-2", "texture/vertex-smooth/depth-2",
+        "frame/cached/depth-1", "frame/cached/depth-2"
+    };
+    static const char *long_extra[] = {
+        "cull/all-front/off", "cull/all-front/back", "cull/mixed/off", "cull/mixed/back",
+        "pipeline/serialized/cached/depth-1", "pipeline/streaming/cached/depth-1",
+        "pipeline/serialized/relight/depth-1", "pipeline/streaming/relight/depth-1",
+        "lighting/baked/cpu-flat/cached/depth-1",
+        "lighting/baked/cpu-smooth/cached/depth-1",
+        "lighting/baked/cpu-flat/styles-1/depth-1",
+        "lighting/baked/cpu-smooth/styles-1/depth-1",
+        "lighting/baked/cpu-flat/styles-4/depth-1",
+        "lighting/baked/cpu-smooth/styles-4/depth-1",
+        "texture-map/facet-flat/perspective-motion/depth-1",
+        "texture-map/vertex-smooth/perspective-motion/depth-1",
+        "texture-map/point/perspective-motion/depth-1",
+        "texture-map/bilinear/perspective-motion/depth-1",
+        "texture-map/trilinear/perspective-motion/depth-1",
+        "texture-map/facet-flat/frame/depth-1",
+        "texture-map/vertex-smooth/frame/depth-1",
+        "texture-map/point/frame/depth-1",
+        "texture-map/bilinear/frame/depth-1",
+        "texture-map/trilinear/frame/depth-1",
+        "overhead/color-clear", "overhead/depth-clear"
+    };
+    const char *name;
+    int i, j, n, quick_count, wanted;
+    n = 0;
+    if (o->filter || o->profile == XB_EXTRALONG) {
+        for (i = 0; i < count; ++i)
+            if (!o->filter || strstr(cases[i].name, o->filter)) order[n++] = i;
+        return n;
+    }
+    quick_count = (int)(sizeof(quick) / sizeof(quick[0]));
+    wanted = quick_count;
+    if (o->profile >= XB_MEDIUM) wanted += (int)(sizeof(long_extra) / sizeof(long_extra[0]));
+    for (i = 0; i < wanted; ++i) {
+        name = i < quick_count ? quick[i] : long_extra[i - quick_count];
+        for (j = 0; j < count && strcmp(cases[j].name, name); ++j) {}
+        if (j == count) {
+            fprintf(stderr, "Profile refers to missing case: %s\n", name);
+            return -1;
+        }
+        order[n++] = j;
+    }
+    return n;
+}
+
 static int build_mesh(xb_mesh *mesh, const xb_options *o, const xb_case *c,
                       int width, int height)
 {
@@ -416,6 +544,7 @@ static int one_frame(const xb_options *o, const xb_case *c, xb_mesh *mesh,
     int width, height, changes;
     xb_light_state state;
     memset(f, 0, sizeof(*f));
+    if (budget_expired()) return 0;
     start = xb_now();
     if (c->update == XB_REBUILD) {
         xb_backend_dimensions(&width, &height);
@@ -432,18 +561,22 @@ static int one_frame(const xb_options *o, const xb_case *c, xb_mesh *mesh,
         if ((changes & XB_UPDATE_LIGHTS) && !xb_backend_lighting(&state)) return 0;
     }
     prepared = xb_now();
+    if (budget_expired()) goto cancelled;
     if (c->work == XB_DRAW || c->work == XB_RASTER || c->work == XB_MASKED_RASTER) {
         /* Identical depth history for every frame. Exclude this reset from render_ms. */
         xb_backend_clear(1, c->zbuffer);
         xb_backend_sync();
     }
+    if (budget_expired()) goto cancelled;
     render_start = xb_now();
     switch (c->work) {
     case XB_DRAW:
         f->calls = xb_backend_draw(c->method, c->batch); break;
     case XB_FRAME:
         xb_backend_clear(1, c->zbuffer);
+        if (budget_expired()) goto cancelled;
         f->calls = xb_backend_draw(c->method, c->batch);
+        if (budget_expired()) goto cancelled;
         xb_backend_raster(1);
         break;
     case XB_COLOR_CLEAR: xb_backend_clear(1, 0); break;
@@ -455,16 +588,23 @@ static int one_frame(const xb_options *o, const xb_case *c, xb_mesh *mesh,
     }
     if (c->work != XB_SWAP) xb_backend_sync();
     rendered = xb_now();
+    if (budget_expired()) goto cancelled;
     if (c->work == XB_SWAP || c->work == XB_FRAME) {
         xb_backend_swap();
         xb_backend_sync();
     }
     end = xb_now();
+    if (budget_expired()) goto cancelled;
     f->prepare = prepared - start;
     f->render = c->work == XB_SWAP ? 0 : rendered - render_start;
     f->present = (c->work == XB_SWAP || c->work == XB_FRAME) ? end - rendered : 0;
     f->total = end - start;
     return 1;
+cancelled:
+    /* Drain only what was already submitted. The watchdog remains armed
+     * during this wait, native cleanup and output flushing. */
+    xb_backend_sync();
+    return 0;
 }
 
 static int events(xb_result *r)
@@ -490,7 +630,57 @@ static int events(xb_result *r)
         } else strcpy(r->reason, "window exposed/obscured during trial; measurement discarded");
         return 0;
     }
+    if (budget_expired()) {
+        strcpy(r->reason, "profile time budget reached");
+        return 0;
+    }
     return 1;
+}
+
+/* Sleep after completed work, never inside a measured trial. Expose events
+ * here do not invalidate an earlier sample. Resizing would invalidate the
+ * next case's labels, so it stops the run; recoverable case errors are reset
+ * by the next configure(), just as they are without pauses.
+ */
+static void idle_pause(double seconds, int width, int height)
+{
+    double until, left;
+    int result, actual_width, actual_height;
+    if (seconds <= 0 || xb_quit || budget_expired()) return;
+    xb_backend_sync();
+    fprintf(stderr, "Idle pause: %.2f seconds\n", seconds);
+    until = xb_now() + seconds;
+    while (!xb_quit && !budget_expired()) {
+        result = xb_backend_events();
+        if (!result) {
+            fprintf(stderr, "Run stopped during idle pause: %s\n",
+                *xb_backend_error() ? xb_backend_error() : "interrupted by user");
+            xb_quit = 1;
+            return;
+        }
+        xb_backend_dimensions(&actual_width, &actual_height);
+        if (actual_width != width || actual_height != height) {
+            fprintf(stderr, "Drawable changed size during idle pause; run stopped.\n");
+            xb_quit = 1;
+            return;
+        }
+        left = until - xb_now();
+        if (xb_deadline > 0 && left > xb_deadline - xb_now())
+            left = xb_deadline - xb_now();
+        if (left <= 0) break;
+        if (left > .1) left = .1;
+        if (!xb_sleep(left) && errno != EINTR) {
+            perror("idle pause"); xb_quit = 1; return;
+        }
+    }
+}
+
+static void rest_after_work(const xb_options *o, double active, int width, int height)
+{
+    double rest;
+    rest = active * 2;
+    if (rest < o->pause) rest = o->pause;
+    idle_pause(rest, width, height);
 }
 
 typedef struct {
@@ -502,6 +692,10 @@ typedef struct {
 static void backend_reason(xb_result *r, const char *fallback)
 {
     const char *message;
+    if (budget_expired()) {
+        strcpy(r->reason, "profile time budget reached");
+        return;
+    }
     message = xb_backend_error();
     if (!*message) message = fallback;
     strncpy(r->reason, message, sizeof(r->reason) - 1);
@@ -537,10 +731,16 @@ static int pipeline_window(xb_result *r, xb_mesh *mesh,
             }
         }
         window->prepare += xb_now() - start;
+        if (budget_expired()) {
+            backend_reason(r, "profile time budget reached"); okay = 0; break;
+        }
         start = xb_now();
         calls = xb_backend_stream_draw(slot);
         if (!calls) {
             backend_reason(r, "stream submission failed"); okay = 0; break;
+        }
+        if (budget_expired()) {
+            backend_reason(r, "profile time budget reached"); okay = 0; break;
         }
         xb_backend_post();
         window->enqueue += xb_now() - start;
@@ -631,7 +831,9 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
         strcpy(r->reason, c->area > 0 ? "calibrated triangle does not fit, or allocation/input limit failure" :
                                       "geometry allocation or input limit failure"); return;
     }
+    if (budget_expired()) { strcpy(r->reason, "profile time budget reached"); goto done; }
     if (!xb_backend_configure(c, &mesh, r->reason, sizeof(r->reason))) goto done;
+    if (budget_expired()) { strcpy(r->reason, "profile time budget reached"); goto done; }
     /* configure() owns the initial upload; updates upload inside one_frame(). */
     r->triangles = mesh.triangles;
     r->bytes = mesh.bytes;
@@ -1053,21 +1255,38 @@ int main(int argc, char **argv)
     xb_result *results, *r;
     FILE *csv;
     int parsed, count, selected, i, s, m, nresult, w, h, successes, sizes;
-    int valid[XB_METHODS];
+    int valid[XB_METHODS], order[XB_MAX_CASES], planned;
+    double run_start, active_start, active, nominal, budget;
     char validation[XB_METHODS][160];
     struct utsname host;
     parsed = options(argc, argv, &o);
     if (parsed == 2) return 0;
     if (!parsed) { usage(stderr); return 2; }
     count = make_cases(cases);
-    selected = 0;
-    for (i = 0; i < count; ++i) {
-        if (o.filter && !strstr(cases[i].name, o.filter)) continue;
-        ++selected;
-        if (o.list_only) puts(cases[i].name);
-    }
+    selected = select_cases(cases, count, &o, order);
+    if (selected < 0) return 1;
+    if (o.list_only)
+        for (i = 0; i < selected; ++i) puts(cases[order[i]].name);
     if (!selected) { fprintf(stderr, "No test names match the filter.\n"); return 2; }
     if (o.list_only) return 0;
+    sizes = o.force_size || o.profile <= XB_MEDIUM ? 1 : 2;
+    planned = selected * sizes;
+    active = o.warmup + o.seconds * o.repeats;
+    nominal = active * 2;
+    if (nominal < o.pause) nominal = o.pause;
+    nominal = planned * active + (planned - 1) * nominal;
+    budget = profile_budget(&o);
+    printf("Profile: %s; %d selected cases x %d resolution(s) = %d planned\n",
+        profile_name(o.profile), selected, sizes, planned);
+    printf("Nominal active + minimum idle: %.1f seconds before setup, validation and slow-frame overhead.\n",
+        nominal);
+    if (budget > 0)
+        printf("Time limit: %.0f seconds including setup and idle; incomplete tests are discarded.\n", budget);
+    if (o.custom_timing) printf("Custom trial/idle settings; profile time limit is unchanged.\n");
+    printf("Idle after setup and between cases: at least %.2f seconds or twice preceding active time.\n"
+           "Idle time is outside measurements; no temperature monitoring or thermal guarantee.\n"
+           "Watchdog: force process exit after 10 seconds of shutdown grace.\n", o.pause);
+    fflush(stdout);
     csv = NULL;
     if (o.csv_path) {
         csv = fopen(o.csv_path, "w");
@@ -1083,9 +1302,16 @@ int main(int argc, char **argv)
     }
     results = (xb_result *)calloc(XB_MAX_RESULTS, sizeof(*results));
     if (!results) { if (csv) fclose(csv); fprintf(stderr, "Out of memory.\n"); return 1; }
+    run_start = xb_now();
+    if (budget > 0) xb_deadline = run_start + budget;
+    if (!xb_watchdog_start((unsigned int)budget)) {
+        perror("cannot start run watchdog");
+        free(results); if (csv) fclose(csv); return 1;
+    }
     if (!xb_backend_open(&o, o.width, o.height)) {
         fprintf(stderr, "XGL setup failed: %s\n", xb_backend_error());
-        xb_backend_close(); free(results); if (csv) fclose(csv); return 1;
+        xb_backend_close(); free(results); if (csv) fclose(csv);
+        xb_watchdog_stop(); return 1;
     }
     printf("xglbench " XB_VERSION " - native XGL geometry and lighting investigation\n");
     if (uname(&host) == 0)
@@ -1138,8 +1364,8 @@ int main(int argc, char **argv)
     if (!xb_backend_has_hardware())
         printf("FALLBACK/TEST RUN: results do not establish the accelerated ZX performance path.\n");
     nresult = 0; successes = 0;
-    sizes = o.force_size ? 1 : 2;
-    for (s = 0; s < sizes && !xb_quit; ++s) {
+    for (s = 0; s < sizes && !xb_quit && !budget_expired(); ++s) {
+        active_start = s ? xb_now() : run_start;
         w = o.force_size ? o.width : (s ? 640 : 320);
         h = o.force_size ? o.height : (s ? 480 : 240);
         if (s && !xb_backend_resize(w, h)) {
@@ -1147,33 +1373,42 @@ int main(int argc, char **argv)
         }
         xb_backend_dimensions(&w, &h);
         printf("\nDrawable: %dx%d\n", w, h);
-        for (m = 0; m < XB_METHODS; ++m) {
+        for (m = 0; m < XB_METHODS && !budget_expired(); ++m) {
             validation[m][0] = '\0';
             valid[m] = xb_backend_validate((enum xb_method)m, validation[m], sizeof(validation[m]));
             printf("Validation %-8s: %s %s\n", xb_method_name((enum xb_method)m),
                 valid[m] ? "PASS" : "FAIL", validation[m]);
         }
+        rest_after_work(&o, xb_now() - active_start, w, h);
         printf("%-38s %9s %9s %9s %9s %10s %6s\n", "Test", "total_ms", "prep_ms",
             "render_ms", "swap_ms", "facets/sec", "calls");
-        for (i = 0; i < count && !xb_quit; ++i) {
-            if (o.filter && !strstr(cases[i].name, o.filter)) continue;
-            r = &results[nresult++]; r->test = cases[i]; r->width = w; r->height = h;
-            fprintf(stderr, "[%dx%d] %s\n", w, h, cases[i].name);
+        for (i = 0; i < selected && !xb_quit && !budget_expired(); ++i) {
+            r = &results[nresult++]; r->test = cases[order[i]]; r->width = w; r->height = h;
+            fprintf(stderr, "[%dx%d] %s\n", w, h, r->test.name);
+            active_start = xb_now();
             measure(&o, r, valid, validation);
+            active = xb_now() - active_start;
             print_result(csv, r);
             if (r->passed) ++successes;
             fflush(stdout);
             if (csv && fflush(csv) != 0) {
                 perror("writing CSV"); xb_quit = 1;
             }
+            if (nresult < planned) rest_after_work(&o, active, w, h);
         }
         findings(results, nresult, w, h);
     }
-    if (!o.force_size && !xb_quit) compare_sizes(results, nresult);
+    if (sizes > 1 && !xb_quit) compare_sizes(results, nresult);
+    if (xb_budget_reached)
+        printf("\nProfile time budget reached; %d selected cases not run.\n", planned - nresult);
     printf("\nCompleted %d cases; %d skipped/failed. %s\n", successes, nresult - successes,
-        xb_quit ? "Run interrupted or output/resize failed." : "Run finished.");
+        xb_quit ? "Run interrupted or output/resize failed." :
+        xb_budget_reached ? "Stopped at profile time limit." : "Run finished.");
+    printf("Elapsed run time: %.1f seconds (including setup and idle).\n", xb_now() - run_start);
     xb_backend_close();
     free(results);
-    if (csv && fclose(csv) != 0) { perror("closing CSV"); return 1; }
+    if (csv && fclose(csv) != 0) { perror("closing CSV"); xb_watchdog_stop(); return 1; }
+    if (fflush(stdout) != 0) { perror("writing report"); xb_watchdog_stop(); return 1; }
+    xb_watchdog_stop();
     return xb_quit || !successes ? 1 : 0;
 }

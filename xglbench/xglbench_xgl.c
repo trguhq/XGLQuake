@@ -76,6 +76,9 @@ typedef struct {
 } xb_native;
 
 static xb_native b;
+/* The cancellation query reads latched flags only: no clock or XGL call in
+ * the per-primitive hot loops. Cancellation must not set b.errors/fatal,
+ * because synchronization and retained-buffer cleanup still have to run. */
 static int validate_raster(int masked);
 static int validate_stream(void);
 static int validate_lighting(void);
@@ -261,6 +264,7 @@ static int texture_build_image(int pattern)
     xb_rgb image[XB_TEXTURE_WIDTH * XB_TEXTURE_WIDTH], rgb;
     Xgl_usgn32 *pixels;
     int x, y;
+    if (xb_cancel_requested()) return 0;
     pixels = texture_raster_pixels(0);
     if (!pixels) { if (!b.errors) fail("cannot access texture memory raster"); return 0; }
     if (!pattern && !xb_texture_image(image, XB_TEXTURE_WIDTH * XB_TEXTURE_WIDTH)) {
@@ -282,10 +286,11 @@ static int texture_build_image(int pattern)
             pixels[(XB_TEXTURE_WIDTH - 1 - y) * XB_TEXTURE_WIDTH + x] = texture_word(&rgb);
         }
     }
+    if (xb_cancel_requested()) return 0;
     if (!b.texture_mipmap)
         b.texture_mipmap = xgl_object_create(b.system, XGL_MIPMAP_TEXTURE, NULL,
                              XGL_MIPMAP_TEXTURE_LEVELS, 7, 0);
-    if (!b.texture_mipmap || b.errors) return 0;
+    if (!b.texture_mipmap || b.errors || xb_cancel_requested()) return 0;
     xgl_mipmap_texture_build(b.texture_mipmap, b.texture_rasters[0],
                              XGL_TEXTURE_BOUNDARY_WRAP, XGL_TEXTURE_BOUNDARY_WRAP);
     return !b.errors;
@@ -334,18 +339,19 @@ static int texture_set_descriptor(void)
 static int texture_probe(float *points)
 {
     Xgl_pt_list list;
+    if (xb_cancel_requested()) return 0;
     memset(&list, 0, sizeof(list));
     list.pt_type = XGL_PT_DATA_F3D;
     list.num_pts = 3;
     list.num_data_values = 2;
     list.pts.data_f3d = (Xgl_pt_data_f3d *)points;
     xb_backend_clear(1, 1);
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     xgl_multi_simple_polygon(b.ctx,
         XGL_FACET_FLAG_SIDES_ARE_3 | XGL_FACET_FLAG_SHAPE_CONVEX,
         NULL, NULL, 1, &list);
     xb_backend_sync();
-    return !b.errors;
+    return !b.errors && !xb_cancel_requested();
 }
 
 static int texture_read(int x, int y, xb_rgb *rgb)
@@ -353,12 +359,12 @@ static int texture_read(int x, int y, xb_rgb *rgb)
     Xgl_pt_i2d point;
     Xgl_color color;
     point.x = x; point.y = y;
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     if (xgl_context_get_pixel(b.ctx, &point, &color)) {
         fail("texture validation pixel is obscured");
         return 0;
     }
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     rgb->r = color.rgb.r; rgb->g = color.rgb.g; rgb->b = color.rgb.b;
     return 1;
 }
@@ -404,7 +410,8 @@ static int validate_texture(void)
             px = (-.9 + 1.8 * bary[i][0] + 1) * .5 * (b.width - 1);
             py = (-.9 + 1.8 * bary[i][1] + 1) * .5 * (b.height - 1);
             if (!pixel_matches((int)px, (int)py, &expected)) {
-                if (!b.errors) fail("texture RGB, UV orientation or wrapping readback failed");
+                if (!b.errors && !xb_cancel_requested())
+                    fail("texture RGB, UV orientation or wrapping readback failed");
                 return 0;
             }
         }
@@ -428,7 +435,8 @@ static int validate_texture(void)
         expected.r = expected.b = 0; expected.g = 1;
         if (!pixel_matches((int)((px + 1) * .5 * (b.width - 1)),
                            (int)((py + 1) * .5 * (b.height - 1)), &expected)) {
-            if (!b.errors) fail("texture perspective-correction readback failed");
+            if (!b.errors && !xb_cancel_requested())
+                fail("texture perspective-correction readback failed");
             return 0;
         }
         view_matrix(0);
@@ -490,7 +498,8 @@ static int validate_texture(void)
     if (!texture_enable(0) || !texture_probe(points)) return 0;
     expected.r = expected.b = 1; expected.g = 0;
     if (!pixel_matches(b.width / 3, b.height / 3, &expected)) {
-        if (!b.errors) fail("texture-off recovery readback failed");
+        if (!b.errors && !xb_cancel_requested())
+            fail("texture-off recovery readback failed");
         return 0;
     }
     view_matrix(b.perspective);
@@ -531,7 +540,8 @@ static int wait_window(int width, int height)
     deadline = xb_now() + 5.0;
     fd = ConnectionNumber(b.display);
     do {
-        while (XPending(b.display)) {
+        if (xb_cancel_requested()) return 0;
+        while (!xb_cancel_requested() && XPending(b.display)) {
             XNextEvent(b.display, &event);
             if (event.type == VisibilityNotify)
                 b.obscured = event.xvisibility.state != VisibilityUnobscured;
@@ -548,6 +558,7 @@ static int wait_window(int width, int height)
                 return 0;
             }
         }
+        if (xb_cancel_requested()) return 0;
         XGetWindowAttributes(b.display, b.window, &attributes);
         if (attributes.map_state == IsViewable && !b.obscured &&
             attributes.width == width && attributes.height == height) {
@@ -586,7 +597,7 @@ static int choose_visual(int width, int height, int allow_fallback)
         return 0;
     }
     best = -1;
-    for (i = 0; i < count; ++i) {
+    for (i = 0; i < count && !xb_cancel_requested(); ++i) {
         if (visuals[i].depth < 24 && !allow_fallback) continue;
         colormap = XCreateColormap(b.display, RootWindow(b.display, b.screen),
                                    visuals[i].visual, AllocNone);
@@ -642,6 +653,7 @@ static int choose_visual(int width, int height, int allow_fallback)
         if (b.errors) break;
     }
     XFree(visuals);
+    if (xb_cancel_requested()) return 0;
     if (best < 0 || b.errors) {
         if (!b.errors) fail("no 24/32-bit TrueColor visual could be queried by XGL");
         return 0;
@@ -657,21 +669,27 @@ int xb_backend_open(const xb_options *options, int width, int height)
     XSizeHints hints;
     char *version;
     memset(&b, 0, sizeof(b));
+    if (xb_cancel_requested()) {
+        copy_text(b.error, sizeof(b.error), "profile time budget reached");
+        return 0;
+    }
     b.allow_fallback = options->allow_fallback;
     b.display = XOpenDisplay(options->display);
     if (!b.display) {
         fail("cannot open X display; run in the local OpenWindows desktop");
         return 0;
     }
+    if (xb_cancel_requested()) return 0;
     b.screen = DefaultScreen(b.display);
     b.system = xgl_open(NULL);
     if (!b.system) { fail("xgl_open failed"); return 0; }
+    if (xb_cancel_requested()) return 0;
     xgl_object_set(b.system, XGL_SYS_ST_ERROR_NOTIFICATION_FUNCTION, xgl_error,
                    XGL_SYS_ST_ERROR_DETECTION, TRUE, 0);
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     version = NULL;
     xgl_object_get(b.system, XGL_SYS_ST_VERSION, &version);
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     copy_text(b.version, sizeof(b.version), version);
     if (!choose_visual(width, height, options->allow_fallback)) return 0;
     b.hardware = b.inquiry.dga_flag &&
@@ -694,7 +712,7 @@ int xb_backend_open(const xb_options *options, int width, int height)
     XStoreName(b.display, b.window, "xglbench: initializing (Escape to stop)");
     XMapRaised(b.display, b.window);
     XSync(b.display, False);
-    if (!wait_window(width, height)) return 0;
+    if (!wait_window(width, height) || xb_cancel_requested()) return 0;
     memset(&xwindow, 0, sizeof(xwindow));
     xwindow.X_display = b.display;
     xwindow.X_screen = b.screen;
@@ -707,9 +725,9 @@ int xb_backend_open(const xb_options *options, int width, int height)
                 XGL_DEV_COLOR_TYPE, XGL_COLOR_RGB,
                 XGL_WIN_RAS_BACKING_STORE, FALSE,
                 XGL_WIN_RAS_BUFFERS_REQUESTED, 2, 0);
-    if (!b.raster || b.errors) return 0;
+    if (!b.raster || b.errors || xb_cancel_requested()) return 0;
     xgl_object_get(b.raster, XGL_WIN_RAS_BUFFERS_ALLOCATED, &b.buffers);
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     if (b.buffers < 2 && !options->allow_fallback) {
         fail("XGL allocated fewer than two window buffers");
         return 0;
@@ -717,7 +735,7 @@ int xb_backend_open(const xb_options *options, int width, int height)
     xgl_object_set(b.raster, XGL_WIN_RAS_BUF_DISPLAY, 0,
                    XGL_WIN_RAS_BUF_DRAW, b.buffers >= 2 ? 1 : 0,
                    XGL_RAS_SOURCE_BUFFER, XGL_BUFFER_SEL_DRAW, 0);
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     memset(&black, 0, sizeof(black));
     b.ctx = xgl_object_create(b.system, XGL_3D_CTX, NULL,
                 XGL_CTX_DEVICE, b.raster,
@@ -734,18 +752,18 @@ int xb_backend_open(const xb_options *options, int width, int height)
                 XGL_3D_CTX_Z_BUFFER_COMP_METHOD, XGL_Z_COMP_LESS_THAN_OR_EQUAL,
                 XGL_3D_CTX_Z_BUFFER_WRITE_MASK, (Xgl_usgn32)0xffffffffUL,
                 XGL_3D_CTX_HLHSR_MODE, XGL_HLHSR_Z_BUFFER, 0);
-    if (!b.ctx || b.errors) return 0;
+    if (!b.ctx || b.errors || xb_cancel_requested()) return 0;
     b.current_z = 1;
     xgl_object_get(b.ctx, XGL_CTX_LOCAL_MODEL_TRANS, &b.model);
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     xgl_object_get(b.ctx, XGL_CTX_VIEW_TRANS, &b.view);
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     xgl_object_set(b.model, XGL_TRANS_DATA_TYPE, XGL_DATA_FLT,
                    XGL_TRANS_DIMENSION, XGL_TRANS_3D, 0);
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     xgl_object_set(b.view, XGL_TRANS_DATA_TYPE, XGL_DATA_FLT,
                    XGL_TRANS_DIMENSION, XGL_TRANS_3D, 0);
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     identity(b.model);
     view_matrix(0);
     setup_view();
@@ -757,7 +775,7 @@ int xb_backend_open(const xb_options *options, int width, int height)
         xb_backend_sync();
     }
     (void)xb_backend_events();
-    return !b.errors;
+    return !b.errors && !xb_cancel_requested();
 }
 
 static void free_geometry(void)
@@ -799,11 +817,12 @@ void xb_backend_close(void)
 
 int xb_backend_resize(int width, int height)
 {
-    if (b.errors || b.quit) return 0;
+    if (b.errors || b.quit || xb_cancel_requested()) return 0;
     xb_backend_sync();
+    if (xb_cancel_requested()) return 0;
     XResizeWindow(b.display, b.window, (unsigned int)width, (unsigned int)height);
     XSync(b.display, False);
-    if (!wait_window(width, height)) return 0;
+    if (!wait_window(width, height) || xb_cancel_requested()) return 0;
     xgl_window_raster_resize(b.raster);
     b.raster_checked = b.mask_checked = 0;
     setup_view();
@@ -815,7 +834,7 @@ int xb_backend_resize(int width, int height)
         xb_backend_sync();
     }
     (void)xb_backend_events();
-    return !b.errors && !b.quit;
+    return !b.errors && !b.quit && !xb_cancel_requested();
 }
 
 void xb_backend_dimensions(int *width, int *height)
@@ -875,6 +894,7 @@ int xb_backend_upload(const xb_mesh *mesh)
 {
     size_t i, start, count, batch_count;
     int needs_points, needs_lists;
+    if (xb_cancel_requested()) return 0;
     if (b.stream_active) {
         fail("end the active stream before uploading ordinary native geometry");
         return 0;
@@ -1010,6 +1030,7 @@ void xb_backend_colors(const xb_mesh *mesh)
 {
     size_t i, start, count;
     int batch;
+    if (xb_cancel_requested()) return;
     if (!mesh || mesh->triangles != b.triangles) return;
     for (i = 0; b.shading != XB_SMOOTH && i < b.triangles; ++i) {
         b.facets[i].color.rgb.r = mesh->colors[i].r;
@@ -1132,7 +1153,7 @@ int xb_backend_stream_prepare(int index, const xb_mesh *mesh)
 {
     xb_native_slot *slot;
     size_t i;
-    if (b.errors || b.fatal) return 0;
+    if (b.errors || b.fatal || xb_cancel_requested()) return 0;
     if (!b.stream_active || index < 0 || index >= b.stream_slots) {
         fail("invalid native stream slot");
         return 0;
@@ -1167,7 +1188,7 @@ static size_t draw_stream_slot(int index, int clear)
 {
     xb_native_slot *slot;
     size_t start, count, calls;
-    if (b.errors || b.fatal) return 0;
+    if (b.errors || b.fatal || xb_cancel_requested()) return 0;
     if (!b.stream_active || index < 0 || index >= b.stream_slots) {
         fail("invalid native stream slot");
         return 0;
@@ -1183,7 +1204,7 @@ static size_t draw_stream_slot(int index, int clear)
     slot->pending = 1;
     if (clear) xb_backend_clear(1, 1);
     calls = 0;
-    for (start = 0; start < slot->triangles && !b.errors; start += count) {
+    for (start = 0; start < slot->triangles && !b.errors && !xb_cancel_requested(); start += count) {
         count = slot->triangles - start;
         if (count > (size_t)b.stream_batch) count = (size_t)b.stream_batch;
         xgl_multi_simple_polygon(b.ctx,
@@ -1193,7 +1214,7 @@ static size_t draw_stream_slot(int index, int clear)
                 slot->lists + start);
         ++calls;
     }
-    return b.errors ? 0 : calls;
+    return b.errors || xb_cancel_requested() ? 0 : calls;
 }
 
 size_t xb_backend_stream_draw(int index)
@@ -1231,6 +1252,10 @@ int xb_backend_stream_begin(const xb_mesh *mesh, int slots,
                             char *reason, size_t size)
 {
     int i;
+    if (xb_cancel_requested()) {
+        copy_text(reason, size, "profile time budget reached");
+        return 0;
+    }
     if (b.errors || b.fatal || b.quit) goto bad;
     xb_backend_stream_end();
     if (b.stream_active || b.errors) goto bad;
@@ -1243,25 +1268,25 @@ int xb_backend_stream_begin(const xb_mesh *mesh, int slots,
         goto bad;
     }
     xb_backend_sync();
-    if (b.errors) goto bad;
+    if (b.errors || xb_cancel_requested()) goto bad;
     xgl_object_get(b.ctx, XGL_CTX_GEOM_DATA_IS_VOLATILE,
                    &b.stream_previous_volatile);
-    if (b.errors) goto bad;
+    if (b.errors || xb_cancel_requested()) goto bad;
     /* Record ownership before changing state so error recovery restores it. */
     b.stream_active = 1;
     b.stream_batch = b.batch;
     xgl_object_set(b.ctx, XGL_CTX_GEOM_DATA_IS_VOLATILE, FALSE, 0);
-    if (b.errors || !validate_stream()) goto bad;
+    if (b.errors || xb_cancel_requested() || !validate_stream()) goto bad;
     free_stream_slots(); /* probe has completed successfully */
     b.stream_slots = slots;
     for (i = 0; i < slots; ++i)
-        if (!allocate_stream_slot(i, mesh)) goto bad;
+        if (xb_cancel_requested() || !allocate_stream_slot(i, mesh)) goto bad;
     copy_text(reason, size, b.shading == XB_SMOOTH ?
               "queued vertex colors, interpolation and per-item color/Z clear readback passed" :
               "independent queued facet colors and per-item color/Z clear readback passed");
     return 1;
 bad:
-    copy_text(reason, size, b.error);
+    copy_text(reason, size, xb_cancel_requested() ? "profile time budget reached" : b.error);
     /* On a native failure end deliberately keeps arrays alive for a later
      * reconfiguration recovery or, ultimately, xgl_close.
      */
@@ -1275,7 +1300,7 @@ int xb_backend_lighting(const xb_light_state *state)
     Xgl_pt_f3d direction;
     Xgl_pt_d3d position;
     int i;
-    if (b.errors || b.fatal) return 0;
+    if (b.errors || b.fatal || xb_cancel_requested()) return 0;
     if (!b.hardware_lighting || !state || state->count != b.light_count ||
         state->count < 1 || state->count > XB_MAX_LIGHTS) {
         fail("light state does not match the configured native light count");
@@ -1288,7 +1313,7 @@ int xb_backend_lighting(const xb_light_state *state)
     direction.x = state->direction.x;
     direction.y = state->direction.y;
     direction.z = state->direction.z;
-    for (i = 0; i < state->count && !b.errors; ++i) {
+    for (i = 0; i < state->count && !b.errors && !xb_cancel_requested(); ++i) {
         color.rgb.r = state->color[i].r;
         color.rgb.g = state->color[i].g;
         color.rgb.b = state->color[i].b;
@@ -1307,7 +1332,7 @@ int xb_backend_lighting(const xb_light_state *state)
                 XGL_LIGHT_ATTENUATION_2, (double)state->attenuation2, 0);
         }
     }
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     b.light_state = *state;
     return 1;
 }
@@ -1377,6 +1402,10 @@ static int configure_lighting(const xb_case *test)
 int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
                          char *reason, size_t size)
 {
+    if (xb_cancel_requested()) {
+        copy_text(reason, size, "profile time budget reached");
+        return 0;
+    }
     if (b.fatal || b.quit) { copy_text(reason, size, b.error); return 0; }
     /* A recoverable API error aborts its case. Reset only at an explicit
      * reconfiguration boundary; nonrecoverable errors never resume drawing.
@@ -1387,6 +1416,10 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
      * changing attributes or releasing the previous native mesh arrays.
      */
     xb_backend_sync();
+    if (xb_cancel_requested()) {
+        copy_text(reason, size, "profile time budget reached");
+        return 0;
+    }
     if (b.errors) { copy_text(reason, size, b.error); return 0; }
     if (!texture_enable(0)) { copy_text(reason, size, b.error); return 0; }
     b.texture_filter = XB_TEXTURE_OFF;
@@ -1441,6 +1474,10 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
     }
     xb_backend_clear(1, 1);
     xb_backend_sync();
+    if (xb_cancel_requested()) {
+        copy_text(reason, size, "profile time budget reached");
+        return 0;
+    }
     if (b.errors) { copy_text(reason, size, b.error); return 0; }
     if (test->work == XB_RASTER || test->work == XB_MASKED_RASTER ||
         test->work == XB_FRAME) {
@@ -1459,6 +1496,10 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
     if (b.texture_filter != XB_TEXTURE_OFF)
         copy_text(reason, size,
             "texture RGB/UV/wrap/filter/off gates passed; execution unclassified, may use software");
+    if (xb_cancel_requested()) {
+        copy_text(reason, size, "profile time budget reached");
+        return 0;
+    }
     return 1;
 }
 
@@ -1466,7 +1507,7 @@ void xb_backend_transform(unsigned long frame)
 {
     Xgl_matrix_f3d matrix;
     double angle, c, s;
-    if (b.errors) return;
+    if (b.errors || xb_cancel_requested()) return;
     angle = (double)(frame % 360) * 0.017453292519943295;
     c = cos(angle); s = sin(angle);
     memset(matrix, 0, sizeof(matrix));
@@ -1481,17 +1522,17 @@ void xb_backend_transform(unsigned long frame)
 void xb_backend_clear(int color, int depth)
 {
     int actions;
-    if (b.errors) return;
+    if (b.errors || xb_cancel_requested()) return;
     actions = 0;
     if (color) actions |= XGL_CTX_NEW_FRAME_CLEAR;
     if (depth) actions |= XGL_CTX_NEW_FRAME_HLHSR_ACTION;
     if (depth && !b.current_z)
         xgl_object_set(b.ctx, XGL_3D_CTX_HLHSR_MODE, XGL_HLHSR_Z_BUFFER, 0);
-    if (b.errors) return;
+    if (b.errors || xb_cancel_requested()) return;
     xgl_object_set(b.ctx, XGL_CTX_NEW_FRAME_ACTION, actions, 0);
-    if (b.errors) return;
+    if (b.errors || xb_cancel_requested()) return;
     xgl_context_new_frame(b.ctx);
-    if (b.errors) return;
+    if (b.errors || xb_cancel_requested()) return;
     if (depth && !b.current_z)
         xgl_object_set(b.ctx, XGL_3D_CTX_HLHSR_MODE, XGL_HLHSR_NONE, 0);
 }
@@ -1502,7 +1543,7 @@ size_t xb_backend_draw(enum xb_method method, int batch)
     Xgl_facet facet;
     Xgl_facet_list facets;
     Xgl_pt_list points;
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     if (method != b.method) {
         fail("draw method differs from configured native geometry representation");
         ++b.errors;
@@ -1515,7 +1556,7 @@ size_t xb_backend_draw(enum xb_method method, int batch)
     facets.facet_type = XGL_FACET_COLOR;
     points.pt_type = XGL_PT_F3D;
     if (method == XB_POLYGON) {
-        for (i = 0; i < b.triangles && !b.errors; ++i) {
+        for (i = 0; i < b.triangles && !b.errors && !xb_cancel_requested(); ++i) {
             if (b.shading == XB_SMOOTH)
                 xgl_polygon(b.ctx, XGL_FACET_NONE, NULL, NULL, 1, &b.lists[i]);
             else if (b.lit_facets) {
@@ -1526,12 +1567,12 @@ size_t xb_backend_draw(enum xb_method method, int batch)
                 xgl_polygon(b.ctx, XGL_FACET_COLOR, &facet, NULL, 1, &b.lists[i]);
             }
         }
-        return i;
+        return xb_cancel_requested() ? 0 : i;
     }
     if (method == XB_STRIP) {
-        for (i = 0; i < b.strip_count && !b.errors; ++i) {
+        for (i = 0; i < b.strip_count && !b.errors && !xb_cancel_requested(); ++i) {
             available = b.strips[i].point_count - 2;
-            for (offset = 0; offset < available && !b.errors; offset += count) {
+            for (offset = 0; offset < available && !b.errors && !xb_cancel_requested(); offset += count) {
                 count = available - offset;
                 if (count > (size_t)batch) count = (size_t)batch;
                 points.num_pts = (Xgl_usgn32)(count + 2);
@@ -1543,13 +1584,13 @@ size_t xb_backend_draw(enum xb_method method, int batch)
                 ++calls;
             }
         }
-        return calls;
+        return xb_cancel_requested() ? 0 : calls;
     }
-    for (start = 0; start < b.triangles && !b.errors; start += count) {
+    for (start = 0; start < b.triangles && !b.errors && !xb_cancel_requested(); start += count) {
         count = b.triangles - start;
         if (count > (size_t)batch) count = (size_t)batch;
         facets.num_facets = (Xgl_usgn32)count;
-        facets.facets.color_facets = b.facets + start;
+        facets.facets.color_facets = b.facets ? b.facets + start : NULL;
         if (method == XB_MULTI) {
             xgl_multi_simple_polygon(b.ctx,
                 XGL_FACET_FLAG_SIDES_ARE_3 | XGL_FACET_FLAG_SHAPE_CONVEX,
@@ -1566,7 +1607,7 @@ size_t xb_backend_draw(enum xb_method method, int batch)
         }
         ++calls;
     }
-    return calls;
+    return xb_cancel_requested() ? 0 : calls;
 }
 
 void xb_backend_sync(void)
@@ -1576,13 +1617,13 @@ void xb_backend_sync(void)
 
 void xb_backend_swap(void)
 {
-    if (b.buffers < 2 || b.errors) return;
+    if (b.buffers < 2 || b.errors || xb_cancel_requested()) return;
     /* Complete queued geometry and raster copies before presentation. */
     xb_backend_sync();
-    if (b.errors) return;
+    if (b.errors || xb_cancel_requested()) return;
     xgl_object_set(b.ctx, XGL_CTX_NEW_FRAME_ACTION,
                    XGL_CTX_NEW_FRAME_SWITCH_BUFFER, 0);
-    if (b.errors) return;
+    if (b.errors || xb_cancel_requested()) return;
     xgl_context_new_frame(b.ctx);
     if (!b.errors) xgl_context_flush(b.ctx, XGL_FLUSH_SYNCHRONIZE);
 }
@@ -1591,7 +1632,7 @@ void xb_backend_raster(int masked)
 {
     Xgl_pt_i2d position;
     int restore_texture;
-    if (b.errors) return;
+    if (b.errors || xb_cancel_requested()) return;
     restore_texture = b.texture_switch;
     if (!texture_enable(0)) return;
     position.x = (b.width - XB_RASTER_W) / 2;
@@ -1599,8 +1640,8 @@ void xb_backend_raster(int masked)
     xgl_object_set(b.ctx, XGL_CTX_RASTER_FILL_STYLE,
                    masked ? XGL_RAS_FILL_STIPPLE : XGL_RAS_FILL_COPY,
                    XGL_CTX_RASTER_FPAT_POSITION, &position, 0);
-    if (!b.errors) xgl_context_copy_buffer(b.ctx, NULL, &position, b.hud);
-    if (!b.errors && restore_texture) (void)texture_enable(1);
+    if (!b.errors && !xb_cancel_requested()) xgl_context_copy_buffer(b.ctx, NULL, &position, b.hud);
+    if (!b.errors && !xb_cancel_requested() && restore_texture) (void)texture_enable(1);
 }
 
 int xb_backend_events(void)
@@ -1664,13 +1705,14 @@ static int pixel_matches(int x, int y, const xb_rgb *expected)
 {
     Xgl_pt_i2d point;
     Xgl_color color;
-    if (b.errors) return 0;
+    if (b.errors || xb_cancel_requested()) return 0;
     point.x = x; point.y = y;
     memset(&color, 0, sizeof(color));
     if (xgl_context_get_pixel(b.ctx, &point, &color)) {
         fail("validation pixel is obscured; keep the entire benchmark window visible");
         return 0;
     }
+    if (xb_cancel_requested()) return 0;
     if (fabs(color.rgb.r - expected->r) > 0.065 ||
         fabs(color.rgb.g - expected->g) > 0.065 ||
         fabs(color.rgb.b - expected->b) > 0.065) {
@@ -1703,6 +1745,7 @@ static int validate_culling(void)
      * (+Z) triangle back-facing. Use no supplied normal or lighting so this
      * gate tests exactly the winding convention of the timed culling cases.
      */
+    if (xb_cancel_requested()) return 0;
     memset(points, 0, sizeof(points));
     memset(lists, 0, sizeof(lists));
     memset(colors, 0, sizeof(colors));
@@ -1745,6 +1788,7 @@ static int validate_culling(void)
                        mode ? XGL_CULL_BACK : XGL_CULL_OFF, 0);
         if (b.errors) goto done;
         xb_backend_clear(1, 1);
+        if (xb_cancel_requested()) goto done;
         xgl_multi_simple_polygon(b.ctx,
                 XGL_FACET_FLAG_SIDES_ARE_3 | XGL_FACET_FLAG_SHAPE_CONVEX,
                 &facets, NULL, 2, lists);
@@ -1754,7 +1798,7 @@ static int validate_culling(void)
                        .5 * (b.width - 1));
             py = (int)(.4 * (b.height - 1));
             if (!pixel_matches(px, py, mode && i ? &black : &expected[i])) {
-                if (!b.errors)
+                if (!b.errors && !xb_cancel_requested())
                     fail("front/back winding readback failed with culling off or back-face culling");
                 goto done;
             }
