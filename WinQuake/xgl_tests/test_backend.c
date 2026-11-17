@@ -26,12 +26,14 @@ static int actions, orientation, mapping, clip_planes, hlhsr, illumination;
 static int clear_calls, swap_calls, polygon_calls, text_calls, extent_calls, flush_calls;
 static int text_color_sets, audio_updates;
 static int transparency, freeze_z;
+static int transparency_sets;
 static float current_ambient, text_height, current_spacing;
 static int spacing_mode, proportional_metrics;
 static int vertical_advance;
 static Xgl_color text_color, polygon_color;
 static Xgl_pt_color_normal_f3d submitted_vertex;
 static Xgl_pt_color_normal_f3d submitted_vertices[8192];
+static const void *submitted_sources[8192 / 3];
 static int submitted_count;
 static Xgl_color recorded_quad_colors[1024];
 static Xgl_pt_f2d recorded_quad_points[1024][4];
@@ -52,6 +54,7 @@ static const char *queued_string[4096];
 static char queued_string_copy[4096][XGL_UI_TEXT_RUN + 1];
 static int queued_count;
 static unsigned long profile_counts[XGL_PROFILE_COUNTER_COUNT];
+static int profile_sections[XGL_PROFILE_SECTION_COUNT];
 static Xgl_error_info injected_error;
 static jmp_buf expected_failure;
 static int expect_failure;
@@ -66,6 +69,7 @@ void XGL_ProfileAdd(xgl_profile_section_t section, double start)
 {
     assert((unsigned int)section < XGL_PROFILE_SECTION_COUNT);
     (void)start;
+    ++profile_sections[section];
 }
 void XGL_ProfileCount(xgl_profile_counter_t counter, unsigned long count)
 {
@@ -138,7 +142,8 @@ void xgl_object_set(Xgl_object object, ...)
         case XGL_CTX_CLIP_PLANES: clip_planes = va_arg(args, int); break;
         case XGL_3D_CTX_HLHSR_MODE: hlhsr = va_arg(args, int); break;
         case XGL_3D_CTX_SURF_FRONT_ILLUMINATION: illumination = va_arg(args, int); break;
-        case XGL_3D_CTX_SURF_TRANSP_METHOD: transparency = va_arg(args, int); break;
+        case XGL_3D_CTX_SURF_TRANSP_METHOD:
+            transparency = va_arg(args, int); ++transparency_sets; break;
         case XGL_3D_CTX_BLEND_FREEZE_Z_BUFFER: freeze_z = va_arg(args, int); break;
         case XGL_3D_CTX_SURF_TRANSP_BLEND_EQ:
         case XGL_3D_CTX_BLEND_DRAW_MODE:
@@ -222,12 +227,20 @@ void xgl_multi_simple_polygon(Xgl_ctx context, Xgl_facet_flags flags,
     if (lists[0].pt_type == XGL_PT_COLOR_NORMAL_F3D) {
         assert(lists[0].num_pts == 3 && !facets);
         native_event('G');
-        submitted_vertex = lists[0].pts.color_normal_f3d[0];
+        /* The renderer owns an SDK-layout-compatible record. Read its bytes
+         * like the external native library rather than making host compiler
+         * aliasing assumptions between the two C struct types. */
+        memcpy(&submitted_vertex, lists[0].pts.color_normal_f3d, sizeof(submitted_vertex));
         for (i = 0; i < count; ++i) {
             assert(lists[i].pt_type == XGL_PT_COLOR_NORMAL_F3D && lists[i].num_pts == 3);
             assert(submitted_count + 3 <= (int)(sizeof(submitted_vertices) / sizeof(submitted_vertices[0])));
-            for (j = 0; j < 3; ++j)
-                submitted_vertices[submitted_count++] = lists[i].pts.color_normal_f3d[j];
+            submitted_sources[submitted_count / 3] = lists[i].pts.color_normal_f3d;
+            for (j = 0; j < 3; ++j) {
+                memcpy(&submitted_vertices[submitted_count],
+                       (const byte *)lists[i].pts.color_normal_f3d + j * sizeof(submitted_vertex),
+                       sizeof(submitted_vertex));
+                ++submitted_count;
+            }
         }
     } else {
         assert(facets && facets->facet_type == XGL_FACET_COLOR);
@@ -370,18 +383,20 @@ static void reset_backend(void)
     for (i = 0; i < XGL_BATCH_TRIANGLES; ++i) {
         xb.lists[i].pt_type = XGL_PT_COLOR_NORMAL_F3D;
         xb.lists[i].num_pts = 3;
-        xb.lists[i].pts.color_normal_f3d = xb.points + i * 3;
+        xb.lists[i].pts.color_normal_f3d = (Xgl_pt_color_normal_f3d *)(xb.points + i * 3);
     }
     clear_calls = swap_calls = polygon_calls = text_calls = extent_calls = flush_calls = 0;
     text_color_sets = audio_updates = submitted_count = 0;
     glyph_count = spacing_mode = proportional_metrics = vertical_advance = 0;
     current_spacing = 0;
     memset(profile_counts, 0, sizeof(profile_counts));
+    memset(profile_sections, 0, sizeof(profile_sections));
     recorded_quads = quad_batch_count = native_event_count = 0;
     native_events[0] = 0;
     queued_count = queued_quad_count = 0;
     actions = orientation = mapping = clip_planes = hlhsr = illumination = 0;
     write_mask = 0; transparency = freeze_z = 0;
+    transparency_sets = 0;
     r_refdef.vrect.x = 40; r_refdef.vrect.y = 30;
     r_refdef.vrect.width = 560; r_refdef.vrect.height = 400;
     r_refdef.fov_x = r_refdef.fov_y = 90;
@@ -514,6 +529,50 @@ static void test_clear_and_lighting(void)
     assert(clear_calls == 2 && actions == XGL_CTX_NEW_FRAME_HLHSR_ACTION);
 }
 
+static void test_weapon_clear_state_reuse(void)
+{
+    xgl_vertex_t vertices[3];
+    int sets, waits, polygons;
+    reset_backend(); XGL_BeginScene();
+    memset(vertices, 0, sizeof(vertices));
+    XGL_DrawTriangles(vertices, 3, 2, 1, 1); XGL_Flush();
+    sets = transparency_sets; waits = flush_calls; polygons = polygon_calls;
+    assert(illumination == XGL_ILLUM_PER_VERTEX && switches[5]);
+    XGL_SetViewModel(1);
+    assert(transparency_sets == sets && polygon_calls == polygons);
+    assert(flush_calls == waits + 1 && clear_calls == 1);
+    assert(actions == XGL_CTX_NEW_FRAME_HLHSR_ACTION);
+    assert(xb.applied_opacity == 1 && xb.applied_zwrite == 1);
+    assert(illumination == XGL_ILLUM_PER_VERTEX && switches[5]);
+    assert(profile_sections[XGL_PROFILE_WEAPON_CLEAR] == 1);
+    XGL_DrawTriangles(vertices, 3, 2, 1, 1); XGL_Flush();
+    assert(transparency_sets == sets && polygon_calls == polygons + 1);
+    assert(profile_counts[XGL_PROFILE_TRIANGLES] == 2);
+    XGL_SetViewModel(0);
+    assert(clear_calls == 1 && flush_calls == waits + 2);
+    assert(profile_sections[XGL_PROFILE_WEAPON_CLEAR] == 1);
+
+    /* A blended preceding layer must restore opaque drawing and depth
+     * writes before the clear, then reuse those values for the weapon. */
+    reset_backend(); XGL_BeginScene();
+    XGL_DrawTriangles(vertices, 3, 0, .5f, 0); XGL_Flush();
+    sets = transparency_sets; waits = flush_calls;
+    assert(transparency == XGL_TRANSP_BLENDED && freeze_z && !write_mask);
+    XGL_SetViewModel(1);
+    assert(transparency_sets == sets + 1 && flush_calls == waits + 1);
+    assert(transparency == XGL_TRANSP_NONE && !freeze_z);
+    assert(write_mask == (Xgl_usgn32)0xffffffffUL);
+    assert(xb.applied_opacity == 1 && xb.applied_zwrite == 1);
+    assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+    assert(profile_sections[XGL_PROFILE_WEAPON_CLEAR] == 1);
+    XGL_DrawTriangles(vertices, 3, 2, 1, 1); XGL_Flush();
+    assert(transparency_sets == sets + 1 && polygon_calls == 2);
+    assert(illumination == XGL_ILLUM_PER_VERTEX && switches[5]);
+    assert(profile_counts[XGL_PROFILE_TRIANGLES] == 2);
+    XGL_SetViewModel(0);
+    assert(flush_calls == waits + 2 && clear_calls == 1);
+}
+
 static void test_fonts_and_gamma(void)
 {
     int extents, i;
@@ -606,6 +665,114 @@ static void test_strided_prepared_colors(void)
     XGL_Flush();
     assert(submitted_vertex.color.rgb.r == 1 && submitted_vertex.color.rgb.b == 0);
     assert(fabs(submitted_vertex.color.rgb.g - 127.0 / 255) < .0001);
+}
+
+static void fill_native_vertices(xgl_native_vertex_t *vertices, int count, int first)
+{
+    int i;
+    for (i = 0; i < count; ++i) {
+        vertices[i].position[0] = (float)(first + i);
+        vertices[i].position[1] = .25f;
+        vertices[i].position[2] = .5f;
+        vertices[i].normal[0] = vertices[i].normal[1] = 0;
+        vertices[i].normal[2] = 1;
+        vertices[i].color.rgb[0] = .2f;
+        vertices[i].color.rgb[1] = .4f;
+        vertices[i].color.rgb[2] = .6f;
+    }
+}
+
+static void test_native_batches(void)
+{
+    xgl_native_vertex_t cached[XGL_BATCH_TRIANGLES * 3 + 3], *reserved;
+    xgl_vertex_t raw[3];
+    int i, count, total;
+    reset_backend();
+    count = 3;
+    assert(!XGL_ReserveTriangles(&count, 1, 1, 1) && count == 0);
+    XGL_BeginScene();
+    fill_native_vertices(cached, XGL_BATCH_TRIANGLES * 3 + 3, 0);
+    XGL_DrawNativeTriangles(cached, 6, 1, 1, 1);
+    assert(xb.count == 6 && !polygon_calls);
+    assert((const void *)xb.lists[0].pts.color_normal_f3d == cached);
+    count = XGL_BATCH_TRIANGLES * 3;
+    reserved = XGL_ReserveTriangles(&count, 1, 1, 1);
+    assert(reserved == xb.points + 6 && count == XGL_BATCH_TRIANGLES * 3 - 6);
+    fill_native_vertices(reserved, count, 6);
+    assert(!polygon_calls); /* a full reservation is not submitted unfilled */
+    XGL_Flush();
+    assert(submitted_count == XGL_BATCH_TRIANGLES * 3 && polygon_calls == 1);
+    assert(submitted_sources[0] == cached && submitted_sources[1] == cached + 3);
+    for (i = 0; i < submitted_count; ++i) {
+        assert(submitted_vertices[i].x == (float)i);
+        assert(submitted_vertices[i].normal.z == 1);
+        assert(submitted_vertices[i].color.rgb.r == .2f);
+    }
+    assert(profile_counts[XGL_PROFILE_NATIVE_CACHED_VERTICES] == 6);
+    assert(profile_counts[XGL_PROFILE_NATIVE_DIRECT_VERTICES] == (unsigned long)count);
+    assert(!profile_counts[XGL_PROFILE_VERTEX_PACKED]);
+    /* Native volatile submission has consumed the records before a cached
+     * mesh or the owned batch can be changed/reused. */
+    cached[0].position[0] = -99;
+    reserved[0].position[0] = -88;
+    assert(submitted_vertices[0].x == 0 && submitted_vertices[6].x == 6);
+
+    reset_backend(); XGL_BeginScene();
+    fill_native_vertices(cached, XGL_BATCH_TRIANGLES * 3 + 3, 0);
+    XGL_DrawNativeTriangles(cached, XGL_BATCH_TRIANGLES * 3 + 3, 1, 1, 1);
+    assert(polygon_calls == 1 && xb.count == 3);
+    memset(raw, 0, sizeof(raw));
+    for (i = 0; i < 3; ++i) { raw[i].position[0] = 771.0f + i; raw[i].color[0] = 1; }
+    XGL_DrawTriangles(raw, 3, 1, 1, 1);
+    count = 3;
+    reserved = XGL_ReserveTriangles(&count, 1, 1, 1);
+    assert(reserved && count == 3);
+    fill_native_vertices(reserved, count, 774);
+    XGL_Flush();
+    total = XGL_BATCH_TRIANGLES * 3 + 9;
+    assert(submitted_count == total && polygon_calls == 2);
+    for (i = 0; i < total; ++i) assert(submitted_vertices[i].x == (float)i);
+    assert(submitted_sources[256] == cached + XGL_BATCH_TRIANGLES * 3);
+    assert(submitted_sources[257] == xb.points + 3);
+    assert(submitted_sources[258] == xb.points + 6);
+    assert(profile_counts[XGL_PROFILE_NATIVE_CACHED_VERTICES] == 771);
+    assert(profile_counts[XGL_PROFILE_NATIVE_DIRECT_VERTICES] == 3);
+    assert(profile_counts[XGL_PROFILE_VERTEX_PACKED] == 3);
+
+    /* State boundaries flush completed borrowed and reserved records. */
+    reset_backend(); XGL_BeginScene();
+    XGL_DrawNativeTriangles(cached, 3, 1, 1, 1);
+    count = 3;
+    reserved = XGL_ReserveTriangles(&count, 0, .5f, 0);
+    assert(polygon_calls == 1 && count == 3);
+    fill_native_vertices(reserved, count, 3);
+    XGL_Flush();
+    assert(polygon_calls == 2 && submitted_count == 6);
+    assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+    assert(transparency == XGL_TRANSP_BLENDED && freeze_z && !write_mask);
+    count = 3;
+    assert(!XGL_ReserveTriangles(&count, 1, 0, 1) && !count);
+    XGL_DrawNativeTriangles(cached, 3, 1, 0, 1);
+    assert(!xb.count && polygon_calls == 2);
+}
+
+static void test_prepared_palette(void)
+{
+    float expected[3], actual[3];
+    int i, component, pass;
+    reset_backend();
+    for (i = 0; i < 768; ++i) xgl_palette[i] = (byte)(i * 73);
+    for (pass = 0; pass < 2; ++pass) {
+        for (i = 0; i < 256; ++i) gammatable[i] = (byte)(pass ? 255 - i : i);
+        XGL_BeginFrame();
+        for (i = 0; i < 256; ++i) {
+            for (component = 0; component < 3; ++component)
+                expected[component] = xgl_palette[i * 3 + component] / 255.0f;
+            XGL_PrepareColor(expected);
+            XGL_PreparePaletteColor(i + 256, actual);
+            assert(!memcmp(expected, actual, sizeof(expected)));
+        }
+    }
 }
 
 static void check_text_cells(const char *text, float x, float y,
@@ -903,9 +1070,12 @@ int main(void)
     test_first_console_frame();
     test_camera();
     test_clear_and_lighting();
+    test_weapon_clear_state_reuse();
     test_fonts_and_gamma();
     test_text_runs();
     test_strided_prepared_colors();
+    test_native_batches();
+    test_prepared_palette();
     test_ui_batch_order_and_capacity();
     test_completion_and_attribute_reuse();
     test_point_light_selection();

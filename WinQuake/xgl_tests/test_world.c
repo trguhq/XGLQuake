@@ -1,7 +1,18 @@
 /* Host renderer contracts; these tests do not simulate XGL or GPU timing. */
 #include <assert.h>
+#include <float.h>
 #include <stdarg.h>
+#include <stdlib.h>
+static int fail_alloc_after = -1;
+static void *test_malloc(size_t bytes)
+{
+    if (fail_alloc_after == 0) return NULL;
+    if (fail_alloc_after > 0) --fail_alloc_after;
+    return malloc(bytes);
+}
+#define malloc test_malloc
 #include "../xgl_world.c"
+#undef malloc
 
 client_state_t cl;
 lightstyle_t cl_lightstyle[MAX_LIGHTSTYLES];
@@ -28,7 +39,10 @@ static byte test_samples[81];
 static efrag_t test_efrag;
 static byte test_vis;
 static int pvs_calls, sample_calls, efrag_calls, reject_box;
-static xgl_vertex_t captured[1024];
+static xgl_native_vertex_t captured[1024];
+static const xgl_native_vertex_t *queued[1024];
+static xgl_native_vertex_t queued_copy[1024];
+static int queued_count, flush_calls, palette_calls, failed_sample;
 static int captured_count, captured_lit, captured_zwrite;
 static int captured_calls, varying_material, prepare_calls, filter_calls;
 static unsigned int color_revision, texture_revision;
@@ -36,8 +50,6 @@ static float gamma_scale;
 static float captured_opacity;
 static unsigned long profile_counts[XGL_PROFILE_COUNTER_COUNT];
 static int profile_sections[XGL_PROFILE_SECTION_COUNT];
-static byte contour_pixels[128 * 128];
-static int contour_pixel_view, contour_alpha, pixel_view_calls;
 
 double XGL_ProfileDetailNow(void) { return 1; }
 void XGL_ProfileAdd(xgl_profile_section_t section, double start)
@@ -55,26 +67,27 @@ void XGL_ProfileCount(xgl_profile_counter_t counter, unsigned long count)
 void Con_Printf(char *format, ...) { (void)format; }
 void XGL_AudioUpdate(void) {}
 unsigned int XGL_TextureRevision(int id) { assert(id == 1 || id == 2); return texture_revision; }
-qboolean XGL_TextureHasAlpha(int id)
-{
-    assert(id == 1 || id == 2);
-    return contour_alpha;
-}
-qboolean XGL_TexturePixels(int id, const byte **pixels, int *width, int *height)
-{
-    assert(id == 1 || id == 2);
-    ++pixel_view_calls;
-    if (!contour_pixel_view) return false;
-    *pixels = contour_pixels;
-    *width = *height = 128;
-    return true;
-}
 unsigned int XGL_ColorRevision(void) { return color_revision; }
 void XGL_PrepareColor(float rgb[3])
 {
     int i;
     ++prepare_calls;
     for (i = 0; i < 3; ++i) rgb[i] *= gamma_scale;
+}
+void XGL_PreparePaletteColor(int index, float rgb[3])
+{
+    int i;
+    assert(index >= 0 && index <= 255);
+    ++palette_calls;
+    for (i = 0; i < 3; ++i) rgb[i] = xgl_palette[index * 3 + i] / 255.0f * gamma_scale;
+}
+void XGL_Flush(void)
+{
+    int i;
+    ++flush_calls;
+    for (i = 0; i < queued_count; ++i)
+        assert(!memcmp(queued[i], &queued_copy[i], sizeof(*queued[i])));
+    queued_count = 0;
 }
 void Sys_Error(char *format, ...)
 {
@@ -104,29 +117,30 @@ void R_StoreEfrags(efrag_t **efrags)
     assert(*efrags == &test_efrag);
     ++efrag_calls;
 }
+qboolean XGL_SampleTextureIndex(int texture, float s, float t, int *index)
+{
+    assert(texture == 1 || texture == 2);
+    ++sample_calls;
+    if (failed_sample) return false;
+    s -= (float)floor(s); t -= (float)floor(t);
+    *index = ((int)(s * 255) + (int)(t * 127)) & 255;
+    return true;
+}
 qboolean XGL_SampleTexture(int texture, float s, float t, float rgb[3], const byte *translation)
 {
-    int x, y, index, channel;
+    int i, index;
     assert(texture == 1 || texture == 2);
     assert(translation == NULL);
-    ++sample_calls;
-    if (contour_pixel_view) {
-        s -= (float)floor(s); t -= (float)floor(t);
-        x = (int)(s * 128); y = (int)(t * 128);
-        if (x > 127) x = 127;
-        if (y > 127) y = 127;
-        index = contour_pixels[y * 128 + x];
-        for (channel = 0; channel < 3; ++channel)
-            rgb[channel] = xgl_palette[index * 3 + channel] / 255.0f;
-        return true;
-    }
-    rgb[0] = .8f; rgb[1] = .4f; rgb[2] = .2f;
     if (varying_material) {
-        rgb[0] = s - (float)floor(s);
-        rgb[1] = t - (float)floor(t);
+        if (!XGL_SampleTextureIndex(texture, s, t, &index)) return false;
+        for (i = 0; i < 3; ++i) rgb[i] = xgl_palette[index * 3 + i] / 255.0f;
+    } else {
+        ++sample_calls;
+        rgb[0] = .8f; rgb[1] = .4f; rgb[2] = .2f;
     }
     return true;
 }
+
 qboolean XGL_SampleTextureFiltered(int texture, float s, float t, float fs, float ft,
                                   float rgb[3], const byte *translation)
 {
@@ -135,24 +149,38 @@ qboolean XGL_SampleTextureFiltered(int texture, float s, float t, float fs, floa
     return XGL_SampleTexture(texture, s, t, rgb, translation);
 }
 
-void XGL_DrawTrianglesStrided(const xgl_vertex_t *vertices, int count, size_t stride,
-                              int lit, float opacity, int zwrite, int prepared)
+void XGL_DrawNativeTriangles(const xgl_native_vertex_t *vertices, int count,
+                             int lit, float opacity, int zwrite)
 {
     int i;
-    const xgl_vertex_t *vertex;
-    assert(prepared && stride >= sizeof(*vertices));
     assert(count > 0 && count % 3 == 0 && captured_count + count <= 1024);
+    assert(queued_count + count <= 1024);
     for (i = 0; i < count; ++i) {
-        vertex = (const xgl_vertex_t *)((const byte *)vertices + i * stride);
-        assert(fabs(DotProduct(vertex->normal, vertex->normal) - 1) < .0001);
-        captured[captured_count++] = *vertex;
+        assert(fabs(DotProduct(vertices[i].normal, vertices[i].normal) - 1) < .0001);
+        captured[captured_count++] = vertices[i];
+        queued[queued_count] = vertices + i;
+        queued_copy[queued_count++] = vertices[i];
     }
     captured_lit = lit; captured_opacity = opacity; captured_zwrite = zwrite;
     ++captured_calls;
 }
 
+xgl_native_vertex_t *XGL_ReserveTriangles(int *count, int lit, float opacity, int zwrite)
+{
+    xgl_native_vertex_t *vertices;
+    assert(*count > 0 && *count % 3 == 0);
+    if (*count > 12) *count = 12; /* Exercise callers handling partial space. */
+    assert(captured_count + *count <= 1024);
+    vertices = captured + captured_count;
+    captured_count += *count;
+    captured_lit = lit; captured_opacity = opacity; captured_zwrite = zwrite;
+    ++captured_calls;
+    return vertices;
+}
+
 static void begin_frame(void)
 {
+    XGL_Flush(); /* The preceding frame has completed. */
     ++r_framecount;
     captured_count = captured_calls = 0;
     memset(profile_counts, 0, sizeof(profile_counts));
@@ -179,6 +207,7 @@ static void setup_world(void)
 {
     int i;
     XGL_WorldShutdown();
+    fail_alloc_after = -1;
     memset(&test_model, 0, sizeof(test_model));
     memset(&test_surface, 0, sizeof(test_surface));
     memset(&test_texinfo, 0, sizeof(test_texinfo));
@@ -242,12 +271,11 @@ static void setup_world(void)
     xgl_subdivide.value = 32;
     xgl_detailtris.value = 4096;
     xgl_detaildistance.value = 768;
-    xgl_contours.value = 1;
     for (i = 0; i < 256; ++i) d_lightstylevalue[i] = 256;
     pvs_calls = sample_calls = efrag_calls = reject_box = captured_count = 0;
     captured_calls = varying_material = prepare_calls = filter_calls = 0;
     color_revision = texture_revision = 1; gamma_scale = 1;
-    contour_pixel_view = contour_alpha = pixel_view_calls = 0;
+    palette_calls = failed_sample = flush_calls = 0;
     for (i = 0; i < 256; ++i)
         xgl_palette[i * 3] = xgl_palette[i * 3 + 1] = xgl_palette[i * 3 + 2] = (byte)i;
     realtime = 0;
@@ -268,13 +296,13 @@ static void test_animated_water_and_sky(void)
     test_surface.flags = SURF_DRAWTURB;
     begin_frame();
     assert(captured_count == 6 && captured_calls == 1 && captured_lit == 0);
-    first_color = captured[0].color[0];
+    first_color = captured[0].color.rgb[0];
     VectorCopy(captured[0].position, first_position);
     samples = sample_calls;
     realtime = .25;
     begin_frame();
-    assert(captured_count == 6 && captured_calls == 1 && sample_calls == samples + 6);
-    assert(fabs(captured[0].color[0] - first_color) > .01);
+    assert(captured_count == 6 && captured_calls == 1 && sample_calls == samples + 4);
+    assert(fabs(captured[0].color.rgb[0] - first_color) > .01);
     assert(VectorCompare(captured[0].position, first_position));
     /* Dynamic lighting never changes the water or sky's unlit material path. */
     assert(captured_lit == 0 && captured_zwrite == 1);
@@ -301,23 +329,23 @@ static void test_animated_water_and_sky(void)
     r_origin[0] = r_origin[1] = 0;
     begin_frame();
     assert(captured_count == 6 && captured_calls == 1 && captured_lit == 0);
-    assert(fabs(captured[0].color[0] - 1.0f / 255) < .0001);
+    assert(fabs(captured[0].color.rgb[0] - 1.0f / 255) < .0001);
     assert(sample_calls == 0); /* split image samples bypass the full-image registry */
     realtime = 1;
     begin_frame();
     assert(captured_count == 6 && captured_calls == 1);
-    assert(fabs(captured[0].color[0] - 9.0f / 255) < .0001);
+    assert(fabs(captured[0].color.rgb[0] - 9.0f / 255) < .0001);
     /* A nonzero foreground texel wins at the faster 16-unit scroll. */
     pixels[16 * 256 + 16] = 200;
     begin_frame();
     assert(captured_calls == 1);
-    assert(fabs(captured[0].color[0] - 200.0f / 255) < .0001);
+    assert(fabs(captured[0].color.rgb[0] - 200.0f / 255) < .0001);
     pixels[16 * 256 + 16] = 0;
     realtime = 0;
     r_origin[0] = 16;
     begin_frame();
     assert(captured_calls == 1 && captured_lit == 0);
-    assert(fabs(captured[0].color[0] - 1.0f / 255) > .01);
+    assert(fabs(captured[0].color.rgb[0] - 1.0f / 255) > .01);
     XGL_WorldShutdown();
     free(sky);
 }
@@ -332,7 +360,7 @@ static void test_cache_and_styles(void)
     assert(captured_zwrite == 1 && captured_opacity == 1);
     assert(fabs(captured_area() - 128 * 128) < .01);
     assert(xgl_cache_bytes <= XGL_WORLD_CACHE_BYTES);
-    original = captured[0].color[0];
+    original = captured[0].color.rgb[0];
     samples = sample_calls; count = captured_count; prepares = prepare_calls;
     assert(filter_calls == count);
     begin_frame();
@@ -341,19 +369,19 @@ static void test_cache_and_styles(void)
     gamma_scale = .5f; ++color_revision;
     begin_frame();
     assert(sample_calls == samples && prepare_calls == prepares + count);
-    assert(fabs(captured[0].color[0] - original * .5f) < .0001);
+    assert(fabs(captured[0].color.rgb[0] - original * .5f) < .0001);
     gamma_scale = 1; ++color_revision;
     begin_frame();
     assert(sample_calls == samples);
-    assert(fabs(captured[0].color[0] - original) < .0001);
+    assert(fabs(captured[0].color.rgb[0] - original) < .0001);
     d_lightstylevalue[0] = 128;
     begin_frame();
     assert(sample_calls == samples);
-    assert(fabs(captured[0].color[0] - original * .5f) < .0001);
+    assert(fabs(captured[0].color.rgb[0] - original * .5f) < .0001);
     r_fullbright.value = 1;
     begin_frame();
     assert(captured_lit == 0 && sample_calls == samples);
-    assert(fabs(captured[0].color[0] - .8f) < .0001);
+    assert(fabs(captured[0].color.rgb[0] - .8f) < .0001);
     ++texture_revision;
     begin_frame();
     assert(sample_calls == samples + count);
@@ -533,295 +561,168 @@ static void test_projected_detail_priority(void)
     XGL_WorldShutdown();
 }
 
-static void contour_panel(int boundary)
+static void compare_sample_map(xgl_surface_mesh_t *mesh, texture_t *texture,
+                                entity_t *entity)
 {
-    int x, y;
-    contour_pixel_view = 1;
-    for (y = 0; y < 128; ++y)
-        for (x = 0; x < 128; ++x)
-            contour_pixels[y * 128 + x] = x < boundary ? 24 : 232;
+    float colors[96][3];
+    unsigned short *map;
+    int i, samples;
+    assert(mesh->count == 96 && mesh->sample_vertex);
+    XGL_UpdateSurfaceMesh(mesh, &test_surface, texture, entity);
+    for (i = 0; i < mesh->count; ++i)
+        VectorCopy(mesh->vertices[i].color.rgb, colors[i]);
+    samples = sample_calls;
+    map = mesh->sample_vertex;
+    mesh->sample_vertex = NULL;
+    XGL_UpdateSurfaceMesh(mesh, &test_surface, texture, entity);
+    if (test_surface.flags & SURF_DRAWTURB) assert(sample_calls == samples + 96);
+    for (i = 0; i < mesh->count; ++i)
+        assert(VectorCompare(mesh->vertices[i].color.rgb, colors[i]));
+    mesh->sample_vertex = map;
 }
 
-static float edge_side(const float *a, const float *b, float x, float y)
+static void test_shared_animated_samples(void)
 {
-    return (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
-}
-
-static void assert_contour_coverage(void)
-{
-    const float *a, *b, *c;
-    float x, y, area, ab, bc, ca;
-    int i, j, k, covered, on_edge;
-    assert(captured_count >= 6 && captured_count <= 96 && captured_count % 3 == 0);
-    assert(xgl_detail_used <= xgl_detailtris.value);
-    assert(fabs(captured_area() - 128 * 128) < .1);
-    for (i = 0; i < captured_count; ++i) {
-        assert(captured[i].position[0] >= -.001 && captured[i].position[0] <= 128.001);
-        assert(captured[i].position[1] >= -.001 && captured[i].position[1] <= 128.001);
-        assert(fabs(captured[i].position[2]) < .00001);
-    }
-    for (i = 0; i < captured_count; i += 3) {
-        a = captured[i].position; b = captured[i + 1].position; c = captured[i + 2].position;
-        area = edge_side(a, b, c[0], c[1]);
-        assert(area > .00001); /* Original face winding and no zero-area triangles. */
-    }
-    /* Area equality alone can hide a hole canceled by an overlapping region.
-     * Jittered points strictly inside triangles must be covered exactly once. */
-    for (j = 0; j < 17; ++j) for (i = 0; i < 19; ++i) {
-        x = 128 * (i + .327f) / 19;
-        y = 128 * (j + .619f) / 17;
-        covered = on_edge = 0;
-        for (k = 0; k < captured_count; k += 3) {
-            a = captured[k].position; b = captured[k + 1].position; c = captured[k + 2].position;
-            ab = edge_side(a, b, x, y); bc = edge_side(b, c, x, y); ca = edge_side(c, a, x, y);
-            if (ab >= -.001 && bc >= -.001 && ca >= -.001) {
-                ++covered;
-                if (fabs(ab) <= .001 || fabs(bc) <= .001 || fabs(ca) <= .001) on_edge = 1;
-            }
-        }
-        assert(covered >= 1);
-        if (!on_edge) assert(covered == 1);
-    }
-}
-
-static void assert_positions_equal(const xgl_vertex_t *before, int count)
-{
-    int i;
-    assert(captured_count == count);
-    for (i = 0; i < count; ++i)
-        assert(!memcmp(before[i].position, captured[i].position, sizeof(vec3_t)));
-}
-
-static int has_vertical_contour(float boundary)
-{
-    const float *a, *b;
-    int i, edge;
-    for (i = 0; i < captured_count; i += 3) for (edge = 0; edge < 3; ++edge) {
-        a = captured[i + edge].position;
-        b = captured[i + (edge + 1) % 3].position;
-        if (fabs(a[0] - boundary) < 4 && fabs(b[0] - boundary) < 4 &&
-            fabs(a[1] - b[1]) > 16) return 1;
-    }
-    return 0;
-}
-
-static void test_contour_cache_lighting_and_replacement(void)
-{
-    xgl_vertex_t first[1024];
-    int count, views, samples, i;
+    xgl_surface_mesh_t *mesh;
+    texture_t *sky;
+    entity_t entity;
+    byte *pixels;
+    size_t bytes;
+    int i, failed, count, before, channel;
+    float s, t, os, ot, phase, expected[3];
     setup_world();
-    contour_panel(43);
-    r_fullbright.value = 1;
+    varying_material = 1;
+    test_surface.flags = SURF_DRAWTURB;
     begin_frame();
-    assert(xgl_surfaces[0].detail.contour);
-    assert(profile_counts[XGL_PROFILE_CONTOUR_ATTEMPTS] == 1);
-    assert(profile_counts[XGL_PROFILE_CONTOUR_BUILDS] == 1);
-    assert(profile_counts[XGL_PROFILE_CONTOUR_SAMPLES] > 0);
-    assert(profile_counts[XGL_PROFILE_CONTOUR_EVALUATIONS] > 0);
-    assert_contour_coverage();
-    assert(has_vertical_contour(43));
-    count = captured_count; views = pixel_view_calls; samples = sample_calls;
-    memcpy(first, captured, count * sizeof(*first));
-    assert(views == 1);
-    begin_frame();
-    assert_positions_equal(first, count);
-    assert(pixel_view_calls == views && sample_calls == samples);
-    assert(profile_counts[XGL_PROFILE_CONTOUR_ATTEMPTS] == 0);
-    assert(profile_counts[XGL_PROFILE_CONTOUR_SAMPLES] == 0);
-    assert(profile_counts[XGL_PROFILE_CONTOUR_EVALUATIONS] == 0);
-
-    gamma_scale = .5f; ++color_revision;
-    begin_frame();
-    assert_positions_equal(first, count);
-    assert(pixel_view_calls == views && sample_calls == samples);
-    for (i = 0; i < count; ++i)
-        assert(fabs(captured[i].color[0] - first[i].color[0] * .5f) < .0001);
-    gamma_scale = 1; ++color_revision;
-    r_fullbright.value = 0;
-    begin_frame();
-    memcpy(first, captured, count * sizeof(*first));
-    d_lightstylevalue[0] = 128;
-    begin_frame();
-    assert_positions_equal(first, count);
-    assert(pixel_view_calls == views && sample_calls == samples);
-    for (i = 0; i < count; ++i)
-        assert(fabs(captured[i].color[0] - first[i].color[0] * .5f) < .0001);
-
-    contour_panel(91); ++texture_revision;
-    begin_frame();
-    assert(xgl_surfaces[0].detail.contour && pixel_view_calls == views + 1);
-    assert_contour_coverage();
-    assert(has_vertical_contour(91));
-    views = pixel_view_calls;
-    test_texture.gl_texturenum = 2;
-    begin_frame();
-    assert(xgl_surfaces[0].detail.contour && pixel_view_calls == views + 1);
-    assert_contour_coverage();
-
-    views = pixel_view_calls;
-    xgl_contours.value = 0;
-    begin_frame();
-    assert(!xgl_surfaces[0].detail.contour && captured_count == 96);
-    assert(pixel_view_calls == views);
-    xgl_contours.value = 1;
-    begin_frame();
-    assert(xgl_surfaces[0].detail.contour && pixel_view_calls == views + 1);
-    assert_contour_coverage();
-}
-
-static void test_contour_uv_orientation(void)
-{
-    const float *a, *b;
-    float sa, sb, boundary, length;
-    int mode, i, edge, found;
-    for (mode = 0; mode < 4; ++mode) {
-        setup_world();
-        contour_panel(43);
-        boundary = 43;
-        if (mode == 0) {
-            test_texinfo.vecs[0][0] = -1;
-            test_texinfo.vecs[0][3] = 128;
-        } else if (mode == 1) {
-            test_texinfo.vecs[0][0] = 0; test_texinfo.vecs[0][1] = 1;
-            test_texinfo.vecs[1][0] = -1; test_texinfo.vecs[1][1] = 0;
-            test_texinfo.vecs[1][3] = 128;
-        } else if (mode == 2) test_texinfo.vecs[0][1] = .25f;
-        else {
-            test_texinfo.vecs[0][3] = -128;
-            boundary = -85;
-        }
-        begin_frame();
-        assert(xgl_surfaces[0].detail.contour);
-        assert_contour_coverage();
-        found = 0;
-        for (i = 0; i < captured_count; i += 3) for (edge = 0; edge < 3; ++edge) {
-            a = captured[i + edge].position;
-            b = captured[i + (edge + 1) % 3].position;
-            sa = DotProduct(a, test_texinfo.vecs[0]) + test_texinfo.vecs[0][3];
-            sb = DotProduct(b, test_texinfo.vecs[0]) + test_texinfo.vecs[0][3];
-            length = (a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]);
-            if (fabs(sa - boundary) < 4 && fabs(sb - boundary) < 4 && length > 256)
-                found = 1;
-        }
-        assert(found);
+    mesh = &xgl_surfaces[0].detail;
+    assert(captured_count == 96 && sample_calls == 25 && palette_calls == 25);
+    assert(profile_counts[XGL_PROFILE_WORLD_ANIMATED_VERTICES] == 96);
+    assert(profile_counts[XGL_PROFILE_WORLD_ANIMATED_SAMPLES] == 25);
+    assert(profile_sections[XGL_PROFILE_WORLD_WATER] == 1);
+    assert(profile_sections[XGL_PROFILE_WORLD_SKY] == 0);
+    /* Same positions share samples, without changing any emitted triangle. */
+    for (i = 0; i < mesh->count; ++i) {
+        assert(mesh->sample_vertex[i] <= i);
+        assert(VectorCompare(mesh->vertices[i].position,
+                             mesh->vertices[mesh->sample_vertex[i]].position));
     }
-}
-
-static void test_contour_exclusions_and_budget(void)
-{
-    int which;
-    for (which = 0; which < 6; ++which) {
-        setup_world();
-        contour_panel(43);
-        if (which == 0) contour_alpha = 1;
-        if (which == 1) {
-            test_texture.anim_total = test_texture.anim_max = 2;
-            test_texture.anim_next = &test_texture;
+    test_texinfo.vecs[0][3] = -17; test_texinfo.vecs[1][3] = 23;
+    for (i = 0; i < mesh->count; ++i) {
+        mesh->data[i].st[0] -= 17; mesh->data[i].st[1] += 23;
+    }
+    for (i = 0; i < 4; ++i) {
+        realtime = i == 3 ? 1000000.25 : (i - 1) * .25;
+        gamma_scale = .65f;
+        compare_sample_map(mesh, &test_texture, &r_worldentity);
+        /* Compare the direct-index path with the former RGB-then-gamma
+         * water calculation, including texture translations and long time. */
+        phase = (float)fmod(realtime, 2 * M_PI);
+        for (count = 0; count < mesh->count; ++count) {
+            os = mesh->data[count].st[0] - test_texinfo.vecs[0][3];
+            ot = mesh->data[count].st[1] - test_texinfo.vecs[1][3];
+            s = (os + xgl_turb_sin[(int)((ot * .125f + phase) * XGL_TURB_SCALE) & 255]) / 64;
+            t = (ot + xgl_turb_sin[(int)((os * .125f + phase) * XGL_TURB_SCALE) & 255]) / 64;
+            assert(XGL_SampleTexture(1, s, t, expected, NULL));
+            XGL_PrepareColor(expected);
+            /* Fast math may reassociate the mock's palette/gamma scaling.
+             * Allow float rounding, far below a change of one palette byte. */
+            for (channel = 0; channel < 3; ++channel)
+                assert(fabs((double)expected[channel] -
+                            mesh->vertices[count].color.rgb[channel]) <= FLT_EPSILON);
         }
-        if (which == 2) test_texture.alternate_anims = &test_texture;
-        if (which == 3) test_texture.anim_next = &test_texture;
-        if (which == 4) test_surface.flags = SURF_DRAWTURB;
-        if (which == 5) test_surface.flags = SURF_DRAWSKY;
+    }
+    failed_sample = 1;
+    XGL_UpdateSurfaceMesh(mesh, &test_surface, &test_texture, &r_worldentity);
+    for (i = 0; i < mesh->count; ++i)
+        assert(mesh->vertices[i].color.rgb[0] == .5f * gamma_scale);
+
+    setup_world();
+    test_surface.flags = SURF_DRAWSKY;
+    sky = (texture_t *)calloc(1, sizeof(texture_t) + 256 * 128);
+    assert(sky);
+    sky->width = 256; sky->height = 128; sky->offsets[0] = sizeof(texture_t);
+    sky->gl_texturenum = 1; test_texinfo.texture = sky;
+    pixels = (byte *)sky + sky->offsets[0];
+    for (i = 0; i < 256 * 128; ++i) pixels[i] = (byte)(i * 17 + i / 256);
+    begin_frame();
+    mesh = &xgl_surfaces[0].detail;
+    assert(captured_count == 96 && palette_calls == 25 && prepare_calls == 0);
+    assert(profile_counts[XGL_PROFILE_WORLD_ANIMATED_SAMPLES] == 25);
+    assert(profile_sections[XGL_PROFILE_WORLD_SKY] == 1);
+    memset(&entity, 0, sizeof(entity));
+    entity.model = &test_model;
+    entity.angles[1] = 27; entity.origin[0] = -31; entity.origin[2] = 15;
+    realtime = 1000000.25; gamma_scale = .7f;
+    compare_sample_map(mesh, sky, &entity);
+    XGL_WorldShutdown();
+    free(sky);
+
+    /* Optional sample-map allocation failure leaves the full mesh working.
+     * Exercise each allocation, including cleanup when the sort list fails. */
+    for (failed = 0; failed < 3; ++failed) {
+        setup_world();
+        test_surface.flags = SURF_DRAWTURB; xgl_detailtris.value = 0;
+        bytes = xgl_cache_bytes;
+        fail_alloc_after = failed;
         begin_frame();
-        assert(!xgl_surfaces[0].detail.contour && pixel_view_calls == 0);
-        assert_contour_coverage();
+        assert(captured_count == 6 && xgl_surfaces[0].coarse.sample_vertex == NULL);
+        if (!failed) assert(xgl_cache_bytes == bytes);
+        else assert(xgl_cache_bytes == bytes + 6 * (sizeof(xgl_native_vertex_t) + sizeof(xgl_cached_vertex_t)));
+        assert(sample_calls == 6);
     }
     setup_world();
-    contour_panel(43);
+    test_surface.flags = SURF_DRAWTURB; xgl_detailtris.value = 0;
+    bytes = 6 * (sizeof(xgl_native_vertex_t) + sizeof(xgl_cached_vertex_t));
+    xgl_cache_bytes = XGL_WORLD_CACHE_BYTES - bytes - 4 * 6 + 1;
+    begin_frame();
+    assert(captured_count == 6 && xgl_surfaces[0].coarse.vertices);
+    assert(xgl_surfaces[0].coarse.sample_vertex == NULL && sample_calls == 6);
+    assert(xgl_cache_bytes <= XGL_WORLD_CACHE_BYTES);
+    before = flush_calls;
+    XGL_WorldShutdown();
+    assert(!queued_count && flush_calls == before + 1 && !xgl_cache_bytes);
+}
+
+static void test_borrowed_mesh_lifetime(void)
+{
+    int before;
+    float old_color;
+    setup_world();
     xgl_detailtris.value = 0;
     begin_frame();
-    assert(captured_count == 6 && xgl_detail_used == 0 && pixel_view_calls == 0);
-    assert_contour_coverage();
-    setup_world();
-    contour_panel(43);
-    xgl_cache_bytes = XGL_WORLD_CACHE_BYTES;
-    begin_frame();
-    assert(captured_count == 6 && xgl_detail_used == 0 && pixel_view_calls == 0);
-    assert_contour_coverage();
-    begin_frame();
-    assert(captured_count == 6 && pixel_view_calls == 0);
-}
+    assert(queued_count == 6);
+    before = flush_calls;
+    XGL_DrawSurface(&test_model, &test_surface, &r_worldentity, 1);
+    assert(flush_calls == before && queued_count == 12); /* Unchanged cache batches. */
+    old_color = captured[0].color.rgb[0];
+    gamma_scale = .5f; ++color_revision;
+    XGL_DrawSurface(&test_model, &test_surface, &r_worldentity, 1);
+    assert(flush_calls == before + 1 && queued_count == 6);
+    assert(captured[12].color.rgb[0] == old_color * .5f);
+    XGL_WorldShutdown(); /* The mock checks pointers before the arrays are freed. */
+    assert(!queued_count);
 
-static void test_contour_existing_two_triangle_budget(void)
-{
-    int x, y;
     setup_world();
-    contour_pixel_view = 1;
-    for (y = 0; y < 128; ++y)
-        for (x = 0; x < 128; ++x)
-            contour_pixels[y * 128 + x] = x + y >= 128 ? 232 : 24;
-    xgl_subdivide.value = 128;
-    xgl_detailtris.value = 2;
+    test_surface.flags = SURF_DRAWTURB; xgl_detailtris.value = 0;
     begin_frame();
-    /* A useful contour can change the diagonal without adding triangles.
-     * Equal-sized coarse/detail meshes must still select that contour. */
-    assert(xgl_surfaces[0].detail.contour);
-    assert(xgl_surfaces[0].detail.count == xgl_surfaces[0].coarse.count);
-    assert(xgl_surfaces[0].detail_frame == r_framecount);
-    assert(captured_count == 6 && xgl_detail_used == 2);
-    assert(fabs(captured[0].color[0] - captured[3].color[0]) > .1);
-    assert_contour_coverage();
-}
-
-static void test_contour_one_analysis_per_frame_and_inline_brush(void)
-{
-    msurface_t surfaces[2], *marks[2];
-    model_t inline_model;
-    entity_t inline_entity;
-    int views;
-    setup_world();
-    contour_panel(43);
-    surfaces[0] = surfaces[1] = test_surface;
-    marks[0] = &surfaces[0]; marks[1] = &surfaces[1];
-    test_model.surfaces = surfaces;
-    test_model.numsurfaces = test_model.nummodelsurfaces = 2;
-    test_node.numsurfaces = 2;
-    test_leaves[1].firstmarksurface = marks;
-    test_leaves[1].nummarksurfaces = 2;
-    XGL_WorldNewMap();
-    begin_frame();
-    assert(pixel_view_calls == 1);
-    assert(xgl_surfaces[0].detail.contour + xgl_surfaces[1].detail.contour == 1);
-    begin_frame();
-    assert(pixel_view_calls == 2);
-    assert(xgl_surfaces[0].detail.contour && xgl_surfaces[1].detail.contour);
-    begin_frame();
-    assert(pixel_view_calls == 2);
-
-    /* Inline brush model shares all backing arrays with the world. Its
-     * faces must not acquire contour meshes even when they are nearby. */
-    test_model.nummodelsurfaces = 1;
-    test_node.numsurfaces = 1;
-    test_leaves[1].nummarksurfaces = 1;
-    inline_model = test_model;
-    inline_model.firstmodelsurface = 1; inline_model.nummodelsurfaces = 1;
-    memset(&inline_entity, 0, sizeof(inline_entity));
-    inline_entity.model = &inline_model;
-    XGL_WorldNewMap();
-    begin_frame();
-    assert(xgl_surfaces[0].detail.contour && !xgl_surfaces[1].detail.contour);
-    views = pixel_view_calls;
-    ++r_framecount; captured_count = 0;
-    XGL_DrawBrushModel(&inline_entity);
-    assert(captured_count == 96 && !xgl_surfaces[1].detail.contour);
-    assert(pixel_view_calls == views);
-    assert_contour_coverage();
+    before = flush_calls; old_color = captured[0].color.rgb[0];
+    realtime = .25;
+    XGL_DrawSurface(&test_model, &test_surface, &r_worldentity, 1);
+    assert(flush_calls == before + 1 && queued_count == 6);
+    assert(captured[6].color.rgb[0] != old_color);
     XGL_WorldShutdown();
 }
 
 int main(void)
 {
+    test_shared_animated_samples();
+    test_borrowed_mesh_lifetime();
     test_cache_and_styles();
     test_projected_detail_priority();
     test_pvs_and_fallback();
     test_profile_cache_events();
     test_brush_water_and_point_light();
     test_animated_water_and_sky();
-    test_contour_cache_lighting_and_replacement();
-    test_contour_uv_orientation();
-    test_contour_exclusions_and_budget();
-    test_contour_existing_two_triangle_budget();
-    test_contour_one_analysis_per_frame_and_inline_brush();
     XGL_WorldShutdown();
     assert(xgl_cache_bytes == 0 && xgl_surfaces == NULL);
     puts("XGL world/light contracts passed");

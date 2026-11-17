@@ -2,7 +2,7 @@
 # Existing software, XIL and OpenGL build recipes remain independent.
 
 CC = gcc
-CFLAGS ?= -O2 -fno-strict-aliasing -fcommon
+CFLAGS ?= -O2 -ffast-math -fno-strict-aliasing -fcommon
 CPPFLAGS ?=
 LDFLAGS ?=
 LANGFLAGS ?=
@@ -12,7 +12,7 @@ OPENWINHOME ?= /usr/openwin
 BUILD_DIR ?= build/xgl
 HOST_CC ?= cc
 HOST_X11_INCLUDE ?=
-HOST_CFLAGS ?= -O2 -std=gnu89 -Wall -Wextra
+HOST_CFLAGS ?= -O2 -ffast-math -std=gnu89 -Wall -Wextra
 TEST_BUILD_DIR ?= build/xgl-tests
 
 XGL_CPPFLAGS = -DXGLQUAKE -D__EXTENSIONS__ -I$(XGLHOME)/include -I$(OPENWINHOME)/include
@@ -27,12 +27,17 @@ COMMON_SOURCES = chase.c cl_demo.c cl_input.c cl_main.c cl_parse.c cl_tent.c \
     cd_null.c sys_sun.c snd_dma.c snd_mem.c snd_mix.c
 XGL_SOURCES = xgl_model.c xgl_mesh.c xgl_texture.c xgl_rmain.c xgl_world.c \
     xgl_light.c xgl_draw.c xgl_vid.c xgl_backend.c xgl_screen.c \
-    xgl_effects.c xgl_entities.c xgl_filesystem.c xgl_snd_sun.c xgl_profile.c xgl_contour.c
+    xgl_effects.c xgl_entities.c xgl_filesystem.c xgl_snd_sun.c xgl_profile.c
 SOURCES = $(COMMON_SOURCES) $(XGL_SOURCES)
 OBJECTS = $(SOURCES:%.c=$(BUILD_DIR)/%.o)
+DEPS = $(OBJECTS:.o=.d)
+MISSING_DEPS = $(filter-out $(wildcard $(DEPS)),$(DEPS))
+# Host test recipes compile several sources at once and retain their own
+# conservative header prerequisites.
 HEADERS = $(wildcard *.h)
 
-.PHONY: all native sdk-check clean check host-check native-contract-check print-sources
+.DELETE_ON_ERROR:
+.PHONY: all native sdk-check clean check host-check native-contract-check print-sources missing-deps
 all: native
 
 native: sdk-check
@@ -44,9 +49,18 @@ sdk-check:
 	@test -f "$(OPENWINHOME)/include/X11/Xlib.h" || { \
 	    echo "Missing OpenWindows headers; set OPENWINHOME to their installation." >&2; exit 1; }
 
-$(BUILD_DIR)/%.o: %.c $(HEADERS)
+# Older builds have no .d files. Rebuild those objects once to establish
+# complete dependencies, also recovering safely if a .d file is removed.
+ifneq ($(MISSING_DEPS),)
+$(MISSING_DEPS:.d=.o): missing-deps
+endif
+missing-deps:
+
+$(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(XGL_CPPFLAGS) $(CFLAGS) $(LANGFLAGS) $(WARNFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(XGL_CPPFLAGS) $(CFLAGS) $(LANGFLAGS) $(WARNFLAGS) \
+	    -MMD -MP -MF $(@:.o=.d.tmp) -MT $@ -c $< -o $@
+	@mv -f $(@:.o=.d.tmp) $(@:.o=.d)
 
 xglquake: $(OBJECTS)
 	$(CC) $(LDFLAGS) $(XGL_LDFLAGS) -o $@ $(OBJECTS) $(XGL_LIBS)
@@ -62,7 +76,8 @@ check: $(TEST_BUILD_DIR)/test_texture $(TEST_BUILD_DIR)/test_mesh \
        $(TEST_BUILD_DIR)/test_draw $(TEST_BUILD_DIR)/test_entities \
        $(TEST_BUILD_DIR)/test_world $(TEST_BUILD_DIR)/test_input \
        $(TEST_BUILD_DIR)/test_filesystem $(TEST_BUILD_DIR)/test_audio \
-       $(TEST_BUILD_DIR)/test_profile $(TEST_BUILD_DIR)/test_contour
+       $(TEST_BUILD_DIR)/test_profile $(TEST_BUILD_DIR)/test_effects \
+       $(TEST_BUILD_DIR)/test_alias_colors
 	./$(TEST_BUILD_DIR)/test_texture
 	./$(TEST_BUILD_DIR)/test_mesh
 	./$(TEST_BUILD_DIR)/test_draw
@@ -72,11 +87,17 @@ check: $(TEST_BUILD_DIR)/test_texture $(TEST_BUILD_DIR)/test_mesh \
 	./$(TEST_BUILD_DIR)/test_filesystem
 	./$(TEST_BUILD_DIR)/test_audio
 	./$(TEST_BUILD_DIR)/test_profile
-	./$(TEST_BUILD_DIR)/test_contour
+	./$(TEST_BUILD_DIR)/test_effects
+	./$(TEST_BUILD_DIR)/test_alias_colors
 
-$(TEST_BUILD_DIR)/test_contour: xgl_tests/test_contour.c xgl_contour.c xgl_contour.h
+$(TEST_BUILD_DIR)/test_alias_colors: xgl_tests/test_alias_colors.c xgl_entities.c xgl_texture.c mathlib.c $(HEADERS)
 	@mkdir -p $(TEST_BUILD_DIR)
-	$(HOST_CC) $(HOST_CFLAGS) -I. -o $@ xgl_tests/test_contour.c -lm
+	$(HOST_CC) $(HOST_CFLAGS) -DXGLQUAKE -I. -ffunction-sections -fdata-sections \
+	    -o $@ xgl_tests/test_alias_colors.c xgl_texture.c mathlib.c -Wl,--gc-sections -lm
+
+$(TEST_BUILD_DIR)/test_effects: xgl_tests/test_effects.c xgl_effects.c $(HEADERS)
+	@mkdir -p $(TEST_BUILD_DIR)
+	$(HOST_CC) $(HOST_CFLAGS) -DXGLQUAKE -I. -o $@ xgl_tests/test_effects.c -lm
 
 $(TEST_BUILD_DIR)/test_audio: xgl_tests/test_audio.c xgl_snd_sun.c $(HEADERS) \
                              xgl_tests/include/sys/audioio.h
@@ -111,10 +132,10 @@ $(TEST_BUILD_DIR)/test_entities: xgl_tests/test_entities.c xgl_entities.c mathli
 	$(HOST_CC) $(HOST_CFLAGS) -DXGLQUAKE -I. -ffunction-sections -fdata-sections \
 	    -o $@ xgl_tests/test_entities.c mathlib.c -Wl,--gc-sections -lm
 
-$(TEST_BUILD_DIR)/test_world: xgl_tests/test_world.c xgl_world.c xgl_light.c xgl_contour.c mathlib.c $(HEADERS)
+$(TEST_BUILD_DIR)/test_world: xgl_tests/test_world.c xgl_world.c xgl_light.c mathlib.c $(HEADERS)
 	@mkdir -p $(TEST_BUILD_DIR)
 	$(HOST_CC) $(HOST_CFLAGS) -DXGLQUAKE -I. -ffunction-sections -fdata-sections \
-	    -o $@ xgl_tests/test_world.c xgl_light.c xgl_contour.c mathlib.c -Wl,--gc-sections -lm
+	    -o $@ xgl_tests/test_world.c xgl_light.c mathlib.c -Wl,--gc-sections -lm
 
 $(TEST_BUILD_DIR)/test_input: xgl_tests/test_input.c xgl_vid.c $(HEADERS) \
                            $(wildcard xgl_tests/include/X11/*.h)
@@ -138,4 +159,8 @@ print-sources:
 	@echo $(SOURCES)
 
 clean:
-	rm -f $(OBJECTS) xglquake
+	rm -f $(OBJECTS) $(DEPS) $(DEPS:.d=.d.tmp) xglquake
+
+# Keep this after the default target; a dependency file must not change it.
+# Read existing files only: missing ones are generated with their objects.
+-include $(wildcard $(DEPS))

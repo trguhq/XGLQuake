@@ -26,7 +26,7 @@ cvar_t r_fullbright = {"r_fullbright", "0", false, false, 0, NULL};
 cvar_t r_wateralpha = {"r_wateralpha", "1", false, false, 0, NULL};
 cvar_t r_dynamic = {"r_dynamic", "1", false, false, 0, NULL};
 cvar_t r_novis = {"r_novis", "0", false, false, 0, NULL};
-extern cvar_t xgl_subdivide, xgl_detailtris, xgl_detaildistance, xgl_contours;
+extern cvar_t xgl_subdivide, xgl_detailtris, xgl_detaildistance;
 void V_SetContentsColor(int contents);
 
 void R_InitTextures (void)
@@ -83,7 +83,6 @@ void R_Init (void)
     Cvar_RegisterVariable(&xgl_subdivide);
     Cvar_RegisterVariable(&xgl_detailtris);
     Cvar_RegisterVariable(&xgl_detaildistance);
-    Cvar_RegisterVariable(&xgl_contours);
     Cmd_AddCommand("timerefresh", XGL_TimeRefresh_f);
     Cmd_AddCommand("pointfile", R_ReadPointFile_f);
     XGL_TextureInit();
@@ -138,6 +137,7 @@ static void XGL_SetFrustum (void)
 void R_RenderView (void)
 {
     double start, section_start;
+    xgl_profile_draw_scope_t draw_scope;
     if (r_norefresh.value || !cl.worldmodel) return;
     start = r_speeds.value ? Sys_FloatTime() : 0;
     if (cl.maxclients > 1 && r_fullbright.value) Cvar_Set("r_fullbright", "0");
@@ -164,11 +164,15 @@ void R_RenderView (void)
     XGL_ProfileAdd(XGL_PROFILE_ENTITIES, section_start);
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
+    XGL_ProfileDrawBegin(&draw_scope);
     R_DrawParticles();
+    XGL_ProfileDrawEnd(&draw_scope, XGL_PROFILE_DRAW_PARTICLES);
     XGL_ProfileAdd(XGL_PROFILE_EFFECTS, section_start);
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
+    XGL_ProfileDrawBegin(&draw_scope);
     XGL_DrawWater();
+    XGL_ProfileDrawEnd(&draw_scope, XGL_PROFILE_DRAW_WATER);
     XGL_ProfileAdd(XGL_PROFILE_EFFECTS, section_start);
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
