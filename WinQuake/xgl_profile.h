@@ -12,6 +12,9 @@ typedef enum {
     XGL_PROFILE_SUBMIT,
     XGL_PROFILE_SYNC,
     XGL_PROFILE_SWAP,
+    /* Time in lit/unlit and blending attribute calls. It does not overlap
+     * submission, but a device may defer part of the cost to the next batch. */
+    XGL_PROFILE_STATE,
     /* Detail timers are enabled only by xgl_profile 2. They overlap the
      * renderer stages above; detail selection also includes mesh builds. */
     XGL_PROFILE_WORLD_VISIBILITY,
@@ -25,7 +28,6 @@ typedef enum {
     XGL_PROFILE_WORLD_WATER,
     XGL_PROFILE_ALIAS_CACHE,
     XGL_PROFILE_ALIAS_TRANSFORM,
-    XGL_PROFILE_WEAPON_CLEAR,
     XGL_PROFILE_ALIAS_LIGHT,
     XGL_PROFILE_WEAPON_LIGHT,
     XGL_PROFILE_SMP_PREPASS,
@@ -39,6 +41,7 @@ typedef enum {
     XGL_PROFILE_GLYPHS,
     XGL_PROFILE_POLYGON_CALLS,
     XGL_PROFILE_WAIT_CALLS,
+    XGL_PROFILE_STATE_CHANGES,
     /* Detail counters use per-frame averages in the report. Cached world
      * draws include a mesh built earlier in the same frame; they are not
      * lookup hits and must not be divided by the build count as a hit rate. */
@@ -68,6 +71,8 @@ typedef enum {
     XGL_PROFILE_ALIAS_TOPOLOGY_HITS,
     XGL_PROFILE_ALIAS_TOPOLOGY_MISSES,
     XGL_PROFILE_SMP_JOBS,
+    XGL_PROFILE_SMP_HELPED,
+    XGL_PROFILE_WORLD_EVICTIONS,
     XGL_PROFILE_COUNTER_COUNT
 } xgl_profile_counter_t;
 
@@ -75,9 +80,7 @@ typedef enum {
     XGL_PROFILE_DRAW_ALIAS,
     XGL_PROFILE_DRAW_BRUSH,
     XGL_PROFILE_DRAW_SPRITE,
-    XGL_PROFILE_DRAW_WEAPON_SETUP,
     XGL_PROFILE_DRAW_WEAPON_DRAW,
-    XGL_PROFILE_DRAW_WEAPON_FINISH,
     XGL_PROFILE_DRAW_PARTICLES,
     XGL_PROFILE_DRAW_WATER,
     XGL_PROFILE_DRAW_ALIAS_OUTPUT,

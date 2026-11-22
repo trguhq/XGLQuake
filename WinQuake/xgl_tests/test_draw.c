@@ -105,7 +105,7 @@ void XGL_UIFlush(void) { (void)next_op('F'); }
 
 static void reset_ops(void)
 {
-    assert(!ui_run_length);
+    assert(!ui_run_length && !ui_number_length);
     num_ops=0;
 }
 
@@ -194,6 +194,8 @@ static void test_pictures_and_translation(void)
     Draw_Pic(24,0,Draw_PicFromWad("num_slash"));
     assert(has_text("/"));
     Draw_Pic(48,0,Draw_PicFromWad("anum_7"));
+    assert(!has_text("7")); /* A digit waits for the rest of its number. */
+    XGL_DrawFlush();
     assert(has_text("7"));
     reset_ops();
     Draw_Pic(0,0,Draw_PicFromWad("inv_shotgun"));
@@ -230,6 +232,51 @@ static void test_pictures_and_translation(void)
     assert(num_ops==1 && ops[0].kind=='F');
 }
 
+static void test_number_runs(void)
+{
+    qpic_t *digits[10], *alternate, *minus;
+    char name[16];
+    int i;
+    for (i = 0; i < 10; ++i) {
+        sprintf(name, "num_%d", i);
+        digits[i] = Draw_PicFromWad(name);
+    }
+    alternate = Draw_PicFromWad("anum_3");
+    minus = Draw_PicFromWad("num_minus");
+    /* Sbar_DrawNum sends "100" as three 24-pixel pictures. They become one
+     * native text call, centred over the cells the digits occupy. */
+    reset_ops();
+    Draw_TransPic(24,0,digits[1]);
+    Draw_TransPic(48,0,digits[0]);
+    Draw_TransPic(72,0,digits[0]);
+    assert(num_ops==0);
+    /* A gap, another colour or another row starts a new number. */
+    Draw_TransPic(120,0,digits[5]);
+    assert(num_ops==1 && ops[0].kind=='T' && !strcmp(ops[0].text,"100"));
+    assert(ops[0].width==10 && ops[0].height==16 && ops[0].color==UI_WHITE);
+    assert(ops[0].x==24+(72-30)*.5f && ops[0].y==4);
+    Draw_TransPic(144,0,alternate);
+    assert(num_ops==2 && !strcmp(ops[1].text,"5") && ops[1].x==120+(24-10)*.5f);
+    Draw_TransPic(168,24,digits[9]);
+    assert(num_ops==3 && !strcmp(ops[2].text,"3") && ops[2].color==251);
+    /* Any other drawing ends the number first, keeping painter's order. */
+    Draw_Fill(0,100,8,8,7);
+    assert(num_ops==5 && ops[3].kind=='T' && !strcmp(ops[3].text,"9") && ops[4].kind=='Q');
+    Draw_TransPic(0,48,minus);
+    Draw_TransPic(24,48,digits[7]);
+    Draw_Character(100,48,'A');
+    assert(num_ops==6 && !strcmp(ops[5].text,"-7") && ui_run_length==1);
+    Draw_TransPic(0,72,digits[4]);
+    assert(num_ops==7 && !strcmp(ops[6].text,"A") && ui_number_length==1);
+    XGL_DrawFlush();
+    assert(num_ops==9 && !strcmp(ops[7].text,"4") && ops[8].kind=='F');
+    /* Longer than the buffer: split, never overrun. */
+    reset_ops();
+    for (i = 0; i < XGL_DRAW_NUMBER + 2; ++i) Draw_TransPic(i*24,0,digits[i%10]);
+    XGL_DrawFlush();
+    assert(num_ops==3 && strlen(ops[0].text)==XGL_DRAW_NUMBER && !strcmp(ops[1].text,"23"));
+}
+
 int main(void)
 {
     memset(&vid,0,sizeof(vid));
@@ -242,6 +289,7 @@ int main(void)
     test_metadata_and_menus();
     test_cells_and_order();
     test_pictures_and_translation();
+    test_number_runs();
     puts("XGL UI adapter semantic tests passed (no device rendering)");
     return 0;
 }

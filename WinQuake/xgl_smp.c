@@ -8,7 +8,8 @@
 #include "xgl_profile.h"
 #include "xgl_smp.h"
 
-#define XGL_SMP_QUEUE_SIZE 8
+/* Large enough for every job the renderer prepares in one frame. */
+#define XGL_SMP_QUEUE_SIZE 32
 
 typedef struct {
     void (*function)(void *);
@@ -150,7 +151,10 @@ int XGL_SMPActive(void)
 int XGL_SMPSubmit(void (*function)(void *), void *argument)
 {
     int tail, accepted;
-    if (!xgl_smp_active || !function || pthread_mutex_trylock(&xgl_smp_mutex)) return 0;
+    if (!xgl_smp_active || !function) return 0;
+    /* The worker holds this lock for a few instructions only, so waiting is
+     * cheaper than refusing a job the main thread would then run itself. */
+    pthread_mutex_lock(&xgl_smp_mutex);
     accepted = xgl_smp_count < XGL_SMP_QUEUE_SIZE;
     if (accepted) {
         tail = (xgl_smp_head + xgl_smp_count) % XGL_SMP_QUEUE_SIZE;
@@ -162,6 +166,23 @@ int XGL_SMPSubmit(void (*function)(void *), void *argument)
     }
     pthread_mutex_unlock(&xgl_smp_mutex);
     return accepted;
+}
+
+int XGL_SMPTake(void (**function)(void *), void **argument)
+{
+    int tail, taken;
+    if (!xgl_smp_active || !function || !argument) return 0;
+    pthread_mutex_lock(&xgl_smp_mutex);
+    taken = xgl_smp_count > 0;
+    if (taken) {
+        /* Newest first: the worker continues in order from the other end. */
+        tail = (xgl_smp_head + xgl_smp_count - 1) % XGL_SMP_QUEUE_SIZE;
+        *function = xgl_smp_queue[tail].function;
+        *argument = xgl_smp_queue[tail].argument;
+        --xgl_smp_count;
+    }
+    pthread_mutex_unlock(&xgl_smp_mutex);
+    return taken;
 }
 
 void XGL_SMPWait(void)

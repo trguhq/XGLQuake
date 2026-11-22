@@ -4,6 +4,16 @@
 
 #define BACKFACE_EPSILON 0.01
 
+/* The view weapon is drawn shrunk toward the eye by this factor: its image
+ * is unchanged, but its depth lies in front of the world, so it needs no
+ * depth clear. The near plane moves in by the same factor, which clips the
+ * weapon exactly where the original four-unit plane did. */
+#define XGL_VIEWMODEL_SCALE 0.125f
+#define XGL_NEAR_CLIP (4.0 * XGL_VIEWMODEL_SCALE)
+/* Particles keep the original four-unit limit: one at the eye would
+ * otherwise fill the view. */
+#define XGL_PARTICLE_NEAR 4.0f
+
 typedef enum {
     pt_static, pt_grav, pt_slowgrav, pt_fire, pt_explode, pt_explode2, pt_blob, pt_blob2
 } ptype_t;
@@ -73,7 +83,9 @@ void XGL_PreparePaletteColor(int index, float rgb[3]);
 void XGL_Flush(void);
 void XGL_EndScene(void);
 void XGL_EndFrame(void);
-void XGL_SetViewModel(int enabled);
+/* Nonzero while a dynamic point light or reduced ambient light makes lit
+ * submission differ from unlit. Valid after XGL_BeginScene. */
+int XGL_LightsActive(void);
 void XGL_UIText(float x, float y, const char *text, int color,
                 float cell_width, float height);
 void XGL_UIFill(float x, float y, float width, float height,
@@ -104,11 +116,16 @@ void XGL_SubdivideSurface(msurface_t *surface);
 void XGL_WorldNewMap(void);
 void XGL_WorldShutdown(void);
 void XGL_DrawWorld(void);
+void XGL_DrawWorldSpecial(void);
 void XGL_DrawBrushModel(entity_t *entity);
 void XGL_DrawWater(void);
 void XGL_AliasPrepareFrame(void);
 void XGL_AliasFinishFrame(void);
-void XGL_DrawEntities(void);
+/* Entity drawing is split by native state so that R_RenderView can order
+ * the frame with as few lit/unlit changes as possible. */
+void XGL_DrawBrushEntities(void);
+void XGL_DrawSprites(void);
+void XGL_DrawAliasEntities(void);
 void XGL_DrawViewModel(void);
 void XGL_EntitiesInit(void);
 void XGL_EntitiesShutdown(void);

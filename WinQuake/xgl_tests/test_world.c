@@ -10,9 +10,28 @@ static void *test_malloc(size_t bytes)
     if (fail_alloc_after > 0) --fail_alloc_after;
     return malloc(bytes);
 }
+/* Count frustum tests without changing their result. The macro also
+ * renames mathlib.h's prototype, which then declares the wrapper. */
+static int box_tests, angle_calls;
 #define malloc test_malloc
+#define BoxOnPlaneSide test_box_side
+#define AngleVectors test_angle_vectors
 #include "../xgl_world.c"
+#undef AngleVectors
+#undef BoxOnPlaneSide
 #undef malloc
+int BoxOnPlaneSide(vec3_t emins, vec3_t emaxs, struct mplane_s *plane);
+int test_box_side(vec3_t emins, vec3_t emaxs, struct mplane_s *plane)
+{
+    ++box_tests;
+    return BoxOnPlaneSide(emins, emaxs, plane);
+}
+void AngleVectors(vec3_t angles, vec3_t forward, vec3_t right, vec3_t up);
+void test_angle_vectors(vec3_t angles, vec3_t forward, vec3_t right, vec3_t up)
+{
+    ++angle_calls;
+    AngleVectors(angles, forward, right, up);
+}
 
 client_state_t cl;
 lightstyle_t cl_lightstyle[MAX_LIGHTSTYLES];
@@ -21,6 +40,7 @@ vec3_t r_origin, vpn;
 mleaf_t *r_viewleaf;
 int r_framecount, r_visframecount, c_brush_polys;
 cvar_t r_fullbright, r_wateralpha, r_novis;
+mplane_t frustum[4];
 double realtime;
 byte xgl_palette[768];
 
@@ -39,7 +59,7 @@ static byte test_samples[81];
 static efrag_t test_efrag;
 static byte test_vis;
 static int pvs_calls, sample_calls, efrag_calls, reject_box;
-static int smp_active, alias_prepasses;
+static int smp_active, alias_prepasses, lights_active, gamma_copies;
 static xgl_native_vertex_t captured[1024];
 static const xgl_native_vertex_t *queued[1024];
 static xgl_native_vertex_t queued_copy[1024];
@@ -76,6 +96,19 @@ void XGL_AliasPrepareFrame(void)
 void XGL_AudioUpdate(void) {}
 unsigned int XGL_TextureRevision(int id) { assert(id == 1 || id == 2); return texture_revision; }
 unsigned int XGL_ColorRevision(void) { return color_revision; }
+int XGL_LightsActive(void) { return lights_active; }
+/* The backend's 256-entry gamma output table. World colors index it with an
+ * integer level; the volatile store keeps fast math from reassociating. */
+void XGL_CopyGammaOutput(float output[256])
+{
+    volatile float level;
+    int i;
+    ++gamma_copies;
+    for (i = 0; i < 256; ++i) {
+        level = (float)i / 255.0f;
+        output[i] = level * gamma_scale;
+    }
+}
 void XGL_PrepareColor(float rgb[3])
 {
     int i;
@@ -186,6 +219,18 @@ xgl_native_vertex_t *XGL_ReserveTriangles(int *count, int lit, float opacity, in
     return vertices;
 }
 
+/* Four planes that either contain every box or exclude every box. */
+static void set_frustum(int reject)
+{
+    int i;
+    memset(frustum, 0, sizeof(frustum));
+    for (i = 0; i < 4; ++i) {
+        frustum[i].normal[0] = 1;
+        frustum[i].dist = reject ? 1000000.0f : -1000000.0f;
+        frustum[i].type = PLANE_ANYZ;
+    }
+}
+
 static void begin_frame(void)
 {
     XGL_Flush(); /* The preceding frame has completed. */
@@ -193,7 +238,9 @@ static void begin_frame(void)
     captured_count = captured_calls = 0;
     memset(profile_counts, 0, sizeof(profile_counts));
     memset(profile_sections, 0, sizeof(profile_sections));
+    set_frustum(reject_box);
     XGL_DrawWorld();
+    XGL_DrawWorldSpecial(); /* Sky and water follow the walls in a frame. */
 }
 
 static float captured_area(void)
@@ -279,9 +326,16 @@ static void setup_world(void)
     xgl_subdivide.value = 32;
     xgl_detailtris.value = 4096;
     xgl_detaildistance.value = 768;
+    /* Most contracts exercise on-demand building without a per-frame limit;
+     * map-load building and the limit have tests of their own. */
+    xgl_world_prebuild = 0;
+    xgl_detailbuild.value = 0;
+    lights_active = 1;
+    xgl_gamma_revision = 0;
     for (i = 0; i < 256; ++i) d_lightstylevalue[i] = 256;
     pvs_calls = sample_calls = efrag_calls = reject_box = captured_count = 0;
     captured_calls = varying_material = prepare_calls = filter_calls = 0;
+    gamma_copies = box_tests = angle_calls = 0;
     color_revision = texture_revision = 1; gamma_scale = 1;
     palette_calls = failed_sample = flush_calls = 0;
     for (i = 0; i < 256; ++i)
@@ -369,14 +423,18 @@ static void test_cache_and_styles(void)
     assert(fabs(captured_area() - 128 * 128) < .01);
     assert(xgl_cache_bytes <= XGL_WORLD_CACHE_BYTES);
     original = captured[0].color.rgb[0];
-    samples = sample_calls; count = captured_count; prepares = prepare_calls;
-    assert(filter_calls == count);
+    /* Material .8 is byte 204; a lightmap sample of 64 is half brightness:
+     * level 102 of 255, taken through the gamma table. */
+    assert(fabs(original - 102.0f / 255) < .0001);
+    samples = sample_calls; count = captured_count; prepares = gamma_copies;
+    assert(filter_calls == count && prepares == 1 && !prepare_calls);
     begin_frame();
     assert(captured_count == count && sample_calls == samples && pvs_calls == 1);
-    assert(efrag_calls == 2 && prepare_calls == prepares);
+    assert(efrag_calls == 2 && gamma_copies == prepares);
     gamma_scale = .5f; ++color_revision;
     begin_frame();
-    assert(sample_calls == samples && prepare_calls == prepares + count);
+    /* A gamma change refetches the table once; textures are not resampled. */
+    assert(sample_calls == samples && gamma_copies == prepares + 1);
     assert(fabs(captured[0].color.rgb[0] - original * .5f) < .0001);
     gamma_scale = 1; ++color_revision;
     begin_frame();
@@ -727,6 +785,386 @@ static void test_borrowed_mesh_lifetime(void)
     XGL_WorldShutdown();
 }
 
+/* Two square faces on the z=0 plane, in BSP order, spanning the given x
+ * ranges and 0..size in y. Storage is static: the world keeps pointers. */
+static msurface_t pair_surfaces[2], *pair_marks[2];
+static mvertex_t pair_vertices[8];
+static medge_t pair_edges[8];
+static int pair_surfedges[8];
+
+static void setup_pair(float x0, float size0, float x1, float size1)
+{
+    float minimum, size;
+    int i, j;
+    setup_world();
+    pair_surfaces[0] = pair_surfaces[1] = test_surface;
+    memset(pair_vertices, 0, sizeof(pair_vertices));
+    memset(pair_edges, 0, sizeof(pair_edges));
+    for (i = 0; i < 2; ++i) {
+        minimum = i ? x1 : x0; size = i ? size1 : size0;
+        pair_vertices[i * 4].position[0] = minimum;
+        pair_vertices[i * 4 + 1].position[0] = minimum + size;
+        pair_vertices[i * 4 + 2].position[0] = minimum + size;
+        pair_vertices[i * 4 + 2].position[1] = size;
+        pair_vertices[i * 4 + 3].position[0] = minimum;
+        pair_vertices[i * 4 + 3].position[1] = size;
+        for (j = 0; j < 4; ++j) {
+            pair_edges[i * 4 + j].v[0] = i * 4 + j;
+            pair_edges[i * 4 + j].v[1] = i * 4 + (j + 1) % 4;
+            pair_surfedges[i * 4 + j] = i * 4 + j;
+        }
+        pair_surfaces[i].firstedge = i * 4;
+        pair_marks[i] = &pair_surfaces[i];
+    }
+    test_model.surfaces = pair_surfaces;
+    test_model.numsurfaces = test_model.nummodelsurfaces = 2;
+    test_model.vertexes = pair_vertices; test_model.edges = pair_edges;
+    test_model.surfedges = pair_surfedges;
+    test_node.numsurfaces = 2;
+    test_leaves[1].firstmarksurface = pair_marks; test_leaves[1].nummarksurfaces = 2;
+    XGL_WorldNewMap();
+}
+
+static void test_unlit_without_dynamic_light(void)
+{
+    entity_t entity;
+    float lit_color;
+    setup_world();
+    xgl_detailtris.value = 0;
+    begin_frame();
+    assert(captured_count == 6 && captured_lit == 1);
+    lit_color = captured[0].color.rgb[0];
+    /* Baked light is in the vertex colors. With no dynamic light and full
+     * ambient, illumination would return those colors unchanged, so walls
+     * and brush entities are submitted unlit, with exactly the same colors. */
+    lights_active = 0;
+    begin_frame();
+    assert(captured_count == 6 && captured_lit == 0 && captured_zwrite == 1);
+    assert(captured[0].color.rgb[0] == lit_color);
+    assert(profile_counts[XGL_PROFILE_WORLD_COLOR_HITS] == 1);
+    memset(&entity, 0, sizeof(entity));
+    entity.model = &test_model;
+    captured_count = 0;
+    XGL_DrawBrushModel(&entity);
+    assert(captured_count == 6 && captured_lit == 0);
+    lights_active = 1;
+    captured_count = 0;
+    XGL_DrawBrushModel(&entity);
+    assert(captured_count == 6 && captured_lit == 1);
+    /* The streamed fallback follows the same rule. */
+    setup_world();
+    xgl_cache_bytes = XGL_WORLD_CACHE_BYTES;
+    lights_active = 0;
+    begin_frame();
+    assert(captured_count == 6 && captured_lit == 0);
+    assert(profile_counts[XGL_PROFILE_WORLD_FALLBACK_SURFACES] == 1);
+}
+
+static void test_map_load_prebuild(void)
+{
+    int samples;
+    setup_world();
+    xgl_world_prebuild = 1;
+    XGL_WorldNewMap();
+    /* The coarse mesh, its bounds and its filtered material samples exist
+     * before the first frame; no light or gamma work was needed for them. */
+    assert(xgl_surfaces[0].coarse.vertices && xgl_surfaces[0].coarse.count == 6);
+    assert(xgl_surfaces[0].coarse_attempted && xgl_surfaces[0].center_valid);
+    assert(filter_calls == 6 && !gamma_copies && !captured_calls);
+    assert(xgl_surfaces[0].coarse.texture == 1);
+    samples = sample_calls;
+    xgl_detailtris.value = 0;
+    begin_frame();
+    /* The first frame only applies light: nothing is built or sampled. */
+    assert(captured_count == 6 && sample_calls == samples && filter_calls == 6);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 0);
+    assert(profile_counts[XGL_PROFILE_WORLD_COLOR_UPDATES] == 1);
+    assert(profile_sections[XGL_PROFILE_WORLD_BUILD] == 0);
+    assert(fabs(captured[0].color.rgb[0] - 102.0f / 255) < .0001);
+    /* Detail is still built on demand. */
+    xgl_detailtris.value = 4096;
+    begin_frame();
+    assert(captured_count == 96 && profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 1);
+    assert(filter_calls == 6 + 96);
+    /* Sky and water are prebuilt as geometry only; their colors are animated. */
+    setup_world();
+    test_surface.flags = SURF_DRAWTURB;
+    xgl_world_prebuild = 1;
+    XGL_WorldNewMap();
+    assert(xgl_surfaces[0].coarse.vertices && !filter_calls && !sample_calls);
+    /* Beyond its share of the cache, load-time building leaves the remaining
+     * faces to be built when they are first seen. */
+    setup_world();
+    xgl_world_prebuild = 1;
+    xgl_prebuild_bytes = 0;
+    XGL_WorldNewMap();
+    xgl_prebuild_bytes = XGL_WORLD_CACHE_BYTES / 8 * 5;
+    assert(!xgl_surfaces[0].coarse.vertices && !xgl_surfaces[0].coarse_attempted);
+    xgl_detailtris.value = 0;
+    begin_frame();
+    assert(captured_count == 6 && profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 1);
+    /* A failed load-time build leaves the complete streamed fallback. */
+    setup_world();
+    xgl_world_prebuild = 1;
+    fail_alloc_after = 1; /* The cache index succeeds; the mesh does not. */
+    XGL_WorldNewMap();
+    fail_alloc_after = -1;
+    assert(xgl_surfaces && !xgl_surfaces[0].coarse.vertices);
+    xgl_detailtris.value = 0;
+    begin_frame();
+    assert(captured_count == 6 && profile_counts[XGL_PROFILE_WORLD_FALLBACK_SURFACES] == 1);
+}
+
+static void test_detail_build_limit(void)
+{
+    setup_pair(32, 64, 0, 128);
+    /* The limit counts vertices built per frame. One mesh is always allowed,
+     * so the larger-ranked face is detailed now and the other next frame. */
+    xgl_detailbuild.value = 10;
+    begin_frame();
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 3); /* 2 coarse + 1 detail */
+    assert(xgl_surfaces[1].detail.vertices && !xgl_surfaces[0].detail.vertices);
+    assert(!xgl_surfaces[0].detail_attempted && captured_count == 6 + 96);
+    begin_frame();
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 1);
+    assert(xgl_surfaces[0].detail.vertices && captured_count == 24 + 96);
+    begin_frame();
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 0 && captured_count == 24 + 96);
+    /* Zero removes the limit. */
+    setup_pair(32, 64, 0, 128);
+    begin_frame();
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 4 && captured_count == 24 + 96);
+    /* A face too small to subdivide keeps no second, identical mesh. */
+    setup_pair(0, 16, 64, 16);
+    begin_frame();
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 4 && captured_count == 12);
+    assert(!xgl_surfaces[0].detail.vertices && xgl_surfaces[0].detail_attempted);
+    assert(xgl_cache_bytes == 2 * (sizeof(*xgl_surfaces) + 3 * sizeof(int)) +
+           12 * (sizeof(xgl_native_vertex_t) + sizeof(xgl_cached_vertex_t)));
+    begin_frame();
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 0 && captured_count == 12);
+    XGL_WorldShutdown();
+}
+
+static int pair_bucket(int face)
+{
+    vec3_t delta;
+    VectorSubtract(xgl_surfaces[face].center, r_origin, delta);
+    return XGL_DetailBucket(xgl_surfaces[face].area / (DotProduct(delta, delta) + 64));
+}
+
+static void test_detail_hysteresis(void)
+{
+    /* Equal faces side by side; the allowance covers the detail of one. */
+    setup_pair(0, 128, 128, 128);
+    xgl_detailtris.value = 32;
+    r_origin[0] = 64;
+    begin_frame();
+    assert(pair_bucket(0) > pair_bucket(1) + XGL_DETAIL_KEEP);
+    assert(xgl_surfaces[0].detail_frame == r_framecount && xgl_detail_used == 32);
+    assert(xgl_surfaces[1].detail_frame != r_framecount);
+    /* The other face now ranks one step higher. Without the preference for
+     * last frame's choice the detail would hop across; it stays put. */
+    r_origin[0] = 132;
+    begin_frame();
+    assert(pair_bucket(1) == pair_bucket(0) + 1);
+    assert(xgl_surfaces[0].detail_frame == r_framecount);
+    assert(xgl_surfaces[1].detail_frame != r_framecount);
+    begin_frame();
+    assert(xgl_surfaces[0].detail_frame == r_framecount);
+    /* A clearly larger estimate still takes the allowance. */
+    r_origin[0] = 150;
+    begin_frame();
+    assert(pair_bucket(1) > pair_bucket(0) + XGL_DETAIL_KEEP);
+    assert(xgl_surfaces[1].detail_frame == r_framecount);
+    assert(xgl_surfaces[0].detail_frame != r_framecount);
+    /* And then it is the new holder that is kept. */
+    r_origin[0] = 132;
+    begin_frame();
+    assert(xgl_surfaces[1].detail_frame == r_framecount);
+    r_origin[0] = 124;
+    begin_frame();
+    assert(pair_bucket(0) == pair_bucket(1) + 1);
+    assert(xgl_surfaces[1].detail_frame == r_framecount);
+    /* The estimate's rank grows with size and is bounded at both ends. */
+    assert(XGL_DetailBucket(0) == 0 && XGL_DetailBucket(-1) == 0);
+    assert(XGL_DetailBucket(1e-9f) == 0);
+    assert(XGL_DetailBucket(1e9f) == XGL_DETAIL_BUCKETS - 1 - XGL_DETAIL_KEEP);
+    assert(XGL_DetailBucket(2) == XGL_DetailBucket(1) + 4);
+    assert(XGL_DetailBucket(1.5f) == XGL_DetailBucket(1) + 2);
+    XGL_WorldShutdown();
+}
+
+static void test_detail_eviction(void)
+{
+    size_t detail_bytes, full;
+    detail_bytes = 96 * (sizeof(xgl_native_vertex_t) + sizeof(xgl_cached_vertex_t));
+    setup_pair(0, 128, 1024, 128);
+    xgl_detaildistance.value = 200; /* Only the face near the viewer. */
+    r_origin[0] = 64;
+    begin_frame();
+    assert(xgl_surfaces[0].detail.vertices && !xgl_surfaces[1].detail.vertices);
+    assert(xgl_surfaces[0].detail.bytes == detail_bytes);
+    /* Pretend the rest of the 8 MiB is in use, then walk to the other face.
+     * In the next frame the first detail mesh is still too recent to free:
+     * the new build is refused and counted, and the face stays coarse. */
+    full = xgl_cache_bytes;
+    xgl_cache_bytes = XGL_WORLD_CACHE_BYTES;
+    r_origin[0] = 1088;
+    begin_frame();
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_FAILURES] == 1);
+    assert(profile_counts[XGL_PROFILE_WORLD_EVICTIONS] == 0);
+    assert(xgl_surfaces[0].detail.vertices && !xgl_surfaces[1].detail.vertices);
+    assert(xgl_surfaces[1].detail_retry == r_framecount + XGL_DETAIL_RETRY_FRAMES);
+    assert(captured_count == 12);
+    begin_frame(); /* No retry yet: nothing is built or freed. */
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_FAILURES] == 0 && captured_count == 12);
+    /* When the retry comes due, the idle mesh is evicted to make room. */
+    r_framecount = xgl_surfaces[1].detail_retry - 1;
+    begin_frame();
+    assert(profile_counts[XGL_PROFILE_WORLD_EVICTIONS] == 1);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 1);
+    assert(!xgl_surfaces[0].detail.vertices && !xgl_surfaces[0].detail_attempted);
+    assert(xgl_surfaces[1].detail.vertices && captured_count == 6 + 96);
+    assert(xgl_cache_bytes == XGL_WORLD_CACHE_BYTES);
+    /* Walking back rebuilds the first face's detail the same way. */
+    r_origin[0] = 64;
+    r_framecount += 2;
+    begin_frame();
+    assert(profile_counts[XGL_PROFILE_WORLD_EVICTIONS] == 1);
+    assert(xgl_surfaces[0].detail.vertices && !xgl_surfaces[1].detail.vertices);
+    assert(captured_count == 6 + 96);
+    xgl_cache_bytes = full;
+    XGL_WorldShutdown();
+}
+
+static void test_state_order_and_clip_flags(void)
+{
+    /* BSP order reaches the sky face first; it is still drawn after the wall. */
+    setup_pair(0, 128, 128, 128);
+    pair_surfaces[0].flags = SURF_DRAWSKY;
+    xgl_detailtris.value = 0;
+    XGL_WorldNewMap();
+    XGL_Flush(); ++r_framecount; captured_count = captured_calls = 0;
+    set_frustum(0);
+    box_tests = 0;
+    XGL_DrawWorld();
+    assert(captured_count == 6 && captured_lit == 1 && captured[0].position[0] == 128);
+    /* Every box is inside all four planes: the root's four tests settle it
+     * for the whole tree. */
+    assert(box_tests == 4);
+    XGL_DrawWorldSpecial();
+    assert(captured_count == 12 && captured_lit == 0 && captured[6].position[0] == 0);
+    XGL_DrawWorldSpecial(); /* The list is the frame's; nothing accumulates. */
+    assert(captured_count == 18);
+
+    /* One plane crosses the root box: only that plane is tested again below.
+     * The visible leaf lies inside it, so its faces are drawn. */
+    setup_world();
+    xgl_detailtris.value = 0;
+    test_node.minmaxs[3] = test_node.minmaxs[4] = 128;
+    test_leaves[1].minmaxs[0] = 64;
+    test_leaves[1].minmaxs[3] = test_leaves[1].minmaxs[4] = 128;
+    test_leaves[1].minmaxs[5] = 64;
+    XGL_Flush(); ++r_framecount; captured_count = 0;
+    set_frustum(0);
+    frustum[2].dist = 64;
+    box_tests = 0;
+    XGL_DrawWorld();
+    assert(captured_count == 6 && box_tests == 5);
+    /* The same plane moved beyond the leaf rejects it. */
+    XGL_Flush(); ++r_framecount; captured_count = 0;
+    frustum[2].dist = 130;
+    box_tests = 0;
+    XGL_DrawWorld();
+    assert(captured_count == 0 && box_tests <= 4);
+}
+
+static void test_brush_entity_basis_and_external_cache(void)
+{
+    static model_t external;
+    static msurface_t external_surfaces[XGL_BRUSH_CACHE_FACES + 1];
+    entity_t entity, second;
+    int i, filters;
+    setup_world();
+    xgl_detailtris.value = 0;
+    begin_frame();
+    /* An unrotated entity is translated exactly; no trigonometry per face. */
+    memset(&entity, 0, sizeof(entity));
+    entity.model = &test_model;
+    entity.origin[0] = 10; entity.origin[1] = -20; entity.origin[2] = 30;
+    captured_count = 0; angle_calls = 0;
+    XGL_DrawBrushModel(&entity);
+    assert(captured_count == 6 && angle_calls == 1);
+    for (i = 0; i < 6; ++i) {
+        assert(captured[i].position[0] == xgl_surfaces[0].coarse.vertices[i].position[0] + 10);
+        assert(captured[i].position[1] == xgl_surfaces[0].coarse.vertices[i].position[1] - 20);
+        assert(captured[i].position[2] == 30 && captured[i].normal[2] == 1);
+    }
+    /* The same orientation is reused, also by another entity. */
+    second = entity; second.origin[0] = 300;
+    XGL_DrawBrushModel(&second);
+    XGL_DrawBrushModel(&entity);
+    assert(angle_calls == 1);
+    entity.angles[1] = 90;
+    captured_count = 0;
+    XGL_DrawBrushModel(&entity);
+    assert(angle_calls == 2 && captured_count == 6);
+    assert(fabs(captured[1].position[0] - 10) < .001 && fabs(captured[1].position[1] - 108) < .001);
+    XGL_DrawBrushModel(&entity);
+    assert(angle_calls == 2);
+
+    /* An external brush model (an ammo box) has its own surfaces. Its meshes
+     * are now built and sampled once, not streamed and resampled per frame. */
+    external = test_model;
+    for (i = 0; i <= XGL_BRUSH_CACHE_FACES; ++i) external_surfaces[i] = test_surface;
+    external.surfaces = external_surfaces;
+    external.numsurfaces = external.nummodelsurfaces = 1;
+    memset(&entity, 0, sizeof(entity));
+    entity.model = &external;
+    entity.origin[2] = 5;
+    memset(profile_counts, 0, sizeof(profile_counts));
+    captured_count = 0; filters = filter_calls;
+    XGL_DrawBrushModel(&entity);
+    assert(captured_count == 6 && captured[0].position[2] == 5);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 1);
+    assert(profile_counts[XGL_PROFILE_WORLD_FALLBACK_SURFACES] == 0);
+    assert(profile_counts[XGL_PROFILE_WORLD_CACHED_SURFACES] == 1);
+    assert(filter_calls == filters + 6);
+    begin_frame();
+    memset(profile_counts, 0, sizeof(profile_counts));
+    captured_count = 0;
+    XGL_DrawBrushModel(&entity);
+    assert(captured_count == 6 && filter_calls == filters + 6);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 0);
+    assert(profile_counts[XGL_PROFILE_WORLD_COLOR_HITS] == 1);
+    assert(xgl_brush_cache[0].model == &external && xgl_brush_cache[0].count == 1);
+    /* A model with too many faces for a slot streams, complete, as before. */
+    external.numsurfaces = XGL_BRUSH_CACHE_FACES + 1;
+    captured_count = 0;
+    memset(profile_counts, 0, sizeof(profile_counts));
+    XGL_DrawBrushModel(&entity);
+    assert(captured_count == 6);
+    assert(profile_counts[XGL_PROFILE_WORLD_FALLBACK_SURFACES] == 1);
+    /* More models than slots: the least recently drawn one is replaced, but
+     * never one drawn in the current frame. */
+    external.numsurfaces = 1;
+    for (i = 0; i < XGL_BRUSH_CACHE_MODELS; ++i) {
+        external.surfaces = external_surfaces + i + 1;
+        captured_count = 0;
+        memset(profile_counts, 0, sizeof(profile_counts));
+        XGL_DrawBrushModel(&entity);
+        assert(captured_count == 6);
+        /* Slot 0 is from an earlier frame and is reused first; when all the
+         * others hold this frame's models, the next one streams. */
+        assert(profile_counts[XGL_PROFILE_WORLD_FALLBACK_SURFACES] ==
+               (unsigned long)(i == XGL_BRUSH_CACHE_MODELS - 1));
+    }
+    /* A new map releases every external cache with the world's. */
+    XGL_WorldShutdown();
+    assert(!xgl_cache_bytes && !xgl_brush_cache[0].faces && !xgl_brush_cache[1].faces);
+}
+
 int main(void)
 {
     test_shared_animated_samples();
@@ -737,6 +1175,13 @@ int main(void)
     test_profile_cache_events();
     test_brush_water_and_point_light();
     test_animated_water_and_sky();
+    test_unlit_without_dynamic_light();
+    test_map_load_prebuild();
+    test_detail_build_limit();
+    test_detail_hysteresis();
+    test_detail_eviction();
+    test_state_order_and_clip_flags();
+    test_brush_entity_basis_and_external_cache();
     XGL_WorldShutdown();
     assert(xgl_cache_bytes == 0 && xgl_surfaces == NULL);
     puts("XGL world/light contracts passed");

@@ -27,7 +27,7 @@ cvar_t r_fullbright = {"r_fullbright", "0", false, false, 0, NULL};
 cvar_t r_wateralpha = {"r_wateralpha", "1", false, false, 0, NULL};
 cvar_t r_dynamic = {"r_dynamic", "1", false, false, 0, NULL};
 cvar_t r_novis = {"r_novis", "0", false, false, 0, NULL};
-extern cvar_t xgl_subdivide, xgl_detailtris, xgl_detaildistance;
+extern cvar_t xgl_subdivide, xgl_detailtris, xgl_detaildistance, xgl_detailbuild;
 void V_SetContentsColor(int contents);
 
 void R_InitTextures (void)
@@ -84,6 +84,7 @@ void R_Init (void)
     Cvar_RegisterVariable(&xgl_subdivide);
     Cvar_RegisterVariable(&xgl_detailtris);
     Cvar_RegisterVariable(&xgl_detaildistance);
+    Cvar_RegisterVariable(&xgl_detailbuild);
     Cmd_AddCommand("timerefresh", XGL_TimeRefresh_f);
     Cmd_AddCommand("pointfile", R_ReadPointFile_f);
     XGL_TextureInit();
@@ -159,13 +160,25 @@ void R_RenderView (void)
     c_brush_polys = c_alias_polys = 0;
     r_cache_thrash = false;
     XGL_BeginScene();
+    /* Every change between lit and unlit drawing costs about half a
+     * millisecond on the Sun ZX, so the frame is ordered by native state,
+     * not by kind: walls and brush entities; then the unlit sky, water,
+     * sprites and particles; then torches (unlit) and the illuminated models
+     * with the view weapon; blended water last. Depth testing makes the
+     * order of opaque geometry irrelevant to the image. */
     section_start = XGL_ProfileNow();
     XGL_DrawWorld();
     XGL_ProfileAdd(XGL_PROFILE_WORLD, section_start);
     /* Like GLQuake, service the original sound mixer during long frames. */
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
-    XGL_DrawEntities();
+    XGL_DrawBrushEntities();
+    XGL_ProfileAdd(XGL_PROFILE_ENTITIES, section_start);
+    section_start = XGL_ProfileNow();
+    XGL_DrawWorldSpecial();
+    XGL_ProfileAdd(XGL_PROFILE_WORLD, section_start);
+    section_start = XGL_ProfileNow();
+    XGL_DrawSprites();
     XGL_ProfileAdd(XGL_PROFILE_ENTITIES, section_start);
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
@@ -175,14 +188,18 @@ void R_RenderView (void)
     XGL_ProfileAdd(XGL_PROFILE_EFFECTS, section_start);
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
-    XGL_ProfileDrawBegin(&draw_scope);
-    XGL_DrawWater();
-    XGL_ProfileDrawEnd(&draw_scope, XGL_PROFILE_DRAW_WATER);
-    XGL_ProfileAdd(XGL_PROFILE_EFFECTS, section_start);
+    XGL_DrawAliasEntities();
+    XGL_ProfileAdd(XGL_PROFILE_ENTITIES, section_start);
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
     XGL_DrawViewModel();
     XGL_ProfileAdd(XGL_PROFILE_VIEWMODEL, section_start);
+    XGL_AudioUpdate();
+    section_start = XGL_ProfileNow();
+    XGL_ProfileDrawBegin(&draw_scope);
+    XGL_DrawWater();
+    XGL_ProfileDrawEnd(&draw_scope, XGL_PROFILE_DRAW_WATER);
+    XGL_ProfileAdd(XGL_PROFILE_EFFECTS, section_start);
     XGL_AudioUpdate();
     XGL_EndScene();
     if (r_speeds.value)

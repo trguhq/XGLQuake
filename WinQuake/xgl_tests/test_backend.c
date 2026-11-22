@@ -268,9 +268,19 @@ void xgl_multi_simple_polygon(Xgl_ctx context, Xgl_facet_flags flags,
     }
 }
 
+static int space_mode;
+
 static void mock_glyph(int ch, Xgl_bounds_f2d *bounds, Xgl_pt_f2d *advance)
 {
-    assert(ch >= 33 && ch <= 126);
+    assert(ch >= 32 && ch <= 126);
+    if (ch == ' ') {
+        /* No ink. A monospaced font advances one glyph cell; space_mode
+         * models a proportional font with a narrower space. */
+        bounds->xmin = bounds->xmax = bounds->ymin = bounds->ymax = 0;
+        advance->x = (space_mode ? .35f : .7f) * text_height;
+        advance->y = 0;
+        return;
+    }
     bounds->xmin = -.1f * text_height;
     bounds->xmax = .6f * text_height;
     bounds->ymin = 0;
@@ -342,12 +352,15 @@ void xgl_stroke_text(Xgl_ctx context, void *string, void *origin, void *directio
     strcpy(queued_string_copy[queued_count], (const char *)string);
     queued_copy[queued_count++] = *(Xgl_pt_f2d *)origin;
     text = (const char *)string; cursor = cursor_y = 0;
+    assert(((const char *)string)[strlen((const char *)string) - 1] != ' ');
     while (*text) {
-        assert(glyph_count < 8192);
-        recorded_glyph[glyph_count] = *text;
-        recorded_glyph_position[glyph_count] = *(Xgl_pt_f2d *)origin;
-        recorded_glyph_position[glyph_count].y += cursor_y;
-        recorded_glyph_position[glyph_count++].x += cursor;
+        if (*text != ' ') {
+            assert(glyph_count < 8192);
+            recorded_glyph[glyph_count] = *text;
+            recorded_glyph_position[glyph_count] = *(Xgl_pt_f2d *)origin;
+            recorded_glyph_position[glyph_count].y += cursor_y;
+            recorded_glyph_position[glyph_count++].x += cursor;
+        }
         mock_glyph((unsigned char)*text++, &bounds, &advance);
         cursor += advance.x + mock_spacing();
         cursor_y += advance.y;
@@ -388,6 +401,7 @@ static void reset_backend(void)
     clear_calls = swap_calls = polygon_calls = text_calls = extent_calls = flush_calls = 0;
     text_color_sets = audio_updates = submitted_count = 0;
     glyph_count = spacing_mode = proportional_metrics = vertical_advance = 0;
+    space_mode = 0;
     current_spacing = 0;
     memset(profile_counts, 0, sizeof(profile_counts));
     memset(profile_sections, 0, sizeof(profile_sections));
@@ -443,9 +457,11 @@ static void check_camera_rectangle(double left, double top, double right, double
     project(100, 0, 0, clip);
     assert(fabs(clip[0]) < .0001 && fabs(clip[1]) < .0001 && fabs(clip[3] - 100) < .0001);
     check_device_position(clip, (left + right) * .5, (top + bottom) * .5);
-    project(4, 0, 0, clip); assert(fabs(clip[2] / clip[3]) < .0001);
+    /* The near plane sits where the shrunken view weapon needs it. */
+    assert(XGL_NEAR_CLIP == .5 && XGL_VIEWMODEL_SCALE * 4 == XGL_NEAR_CLIP);
+    project((float)XGL_NEAR_CLIP, 0, 0, clip); assert(fabs(clip[2] / clip[3]) < .0001);
     project(4096, 0, 0, clip); assert(fabs(clip[2] / clip[3] - 1) < .0001);
-    project(3, 0, 0, clip); assert(clip[2] < 0);
+    project((float)XGL_NEAR_CLIP * .75f, 0, 0, clip); assert(clip[2] < 0);
     project(8192, 0, 0, clip); assert(clip[2] > clip[3]);
     project(100, 100, 100, clip);
     assert(fabs(clip[0] / clip[3] - 1) < .0001);
@@ -593,9 +609,9 @@ static void test_console_clip_full_cover(void)
     XGL_DrawNativeTriangles(native, 3, 1, 1, 1);
     count = 3;
     assert(!XGL_ReserveTriangles(&count, 1, 1, 1) && count == 0);
-    XGL_SetViewModel(1); XGL_SetViewModel(0); XGL_Flush();
+    XGL_Flush();
     assert(clear_calls == clears && polygon_calls == polygons && flush_calls == waits);
-    assert(!xb.count && !profile_sections[XGL_PROFILE_WEAPON_CLEAR]);
+    assert(!xb.count);
     XGL_EndScene();
     assert(flush_calls == waits + 1); /* Existing scene/UI completion. */
     XGL_UIFill(0, 0, 640, 430, 1, 1);
@@ -605,13 +621,13 @@ static void test_console_clip_full_cover(void)
     assert(swap_calls == 1 && !xb.frame && !xb.scene_active && !xb.ui_active);
 
     /* BeginFrame drops the old clip; closing the console restores drawing
-     * and the weapon clear without needing another explicit clip setter. */
+     * without needing another explicit clip setter. */
     XGL_BeginFrame(); XGL_BeginScene();
     assert(xb.scene_active && !xb.console_lines && current_clip.ymin == -1);
     XGL_DrawTriangles(raw, 3, 2, 1, 1); XGL_Flush();
     assert(submitted_count == 6);
-    XGL_SetViewModel(1);
-    assert(clear_calls == clears + 2);
+    /* One clear per frame: the view weapon needs no depth clear of its own. */
+    assert(clear_calls == clears + 1);
     /* Repeated scene entry after UI also clears the UI state on full cover. */
     XGL_UIText(8, 8, "H", 1, 8, 8);
     assert(xb.ui_active);
@@ -671,52 +687,13 @@ static void test_clear_and_lighting(void)
     XGL_DrawTriangles(vertices, 3, 0, .5f, 0);
     XGL_Flush();
     assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR && write_mask == 0);
-    XGL_SetViewModel(1);
-    assert(clear_calls == 2 && actions == XGL_CTX_NEW_FRAME_HLHSR_ACTION);
-}
-
-static void test_weapon_clear_state_reuse(void)
-{
-    xgl_vertex_t vertices[3];
-    int sets, waits, polygons;
-    reset_backend(); XGL_BeginScene();
-    memset(vertices, 0, sizeof(vertices));
-    XGL_DrawTriangles(vertices, 3, 2, 1, 1); XGL_Flush();
-    sets = transparency_sets; waits = flush_calls; polygons = polygon_calls;
-    assert(illumination == XGL_ILLUM_PER_VERTEX && switches[5]);
-    XGL_SetViewModel(1);
-    assert(transparency_sets == sets && polygon_calls == polygons);
-    assert(flush_calls == waits + 1 && clear_calls == 1);
-    assert(actions == XGL_CTX_NEW_FRAME_HLHSR_ACTION);
-    assert(xb.applied_opacity == 1 && xb.applied_zwrite == 1);
-    assert(illumination == XGL_ILLUM_PER_VERTEX && switches[5]);
-    assert(profile_sections[XGL_PROFILE_WEAPON_CLEAR] == 1);
-    XGL_DrawTriangles(vertices, 3, 2, 1, 1); XGL_Flush();
-    assert(transparency_sets == sets && polygon_calls == polygons + 1);
-    assert(profile_counts[XGL_PROFILE_TRIANGLES] == 2);
-    XGL_SetViewModel(0);
-    assert(clear_calls == 1 && flush_calls == waits + 2);
-    assert(profile_sections[XGL_PROFILE_WEAPON_CLEAR] == 1);
-
-    /* A blended preceding layer must restore opaque drawing and depth
-     * writes before the clear, then reuse those values for the weapon. */
-    reset_backend(); XGL_BeginScene();
-    XGL_DrawTriangles(vertices, 3, 0, .5f, 0); XGL_Flush();
-    sets = transparency_sets; waits = flush_calls;
-    assert(transparency == XGL_TRANSP_BLENDED && freeze_z && !write_mask);
-    XGL_SetViewModel(1);
-    assert(transparency_sets == sets + 1 && flush_calls == waits + 1);
-    assert(transparency == XGL_TRANSP_NONE && !freeze_z);
-    assert(write_mask == (Xgl_usgn32)0xffffffffUL);
-    assert(xb.applied_opacity == 1 && xb.applied_zwrite == 1);
-    assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR);
-    assert(profile_sections[XGL_PROFILE_WEAPON_CLEAR] == 1);
-    XGL_DrawTriangles(vertices, 3, 2, 1, 1); XGL_Flush();
-    assert(transparency_sets == sets + 1 && polygon_calls == 2);
-    assert(illumination == XGL_ILLUM_PER_VERTEX && switches[5]);
-    assert(profile_counts[XGL_PROFILE_TRIANGLES] == 2);
-    XGL_SetViewModel(0);
-    assert(flush_calls == waits + 2 && clear_calls == 1);
+    assert(clear_calls == 1);
+    /* Three batches in three different states; an unchanged state is free. */
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 3);
+    assert(profile_sections[XGL_PROFILE_STATE] == 3);
+    XGL_DrawTriangles(vertices, 3, 0, .5f, 0);
+    XGL_Flush();
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 3);
 }
 
 static void test_fonts_and_gamma(void)
@@ -726,16 +703,16 @@ static void test_fonts_and_gamma(void)
     xgl_vertex_t vertices[3];
     reset_backend();
     XGL_UIText(10, 20, "Hg|-. ", 1, 8, 8);
-    assert(text_calls == 4 && glyph_count == 5 && extent_calls == 97);
+    assert(text_calls == 4 && glyph_count == 5 && extent_calls == 98);
     for (i = 1; i < 5; ++i)
         assert(recorded_glyph_position[i].y == recorded_glyph_position[0].y);
     extents = extent_calls; original_height = text_height;
     XGL_UIText(10, 40, "H", 1, 8, 8);
     assert(extent_calls == extents);
     XGL_UIText(10, 60, "H", 1, 16, 16);
-    assert(extent_calls == extents + 97 && text_height > original_height);
+    assert(extent_calls == extents + 98 && text_height > original_height);
     XGL_UIText(10, 80, "H", 1, 8, 8);
-    assert(extent_calls == extents + 97 && text_height == original_height);
+    assert(extent_calls == extents + 98 && text_height == original_height);
     XGL_UIFlush();
     assert(queued_count == 0);
     for (i = 0; i < 256; ++i) gammatable[i] = (byte)(255 - i);
@@ -954,17 +931,36 @@ static void test_text_runs(void)
     const char *mixed = "HHiiWW Hg|-. HHH";
     int first, extents, calls, i;
     reset_backend();
+    /* A measured one-cell space stays inside the run: one native call. */
     XGL_UIText(8, 16, "HHH Loading", 2, 8, 8);
-    assert(text_calls == 2 && glyph_count == 10);
-    assert(profile_counts[XGL_PROFILE_TEXT_CALLS] == 2);
+    assert(text_calls == 1 && glyph_count == 10);
+    assert(profile_counts[XGL_PROFILE_TEXT_CALLS] == 1);
     assert(profile_counts[XGL_PROFILE_GLYPHS] == 10);
+    assert(!strcmp(queued_string_copy[0], "HHH Loading"));
     check_text_cells("HHH Loading", 8, 16, 8, 8, 0);
     first = glyph_count; extents = extent_calls;
     XGL_UIText(32, 24, "HHH", 3, 8, 8);
-    assert(extent_calls == extents && text_calls == 3);
+    assert(extent_calls == extents && text_calls == 2);
     check_text_cells("HHH", 32, 24, 8, 8, first);
     XGL_UIFlush();
     assert(!queued_count);
+
+    /* Leading, repeated and trailing spaces never reach the native call as
+     * a run's first or last character, and never move a later glyph. */
+    reset_backend();
+    XGL_UIText(8, 16, "  HH   HH  H  ", 2, 8, 8);
+    assert(text_calls == 1 && glyph_count == 5);
+    assert(!strcmp(queued_string_copy[0], "HH   HH  H"));
+    check_text_cells("  HH   HH  H  ", 8, 16, 8, 8, 0);
+    XGL_UIFlush();
+
+    /* A font whose space is not one cell wide keeps splitting at spaces. */
+    reset_backend(); space_mode = 1;
+    XGL_UIText(8, 16, "HHH Loading", 2, 8, 8);
+    assert(text_calls == 2 && glyph_count == 10);
+    assert(!strcmp(queued_string_copy[0], "HHH") && !strcmp(queued_string_copy[1], "Loading"));
+    check_text_cells("HHH Loading", 8, 16, 8, 8, 0);
+    XGL_UIFlush();
 
     /* Unequal widths/advances keep the old centered glyph origins. A run
      * may end at an unusual glyph but cannot shift following characters. */
@@ -1117,7 +1113,9 @@ static void test_point_light_selection(void)
         cl_dlights[i].origin[1] = r_origin[1];
         cl_dlights[i].origin[2] = r_origin[2];
     }
+    assert(!XGL_LightsActive());
     update_lights();
+    assert(XGL_LightsActive());
     assert(switches[0] && switches[1] && switches[2] && switches[3] && switches[4]);
     assert(!switches[5]);
     assert(light_position[1].x == r_origin[0] + 1);
@@ -1131,6 +1129,11 @@ static void test_point_light_selection(void)
     update_lights();
     for (i = 1; i < 6; ++i) assert(!switches[i]);
     assert(switches[0]);
+    /* No point light and full ambient: lit and unlit output are identical.
+     * Reduced ambient light still needs the illuminated path. */
+    assert(!XGL_LightsActive());
+    xgl_ambient.value = .5f;
+    assert(XGL_LightsActive());
 }
 
 static void test_error_diagnostics(void)
@@ -1218,7 +1221,6 @@ int main(void)
     test_console_clip_projection();
     test_console_clip_full_cover();
     test_clear_and_lighting();
-    test_weapon_clear_state_reuse();
     test_fonts_and_gamma();
     test_text_runs();
     test_strided_prepared_colors();

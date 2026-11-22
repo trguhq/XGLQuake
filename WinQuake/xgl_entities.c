@@ -21,6 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  * texture objects. Native lighting supplies moving-light illumination. */
 #include "quakedef.h"
 #include "xgl_local.h"
+#include "xgl_alias.h"
 #include "xgl_audio.h"
 #include "xgl_profile.h"
 #include "xgl_smp.h"
@@ -61,7 +62,9 @@ typedef struct {
 typedef struct {
     int material, depth, command_words, triangle_count, translated, ready;
     int visible_triangles;
-    unsigned int revision, used, command_hash;
+    /* generation: the loaded model these commands were last matched against;
+     * zero when the model carries no identity record. */
+    unsigned int revision, used, command_hash, generation;
     byte translation[256];
     int *commands;
     xgl_alias_color_t *colors;
@@ -85,7 +88,7 @@ typedef struct {
 
 typedef struct {
     int depth, command_words, base_count, vertex_count, triangle_count;
-    unsigned int used, command_hash;
+    unsigned int used, command_hash, generation;
     int *commands;
     xgl_alias_parent_t *parents;
     unsigned short *indices;
@@ -109,9 +112,9 @@ typedef struct {
  * the movable model block. The XGL cache arrays are immutable from submission
  * until the main thread joins the jobs, before it draws any entities. */
 #define XGL_ALIAS_FRAME_JOBS 32
-#define XGL_ALIAS_FRAME_CORNERS 8190
+#define XGL_ALIAS_FRAME_CORNERS 16380
 typedef struct {
-    int visible_index, lit, triangles, extra, count;
+    int visible_index, lit, triangles, count;
     float light;
     vec3_t scale, scale_origin, forward, right, up, origin;
     const trivertx_t *pose;
@@ -137,17 +140,21 @@ typedef struct {
 
 static xgl_alias_frame_t *xgl_alias_frame;
 
-static void XGL_JoinAliasJobs(void)
-{
-    if (xgl_alias_frame && xgl_alias_frame->pending) {
-        XGL_SMPWait();
-        xgl_alias_frame->pending = 0;
-    }
-}
+/* One detail decision per visible entity, made in visible-list order so the
+ * shared triangle allowance is spent identically whatever the drawing order
+ * and whether or not a worker prepares the models. Negative: not drawn. */
+#define XGL_ALIAS_UNPLANNED (-2)
+#define XGL_ALIAS_FLAME 4
+static signed char xgl_alias_plan[MAX_VISEDICTS];
+static int xgl_alias_planned;
+
+static void XGL_RunAliasJob(void *argument);
+static void XGL_JoinAliasJobs(void);
 
 void XGL_AliasFinishFrame(void)
 {
     XGL_JoinAliasJobs();
+    xgl_alias_planned = 0;
     if (xgl_alias_frame) {
         xgl_alias_frame->job_count = 0;
         xgl_alias_frame->pose_count = 0;
@@ -164,6 +171,31 @@ static xgl_alias_work_vertex_t xgl_alias_work[XGL_ALIAS_POSE_VERTICES];
 #define XGL_ALIAS_FIXED_BYTES (sizeof(xgl_alias_topologies) + sizeof(xgl_alias_poses) + sizeof(xgl_alias_work))
 static size_t xgl_alias_pose_bytes = XGL_ALIAS_FIXED_BYTES;
 static unsigned int xgl_alias_pose_used;
+
+/* Rather than idle, the main thread runs the jobs the worker has not reached,
+ * on the serial path's own scratch buffer, then waits for the one in flight. */
+static void XGL_JoinAliasJobs(void)
+{
+    void (*function)(void *);
+    void *argument;
+    double start;
+    unsigned long helped;
+    if (!xgl_alias_frame || !xgl_alias_frame->pending) return;
+    start = XGL_ProfileDetailNow();
+    helped = 0;
+    while (XGL_SMPTake(&function, &argument)) {
+        if (function == XGL_RunAliasJob)
+            ((xgl_alias_job_t *)argument)->work = xgl_alias_work;
+        function(argument);
+        ++helped;
+    }
+    if (helped) {
+        XGL_ProfileAdd(XGL_PROFILE_SMP_WAIT, start);
+        XGL_ProfileCount(XGL_PROFILE_SMP_HELPED, helped);
+    }
+    XGL_SMPWait();
+    xgl_alias_frame->pending = 0;
+}
 
 static void XGL_FreeAliasPose(xgl_alias_pose_cache_t *cache)
 {
@@ -242,29 +274,35 @@ static xgl_alias_cache_t *XGL_FindAliasColors(const aliashdr_t *header,
                                        const byte *translation, int create)
 {
     const int *commands, *cursor;
+    const xgl_alias_identity_t *identity;
     xgl_alias_cache_t *cache;
     unsigned int revision;
     size_t bytes;
     int count, consumed, triangles, words, i, slot;
-    const byte *command_bytes;
-    unsigned int hash;
     revision = XGL_TextureRevision(material);
     if (!revision || depth < 0 || depth > 2 || header->poseverts < 3 ||
         header->poseverts > MAXALIASTRIS * 3 ||
         header->numtris < 1 || header->numtris > MAXALIASTRIS) return NULL;
     commands = (const int *)((const byte *)header + header->commands);
-    cursor = commands;
-    consumed = triangles = 0;
-    while ((count = *cursor++) != 0) {
-        if (count > header->poseverts - consumed || count < -(header->poseverts - consumed))
-            return NULL;
-        if (count < 0) count = -count;
-        if (count < 3) return NULL;
-        consumed += count; triangles += count - 2;
-        cursor += count * 2;
+    identity = XGL_AliasIdentity(header);
+    if (identity) {
+        /* The loader generated and measured these commands itself. */
+        words = identity->words;
+        triangles = header->numtris;
+    } else {
+        cursor = commands;
+        consumed = triangles = 0;
+        while ((count = *cursor++) != 0) {
+            if (count > header->poseverts - consumed || count < -(header->poseverts - consumed))
+                return NULL;
+            if (count < 0) count = -count;
+            if (count < 3) return NULL;
+            consumed += count; triangles += count - 2;
+            cursor += count * 2;
+        }
+        if (triangles != header->numtris) return NULL;
+        words = (int)(cursor - commands);
     }
-    if (triangles != header->numtris) return NULL;
-    words = (int)(cursor - commands);
     triangles *= 1 << (2 * depth);
     if (++xgl_alias_cache_used == 0) {
         for (i = 0; i < XGL_ALIAS_CACHE_SLOTS; ++i) xgl_alias_cache[i].used = 0;
@@ -279,7 +317,14 @@ static xgl_alias_cache_t *XGL_FindAliasColors(const aliashdr_t *header,
             cache->translated != (translation != NULL) ||
             cache->triangle_count != triangles) continue;
         if (translation && memcmp(cache->translation, translation, 256)) continue;
-        if (memcmp(cache->commands, commands, (size_t)words * sizeof(int))) continue;
+        /* The same loaded model needs no comparison. Another load of equal
+         * commands (a reloaded or duplicate model) is compared once, exactly,
+         * and then remembered by its generation. */
+        if (!identity || cache->generation != identity->generation) {
+            if (identity && cache->command_hash != identity->hash) continue;
+            if (memcmp(cache->commands, commands, (size_t)words * sizeof(int))) continue;
+            cache->generation = identity ? identity->generation : 0;
+        }
         cache->used = xgl_alias_cache_used;
         if (create) XGL_ProfileCount(XGL_PROFILE_ALIAS_COLOR_HITS, 1);
         return cache;
@@ -307,11 +352,8 @@ static xgl_alias_cache_t *XGL_FindAliasColors(const aliashdr_t *header,
         return NULL;
     }
     memcpy(cache->commands, commands, (size_t)words * sizeof(int));
-    hash = 2166136261U;
-    command_bytes = (const byte *)commands;
-    for (i = 0; i < words * (int)sizeof(int); ++i)
-        hash = (hash ^ command_bytes[i]) * 16777619U;
-    cache->command_hash = hash;
+    cache->command_hash = identity ? identity->hash : XGL_AliasCommandHash(commands, words);
+    cache->generation = identity ? identity->generation : 0;
     if (translation) memcpy(cache->translation, translation, 256);
     cache->translated = translation != NULL;
     cache->material = material; cache->revision = revision; cache->depth = depth;
@@ -418,9 +460,13 @@ static xgl_alias_topology_t *XGL_AliasTopology(const aliashdr_t *header,
         if (!topology->indices) { if (slot < 0) slot = i; continue; }
         if (topology->depth != colors->depth || topology->command_hash != colors->command_hash ||
             topology->command_words != colors->command_words || topology->base_count != header->poseverts ||
-            topology->vertex_count != vertices || topology->triangle_count != colors->triangle_count ||
-            memcmp(topology->commands, colors->commands,
-                   (size_t)colors->command_words * sizeof(int))) continue;
+            topology->vertex_count != vertices || topology->triangle_count != colors->triangle_count)
+            continue;
+        if (!colors->generation || topology->generation != colors->generation) {
+            if (memcmp(topology->commands, colors->commands,
+                       (size_t)colors->command_words * sizeof(int))) continue;
+            topology->generation = colors->generation;
+        }
         topology->used = xgl_alias_pose_used;
         if (create) XGL_ProfileCount(XGL_PROFILE_ALIAS_TOPOLOGY_HITS, 1);
         return topology;
@@ -444,6 +490,7 @@ static xgl_alias_topology_t *XGL_AliasTopology(const aliashdr_t *header,
     }
     topology->depth = colors->depth; topology->command_words = colors->command_words;
     topology->command_hash = colors->command_hash;
+    topology->generation = colors->generation;
     topology->base_count = header->poseverts; topology->vertex_count = vertices;
     topology->triangle_count = colors->triangle_count;
     topology->used = xgl_alias_pose_used; topology->bytes = bytes;
@@ -887,13 +934,12 @@ static void XGL_AliasVertex(const trivertx_t *pose, const aliashdr_t *header,
 static void XGL_SubmitAliasJob(int visible_index, const entity_t *entity, const aliashdr_t *header,
                                const trivertx_t *pose, const xgl_alias_pose_cache_t *cached_pose,
                                const xgl_alias_cache_t *colors, const vec3_t forward,
-                               const vec3_t right, const vec3_t up, float light, int lit, int extra)
+                               const vec3_t right, const vec3_t up, float light, int lit)
 {
     xgl_alias_job_t *job;
     int corners;
     job = &xgl_alias_frame->jobs[xgl_alias_frame->job_count];
     job->visible_index = visible_index;
-    job->extra = extra;
     job->triangles = header->numtris;
     job->light = light; job->lit = lit;
     VectorCopy(header->scale, job->scale);
@@ -924,9 +970,33 @@ static void XGL_SubmitAliasJob(int visible_index, const entity_t *entity, const 
     }
 }
 
+static int XGL_AliasIsFlame(const model_t *model)
+{
+    return !strcmp(model->name, "progs/flame.mdl") ||
+           !strcmp(model->name, "progs/flame2.mdl");
+}
+
+static int XGL_AliasCulled(entity_t *entity)
+{
+    vec3_t mins, maxs;
+    float radius;
+    int i;
+    if (entity == &cl.viewent) return 0;
+    radius = entity->model->radius;
+    for (i = 0; i < 3; ++i) {
+        mins[i] = entity->origin[i] - radius;
+        maxs[i] = entity->origin[i] + radius;
+    }
+    /* A loader without a valid radius must not reduce an animated model
+     * to a point for culling. The XGL loader computes pose-wide bounds. */
+    return radius > 0 && R_CullBox(mins, maxs);
+}
+
 /* A nonnegative visible index selects an early, hit-only preparation pass.
- * Cold/oversized entries run the ordinary draw path later, in painter order. */
-static int XGL_ProcessAlias(entity_t *entity, int visible_index)
+ * Cold/oversized entries run the ordinary draw path later. A planned depth
+ * comes from XGL_PlanAliasEntities, which has already culled the entity;
+ * XGL_ALIAS_UNPLANNED culls and spends the detail allowance here. */
+static int XGL_ProcessAlias(entity_t *entity, int visible_index, int planned)
 {
     aliashdr_t *header;
     const trivertx_t *pose;
@@ -937,28 +1007,22 @@ static int XGL_ProcessAlias(entity_t *entity, int visible_index)
     xgl_alias_pose_cache_t *cached_pose = NULL;
     xgl_alias_normals_t normals;
     xgl_profile_draw_scope_t output_scope;
-    vec3_t angles, forward, right, up, mins, maxs;
-    float light, radius;
+    vec3_t angles, forward, right, up;
+    float light, shrink;
     double time, prepare_start, cache_start, transform_start, light_start;
-    int i, frame, posenum, animation, skin, material, count, fan, consumed, depth, lit;
-    int light_value, extra_before;
-    if (entity != &cl.viewent) {
-        radius = entity->model->radius;
-        for (i = 0; i < 3; ++i) {
-            mins[i] = entity->origin[i] - radius;
-            maxs[i] = entity->origin[i] + radius;
-        }
-        /* A loader without a valid radius must not reduce an animated model
-         * to a point for culling. The XGL loader computes pose-wide bounds. */
-        if (radius > 0 && R_CullBox(mins, maxs)) return 1;
-    }
+    int i, j, frame, posenum, animation, skin, material, count, fan, consumed, depth, lit;
+    int light_value;
+    if (planned == XGL_ALIAS_UNPLANNED && XGL_AliasCulled(entity)) return 1;
+    /* The view weapon is shrunk toward the eye: the same image, but nearer
+     * than any world geometry, so it needs no depth clear of its own. */
+    shrink = entity == &cl.viewent ? XGL_VIEWMODEL_SCALE : 1;
     /* A sound cache miss can move or evict Quake alias-cache allocations.
      * Service audio before acquiring pointers, then defer mixer calls until
      * the last header/pose/command access. Native batches still submit as
      * usual; their audio hooks respect this short, nestable cache lock. */
     XGL_AudioLock();
-    /* Lock may itself service audio and evict a model. Defer this and all
-     * later predictions if its contribution to the shared budget is unknown.
+    /* Lock may itself service audio and evict a model. The early pass never
+     * reloads one; the ordinary draw does that later.
      * Mod_Extradata touches the resident block on Quake's LRU as usual. */
     if (visible_index >= 0 && !entity->model->cache.data) {
         XGL_AudioUnlock();
@@ -986,8 +1050,7 @@ static int XGL_ProcessAlias(entity_t *entity, int visible_index)
     translation = XGL_EntityTranslation(entity);
     pose = (const trivertx_t *)((const byte *)header + header->posedata) + posenum * header->poseverts;
     order = (const int *)((const byte *)header + header->commands);
-    extra_before = xgl_entity_extra_used;
-    depth = XGL_AliasDepth(entity, header->numtris);
+    depth = planned == XGL_ALIAS_UNPLANNED ? XGL_AliasDepth(entity, header->numtris) : planned;
     /* Detailed preparation covers cache lookup/build and cached live-pose
      * transforms. Fallback recursion and emission stay in the entity stage. */
     if (visible_index >= 0) {
@@ -1001,9 +1064,7 @@ static int XGL_ProcessAlias(entity_t *entity, int visible_index)
             return 1;
         }
     }
-    lit = r_fullbright.value ? 0 : 2;
-    if (!strcmp(entity->model->name, "progs/flame.mdl") ||
-        !strcmp(entity->model->name, "progs/flame2.mdl")) lit = 0;
+    lit = r_fullbright.value || XGL_AliasIsFlame(entity->model) ? 0 : 2;
     if (lit) {
         light_start = XGL_ProfileDetailNow();
         light_value = R_LightPoint(entity->origin);
@@ -1022,7 +1083,7 @@ static int XGL_ProcessAlias(entity_t *entity, int visible_index)
     AngleVectors(angles, forward, right, up);
     if (visible_index >= 0) {
         XGL_SubmitAliasJob(visible_index, entity, header, pose, cached_pose, draw.cache,
-                           forward, right, up, light, lit, xgl_entity_extra_used - extra_before);
+                           forward, right, up, light, lit);
         XGL_AudioUnlock();
         return 1;
     }
@@ -1039,6 +1100,11 @@ static int XGL_ProcessAlias(entity_t *entity, int visible_index)
         transform_start = XGL_ProfileDetailNow();
         XGL_PrepareAliasPose(header->scale, header->scale_origin, pose, cached_pose,
                              forward, right, up, entity->origin, xgl_alias_work);
+        if (shrink != 1)
+            for (i = 0; i < cached_pose->topology->vertex_count; ++i)
+                for (j = 0; j < 3; ++j)
+                    xgl_alias_work[i].position[j] = r_origin[j] +
+                        (xgl_alias_work[i].position[j] - r_origin[j]) * shrink;
         XGL_ProfileAdd(XGL_PROFILE_ALIAS_TRANSFORM, transform_start);
     }
     XGL_ProfileAdd(XGL_PROFILE_ALIAS_PREPARE, prepare_start);
@@ -1067,6 +1133,9 @@ static int XGL_ProcessAlias(entity_t *entity, int visible_index)
         if (fan) count = -count;
         for (i = 0; i < count; ++i) {
             XGL_AliasVertex(pose++, header, forward, right, up, entity->origin, order, &v, &normals);
+            if (shrink != 1)
+                for (j = 0; j < 3; ++j)
+                    v.position[j] = r_origin[j] + (v.position[j] - r_origin[j]) * shrink;
             order += 2;
             if (i == 0) a = v;
             else if (i == 1) b = v;
@@ -1096,13 +1165,49 @@ static int XGL_ProcessAlias(entity_t *entity, int visible_index)
 
 static void XGL_DrawAlias(entity_t *entity)
 {
-    XGL_ProcessAlias(entity, -1);
+    XGL_ProcessAlias(entity, -1, XGL_ALIAS_UNPLANNED);
+}
+
+/* Decide every visible model's subdivision before any is prepared or drawn. */
+static void XGL_PlanAliasEntities(void)
+{
+    entity_t *entity;
+    aliashdr_t *header;
+    int i, base;
+    xgl_entity_extra_used = 0;
+    for (i = 0; i < cl_numvisedicts; ++i) {
+        xgl_alias_plan[i] = -1;
+        entity = cl_visedicts[i];
+        if (!entity || !entity->model || entity->model->type != mod_alias) continue;
+        if (XGL_AliasCulled(entity)) continue;
+        /* Only the triangle count is read; no pointer outlives the lock. */
+        XGL_AudioLock();
+        header = (aliashdr_t *)Mod_Extradata(entity->model);
+        base = header && header->poseverts > 0 && header->numposes > 0 &&
+               header->numskins > 0 ? header->numtris : -1;
+        XGL_AudioUnlock();
+        if (base < 0) continue;
+        xgl_alias_plan[i] = (signed char)(XGL_AliasDepth(entity, base) |
+            (XGL_AliasIsFlame(entity->model) ? XGL_ALIAS_FLAME : 0));
+    }
+    xgl_alias_planned = 1;
+}
+
+/* Unlit flames are drawn first, straight after the other unlit geometry, and
+ * lit models after them: one illumination change instead of one per torch. */
+static int XGL_AliasPassEntity(int pass, int index)
+{
+    entity_t *entity;
+    int flame;
+    entity = cl_visedicts[index];
+    if (!entity || !entity->model || entity->model->type != mod_alias) return 0;
+    flame = xgl_alias_plan[index] >= 0 && (xgl_alias_plan[index] & XGL_ALIAS_FLAME);
+    return (pass == 0) == flame;
 }
 
 void XGL_AliasPrepareFrame(void)
 {
-    entity_t *entity;
-    int i, saved_extra;
+    int i, pass;
     if (!XGL_SMPActive() || !r_drawentities.value) return;
     if (!xgl_alias_frame) {
         xgl_alias_frame = (xgl_alias_frame_t *)malloc(sizeof(*xgl_alias_frame));
@@ -1114,14 +1219,12 @@ void XGL_AliasPrepareFrame(void)
     if (xgl_alias_frame->job_count) return;
     memcpy(xgl_alias_frame->palette, xgl_palette, sizeof(xgl_alias_frame->palette));
     XGL_CopyGammaOutput(xgl_alias_frame->gamma);
-    saved_extra = xgl_entity_extra_used;
-    xgl_entity_extra_used = 0;
-    for (i = 0; i < cl_numvisedicts && xgl_alias_frame->job_count < XGL_ALIAS_FRAME_JOBS; ++i) {
-        entity = cl_visedicts[i];
-        if (!entity || !entity->model || entity->model->type != mod_alias) continue;
-        if (!XGL_ProcessAlias(entity, i)) break;
-    }
-    xgl_entity_extra_used = saved_extra;
+    XGL_PlanAliasEntities();
+    /* Jobs are queued in the order XGL_DrawAliasEntities consumes them. */
+    for (pass = 0; pass < 2; ++pass)
+        for (i = 0; i < cl_numvisedicts && xgl_alias_frame->job_count < XGL_ALIAS_FRAME_JOBS; ++i)
+            if (XGL_AliasPassEntity(pass, i) && xgl_alias_plan[i] >= 0)
+                XGL_ProcessAlias(cl_visedicts[i], i, xgl_alias_plan[i] & 3);
 }
 
 static mspriteframe_t *XGL_SpriteFrame(entity_t *entity, msprite_t *sprite)
@@ -1242,45 +1345,68 @@ static void XGL_DrawSprite(entity_t *entity)
     XGL_AliasFlush(&draw, 0);
 }
 
-void XGL_DrawEntities(void)
+void XGL_DrawBrushEntities(void)
 {
     xgl_profile_draw_scope_t profile;
-    xgl_alias_job_t *job;
-    int i, next_job;
-    /* Hit probes never allocate or evict. Fence before normal serial cache
-     * accesses by later/fallback draws and before reading worker output. */
-    XGL_JoinAliasJobs();
-    next_job = 0;
-    xgl_entity_extra_used = 0;
+    int i;
     if (!r_drawentities.value) return;
     for (i = 0; i < cl_numvisedicts; ++i) {
         currententity = cl_visedicts[i];
-        if (!currententity || !currententity->model) continue;
-        if (currententity->model->type == mod_alias) {
+        if (!currententity || !currententity->model ||
+            currententity->model->type != mod_brush) continue;
+        XGL_ProfileDrawBegin(&profile);
+        XGL_DrawBrushModel(currententity);
+        XGL_ProfileDrawEnd(&profile, XGL_PROFILE_DRAW_BRUSH);
+    }
+}
+
+void XGL_DrawSprites(void)
+{
+    xgl_profile_draw_scope_t profile;
+    int i;
+    if (!r_drawentities.value) return;
+    for (i = 0; i < cl_numvisedicts; ++i) {
+        currententity = cl_visedicts[i];
+        if (!currententity || !currententity->model ||
+            currententity->model->type != mod_sprite) continue;
+        XGL_ProfileDrawBegin(&profile);
+        XGL_DrawSprite(currententity);
+        XGL_ProfileDrawEnd(&profile, XGL_PROFILE_DRAW_SPRITE);
+    }
+}
+
+void XGL_DrawAliasEntities(void)
+{
+    xgl_profile_draw_scope_t profile;
+    xgl_alias_job_t *job;
+    int i, pass, next_job, plan;
+    /* Hit probes never allocate or evict. Fence before normal serial cache
+     * accesses by later/fallback draws and before reading worker output. */
+    XGL_JoinAliasJobs();
+    if (!r_drawentities.value) {
+        xgl_alias_planned = xgl_entity_extra_used = 0;
+        return;
+    }
+    if (!xgl_alias_planned) XGL_PlanAliasEntities();
+    next_job = 0;
+    for (pass = 0; pass < 2; ++pass) {
+        for (i = 0; i < cl_numvisedicts; ++i) {
+            if (!XGL_AliasPassEntity(pass, i)) continue;
+            currententity = cl_visedicts[i];
+            plan = xgl_alias_plan[i];
+            /* Culled models still count as a visit, as they always have. */
             XGL_ProfileDrawBegin(&profile);
             job = xgl_alias_frame && next_job < xgl_alias_frame->job_count ?
                 &xgl_alias_frame->jobs[next_job] : NULL;
-            if (job && job->visible_index == i) {
+            if (plan >= 0 && job && job->visible_index == i) {
                 XGL_DrawNativeTriangles(job->output, job->count, job->lit, 1, 1);
                 c_alias_polys += job->triangles;
-                xgl_entity_extra_used += job->extra;
                 ++next_job;
-            } else XGL_DrawAlias(currententity);
+            } else if (plan >= 0) XGL_ProcessAlias(currententity, -1, plan & 3);
             XGL_ProfileDrawEnd(&profile, XGL_PROFILE_DRAW_ALIAS);
-        } else if (currententity->model->type == mod_brush) {
-            XGL_ProfileDrawBegin(&profile);
-            XGL_DrawBrushModel(currententity);
-            XGL_ProfileDrawEnd(&profile, XGL_PROFILE_DRAW_BRUSH);
         }
     }
-    for (i = 0; i < cl_numvisedicts; ++i) {
-        currententity = cl_visedicts[i];
-        if (currententity && currententity->model && currententity->model->type == mod_sprite) {
-            XGL_ProfileDrawBegin(&profile);
-            XGL_DrawSprite(currententity);
-            XGL_ProfileDrawEnd(&profile, XGL_PROFILE_DRAW_SPRITE);
-        }
-    }
+    xgl_alias_planned = 0;
 }
 
 void XGL_DrawViewModel(void)
@@ -1290,15 +1416,10 @@ void XGL_DrawViewModel(void)
         (cl.items & IT_INVISIBILITY) || cl.stats[STAT_HEALTH] <= 0 ||
         !cl.viewent.model || cl.viewent.model->type != mod_alias) return;
     currententity = &cl.viewent;
-    /* Finish world work before clearing depth for the weapon. The backend
-     * retains world color and resumes normal depth state afterwards. */
-    XGL_ProfileDrawBegin(&profile);
-    XGL_SetViewModel(1);
-    XGL_ProfileDrawEnd(&profile, XGL_PROFILE_DRAW_WEAPON_SETUP);
+    /* The weapon joins the lit models' batch. XGL_ProcessAlias draws it
+     * shrunk toward the eye, in front of the world by depth alone, so the
+     * frame needs no second depth clear or completion wait. */
     XGL_ProfileDrawBegin(&profile);
     XGL_DrawAlias(currententity);
     XGL_ProfileDrawEnd(&profile, XGL_PROFILE_DRAW_WEAPON_DRAW);
-    XGL_ProfileDrawBegin(&profile);
-    XGL_SetViewModel(0);
-    XGL_ProfileDrawEnd(&profile, XGL_PROFILE_DRAW_WEAPON_FINISH);
 }

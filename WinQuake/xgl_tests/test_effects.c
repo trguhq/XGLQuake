@@ -120,8 +120,9 @@ int main(void)
 {
     particle_t particle;
     xgl_native_vertex_t snapshot[TEST_BATCH_VERTICES + 2];
-    float distances[5] = {-10, 0, 19, 20, 200};
-    int i, palettes, draws;
+    float distances[5] = {4, 10, 19, 20, 200};
+    float hidden[3] = {-10, 0, 3.99f};
+    int i, palettes, draws, reserves;
     memset(guard, 0x5a, sizeof(guard));
     memcpy(batch, guard, sizeof(guard));
     memcpy(batch + TEST_BATCH_VERTICES + 1, guard, sizeof(guard));
@@ -144,6 +145,15 @@ int main(void)
         particle.org[1] = 9; particle.org[2] = -5;
         particle.color = i == 0 ? -1.25f : i * 73.5f;
         draw_and_check(&particle); ++draws;
+    }
+    /* Behind the eye or nearer than the original near plane: nothing is
+     * reserved, colored or written. */
+    for (i = 0; i < 3; ++i) {
+        particle.org[0] = r_origin[0] + hidden[i];
+        palettes = palette_calls; reserves = reserve_calls;
+        XGL_DrawParticle(&particle);
+        assert(palette_calls == palettes && reserve_calls == reserves);
+        check_batch();
     }
     /* Non-axis-aligned camera; palette and gamma edits must be seen at once. */
     vpn[0] = .6f; vpn[1] = .8f;

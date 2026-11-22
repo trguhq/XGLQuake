@@ -21,6 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "xgl_local.h"
+#include "xgl_alias.h"
 #include <string.h>
 
 /*
@@ -282,6 +283,8 @@ static void BuildTris (void)
  * files. Bounded strips/fans are generated from the validated MDL topology. */
 void XGL_MakeAliasModelDisplayLists (model_t *m, aliashdr_t *hdr)
 {
+    static unsigned int generation;
+    xgl_alias_identity_t *identity;
     int i, j;
     int *cmds;
     trivertx_t *verts;
@@ -299,9 +302,16 @@ void XGL_MakeAliasModelDisplayLists (model_t *m, aliashdr_t *hdr)
     paliashdr = hdr;
     BuildTris ();
     paliashdr->poseverts = numorder;
-    cmds = Hunk_Alloc (numcommands * sizeof(*cmds));
+    /* The identity record travels with the commands in the cache block. */
+    identity = Hunk_Alloc (sizeof(*identity) + numcommands * sizeof(*cmds));
+    cmds = (int *)(identity + 1);
     paliashdr->commands = (byte *)cmds - (byte *)paliashdr;
     memcpy (cmds, commands, numcommands * sizeof(*cmds));
+    if (!++generation) ++generation;
+    identity->magic = XGL_ALIAS_IDENTITY_MAGIC;
+    identity->generation = generation;
+    identity->words = numcommands;
+    identity->hash = XGL_AliasCommandHash (cmds, numcommands);
     verts = Hunk_Alloc (paliashdr->numposes * numorder * sizeof(*verts));
     paliashdr->posedata = (byte *)verts - (byte *)paliashdr;
     for (i = 0; i < paliashdr->numposes; ++i)

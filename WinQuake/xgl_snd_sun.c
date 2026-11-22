@@ -34,7 +34,9 @@ slow graphics frames do not impose the original 1024-byte write limit.
 
 #define XGL_AUDIO_BUFFER_BYTES 32768
 #define XGL_AUDIO_EINTR_LIMIT 8
-#define XGL_AUDIO_SERVICE_INTERVAL .010
+/* Rendering asks for service many times a frame. With 0.3 seconds mixed
+ * ahead, topping the device up every 25 ms is ample and costs fewer calls. */
+#define XGL_AUDIO_SERVICE_INTERVAL .025
 
 static int xgl_audio_fd = -1;
 static int xgl_audio_inited;

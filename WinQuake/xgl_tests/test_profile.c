@@ -122,6 +122,8 @@ static void test_detail_levels(void)
     XGL_ProfileCount(XGL_PROFILE_ALIAS_TOPOLOGY_MISSES, 1);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_SLOT_EVICTIONS, 2);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_BYTE_EVICTIONS, 4);
+    XGL_ProfileCount(XGL_PROFILE_WORLD_EVICTIONS, 5);
+    XGL_ProfileCount(XGL_PROFILE_SMP_HELPED, 1);
     clock_time = 101.31; start = XGL_ProfileDetailNow();
     clock_time = 101.33; XGL_ProfileAdd(XGL_PROFILE_WORLD_SKY, start);
     clock_time = 101.34; start = XGL_ProfileDetailNow();
@@ -155,6 +157,8 @@ static void test_detail_levels(void)
     assert(strstr(output, "cache 10.00 transform 30.00 ms; topology hits 1.5 misses 0.5"));
     assert(strstr(output, "pose evictions slot 1.0 bytes 2.0"));
     assert(strstr(output, "SMP alias preparation: 1.5 jobs/frame; main prepass 2.00 worker 7.00 main wait 1.00 ms/frame"));
+    assert(strstr(output, "0.5 more jobs/frame run by main while joining\n"));
+    assert(strstr(output, "vertices built 51.0 recolored 0.0 animated 0.0; detail meshes evicted 2.5\n"));
     assert(!XGL_ProfileDetailEnabled());
     calls = clock_calls;
     assert(XGL_ProfileDetailNow() == 0);
@@ -202,6 +206,9 @@ static void test_aggregation(void)
     clock_time = 10.25; XGL_ProfileAdd(XGL_PROFILE_WORLD, world_start);
     clock_time = 10.26; call_start = XGL_ProfileNow();
     clock_time = 10.285; XGL_ProfileAdd(XGL_PROFILE_SUBMIT, call_start);
+    clock_time = 10.29; call_start = XGL_ProfileNow();
+    clock_time = 10.296; XGL_ProfileAdd(XGL_PROFILE_STATE, call_start);
+    XGL_ProfileCount(XGL_PROFILE_STATE_CHANGES, 3);
     XGL_ProfileCount(XGL_PROFILE_TRIANGLES, 30);
     XGL_ProfileCount(XGL_PROFILE_GLYPHS, 2);
     XGL_ProfileCount(XGL_PROFILE_POLYGON_CALLS, 2);
@@ -220,8 +227,8 @@ static void test_aggregation(void)
     assert(print_calls == 1);
     assert(strstr(output, "2 frames; gfx 550.00 ms (max 600.00)"));
     assert(strstr(output, "world 175.00"));
-    assert(strstr(output, "native calls (overlap stages): submit 12.50 sync 12.50"));
-    assert(strstr(output, "triangles 20.0 glyphs 4.0 polygon calls 3.0 waits 2.0"));
+    assert(strstr(output, "native calls (overlap stages): submit 12.50 sync 12.50 swap 0.00 state 3.00 ms"));
+    assert(strstr(output, "triangles 20.0 glyphs 4.0 polygon calls 3.0 waits 2.0 state changes 1.5\n"));
 
     /* Output is aggregated once per interval; a new interval has no stale
      * geometry counts or elapsed time from the previous report. */
@@ -233,7 +240,7 @@ static void test_aggregation(void)
     assert(print_calls == 2);
     assert(strstr(output, "2 frames; gfx 405.00 ms (max 500.00)"));
     assert(strstr(output, "world 0.00"));
-    assert(strstr(output, "triangles 0.0 glyphs 0.0 polygon calls 0.0 waits 0.0"));
+    assert(strstr(output, "triangles 0.0 glyphs 0.0 polygon calls 0.0 waits 0.0 state changes 0.0\n"));
 }
 
 static void test_toggle_and_clock_reset(void)
@@ -286,11 +293,6 @@ static void record_draw_scope(xgl_profile_draw_t draw, double wall,
     native_start = XGL_ProfileNow();
     clock_time += sync;
     XGL_ProfileAdd(XGL_PROFILE_SYNC, native_start);
-    if (draw == XGL_PROFILE_DRAW_WEAPON_SETUP) {
-        native_start = XGL_ProfileDetailNow();
-        clock_time += .004;
-        XGL_ProfileAdd(XGL_PROFILE_WEAPON_CLEAR, native_start);
-    }
     clock_time = start + wall;
     XGL_ProfileDrawEnd(&scope, draw);
 }
@@ -315,12 +317,11 @@ static void test_draw_scope_aggregation(void)
     record_draw_scope(XGL_PROFILE_DRAW_ALIAS, .100, .020, .010);
     clock_time = 201.1; XGL_ProfileEndFrame();
     assert(print_calls == 2);
-    assert(strstr(output, "native calls (overlap stages): submit 75.00 sync 36.50"));
+    assert(strstr(output, "native calls (overlap stages): submit 65.00 sync 31.50"));
     assert(strstr(output, "native calls executed during scope"));
     assert(strstr(output, "alias 70.00/15.00/7.50 brush 20.00/5.00/2.50 sprite 20.00/5.00/2.50"));
     assert(strstr(output, "visits/frame 1.0/0.5/0.5"));
-    assert(strstr(output, "setup 20.00/5.00/2.50 draw 20.00/5.00/2.50 finish 20.00/5.00/2.50"));
-    assert(strstr(output, "depth clear 2.00 ms"));
+    assert(strstr(output, "weapon scope wall/submit/sync ms: draw 20.00/5.00/2.50\n"));
     assert(strstr(output, "particles 20.00/5.00/2.50 water 20.00/5.00/2.50"));
     assert(strstr(output, "alias entity detail (overlap): lighting 0.00 ms; "
         "cached final vertex/color output 20.00/5.00/2.50; "
@@ -334,7 +335,7 @@ static void test_draw_scope_aggregation(void)
     assert(print_calls == 4);
     assert(strstr(output, "alias 0.00/0.00/0.00 brush 0.00/0.00/0.00 sprite 0.00/0.00/0.00"));
     assert(strstr(output, "visits/frame 0.0/0.0/0.0"));
-    assert(strstr(output, "depth clear 0.00 ms"));
+    assert(strstr(output, "weapon scope wall/submit/sync ms: draw 0.00/0.00/0.00\n"));
 }
 
 static void test_draw_scope_guards(void)
@@ -354,7 +355,7 @@ static void test_draw_scope_guards(void)
         XGL_ProfileDrawBegin(&scope);
         XGL_ProfileDrawEnd(&scope, (xgl_profile_draw_t)i);
     }
-    XGL_ProfileAdd(XGL_PROFILE_WEAPON_CLEAR, 0);
+    XGL_ProfileAdd(XGL_PROFILE_WEAPON_LIGHT, 0);
     assert(clock_calls == calls);
     clock_time = 300.1; XGL_ProfileEndFrame();
 
@@ -460,7 +461,7 @@ static void test_nested_alias_details(void)
      * appear once in frame totals and in both enclosing and nested scopes. */
     assert(strstr(output, "native calls (overlap stages): submit 58.00 sync 19.00"));
     assert(strstr(output, "alias 70.00/17.00/7.00 brush 0.00/0.00/0.00"));
-    assert(strstr(output, "draw 122.00/41.00/12.00 finish 0.00/0.00/0.00"));
+    assert(strstr(output, "draw 122.00/41.00/12.00\n"));
     assert(strstr(output, "alias entity detail (overlap): lighting 10.00 ms; "
         "cached final vertex/color output 30.00/7.00/3.50; "
         "fallback (transform/subdivide/sample/pack) 30.00/10.00/3.50"));

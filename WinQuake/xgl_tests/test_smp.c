@@ -135,6 +135,8 @@ static void submit_eventually(void (*work)(void *), void *argument)
 static void test_queue(void)
 {
     int tickets[4096], i, queued;
+    void (*taken_function)(void *);
+    void *taken_argument;
 
     detail_enabled = 1;
     submit_eventually(hold_worker, NULL);
@@ -145,7 +147,13 @@ static void test_queue(void)
         tickets[queued] = queued;
         if (!XGL_SMPSubmit(check_sequence, &tickets[queued])) break;
     }
-    assert(queued > 0 && queued < 4096);
+    assert(queued == XGL_SMP_QUEUE_SIZE);
+    /* The owner can reclaim the newest unstarted job to run it itself. The
+     * worker keeps the remaining jobs in their original order. */
+    assert(XGL_SMPTake(&taken_function, &taken_argument));
+    assert(taken_function == check_sequence && taken_argument == &tickets[queued - 1]);
+    assert(!XGL_SMPTake(NULL, &taken_argument) && !XGL_SMPTake(&taken_function, NULL));
+    --queued;
     assert(completed == 0);
     released = 1;
     pthread_cond_signal(&gate_changed);
@@ -155,6 +163,7 @@ static void test_queue(void)
     assert(reported_jobs == (unsigned long)queued + 1);
     XGL_SMPWait();
     assert(reported_jobs == (unsigned long)queued + 1);
+    assert(!XGL_SMPTake(&taken_function, &taken_argument));
     detail_enabled = 0;
 
     /* Wrap the ring repeatedly. Switching off must finish all accepted work. */
@@ -167,6 +176,7 @@ static void test_queue(void)
     check_status("forced off", "1 online CPU", "single-threaded");
     assert(completed == 4096);
     assert(!XGL_SMPSubmit(check_sequence, &tickets[0]));
+    assert(!XGL_SMPTake(&taken_function, &taken_argument));
 }
 
 int main(void)
@@ -218,6 +228,6 @@ int main(void)
     assert(XGL_SMPActive());
     XGL_SMPShutdown();
     alarm(0);
-    puts("SMP worker tests passed (CPU detection, overrides, startup failure, FIFO, saturation, draining and restart)");
+    puts("SMP worker tests passed (CPU detection, overrides, startup failure, FIFO, saturation, reclaiming, draining and restart)");
     return 0;
 }
