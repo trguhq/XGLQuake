@@ -68,7 +68,7 @@ requires builds and readback checks against those installed SDKs/runtimes.
 
 ## Run
 
-Version 0.9.2 defaults to the **quick** profile at **320x240**, with a one-minute
+Version 0.9.3 defaults to the **quick** profile at **320x240**, with a one-minute
 elapsed-time limit:
 
 ```sh
@@ -83,15 +83,20 @@ the graphics device after setup and between cases. Quick, medium and long
 allow at most one, three and seven minutes including rest, with headroom for
 setup and readback validation. Every profile has a finite elapsed-time limit
 and a further ten-second grace period for stopping
-and cleanup. Extra-long selects the complete case registry with a 45-minute
-limit.
+and cleanup. Extra-long selects every case except native texture mapping,
+with a 45-minute limit.
+
+Whatever the profile, a case is abandoned as soon as one of its frames takes
+longer than a second, starting with the first image it draws. It is reported
+with the measured frame time and counted as a time-limit discard; the run
+continues with the next case.
 
 | Profile | Cases per resolution | Resolutions | Seconds/trial | Repeats | Warm-up/case | Minimum idle pause | Elapsed-time limit |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `-quick` (default) | 16 | 320x240 | 0.2 | 1 | 0.02 s | 1.5 s | 60 s |
 | `-medium` | 34 | 320x240 | 0.25 | 2 | 0.03 s | 2.5 s | 180 s |
 | `-long` | 34 | 320x240, 640x480 | 0.4 | 2 | 0.05 s | 3.0 s | 420 s |
-| `-extralong` | 250 | 320x240, 640x480 | 0.5 | 3 | 0.1 s | 2.0 s | 2700 s (45 min) |
+| `-extralong` | 229 | 320x240, 640x480 | 0.5 | 3 | 0.1 s | 2.0 s | 2700 s (45 min) |
 
 Quick compares individual polygons and two batched submission APIs, sampled
 flat/smooth draws at depth one, matching frames with and without the HUD,
@@ -102,10 +107,10 @@ updates, six transparency cases with four overlapping quads, native-text menu
 and console workloads, depth-two sampled colors, and serialized/streaming
 Quake-like smooth lighting.
 Long runs the same 34 cases at both resolutions with longer trials.
-Native texture mapping is optional: use an explicit `-test` filter or
-`-extralong`, which retains the complete 250-case registry. The later sections
-describe all available families; a short profile need not include every case
-described there.
+Native texture mapping runs only when named with `-test`: on the Sun ZX it
+executes in software, at seconds per frame. `-extralong` runs the other 229
+of the registry's 250 cases. The later sections describe all available
+families; a short profile need not include every case described there.
 
 Keep both standard output and standard error when collecting a hardware run,
 as in the examples above. XGL error details and setup-stage diagnostics are
@@ -152,7 +157,7 @@ two-to-one idle-to-active rule remains in effect.
 Setup, readback validation and minimum work counts vary with the machine, so
 profiles may finish early or reach their limits before attempting every
 selected case. Extra-long's default workload and rest periods take roughly
-38 minutes before setup and validation; its 45-minute limit can leave cases
+37 minutes before setup and validation; its 45-minute limit can leave cases
 unattempted on slower systems. These measures reduce continuous benchmark
 activity, but do not measure temperature or guarantee protection for aging
 graphics hardware.
@@ -186,8 +191,8 @@ warm-up work are outside the measured rendering intervals.
 `-test TEXT` selects matching names from the **full 250-case registry**, even
 when they are outside the profile's usual subset. The chosen profile still
 supplies resolutions, timings, pauses and any elapsed-time limit.
-`-list` shows the selected profile or filter without opening XGL;
-use `-extralong -list` to see the entire registry.
+`-list` shows the selected profile or filter without opening XGL. Every name
+contains a slash, so `-test / -list` shows the entire registry.
 
 Explicit `-seconds`, `-warmup`, `-repeats` or `-pause` values override that
 setting. This is independent of
@@ -431,7 +436,7 @@ selected only by `-test` or `-extralong`. Each prints its finding on the
 | `probe/persist/depth-only-clear` | Does an undrawn region survive buffer switches when frames clear only Z? | PASS means it did, on both buffers. Timed work is a Z-only clear. |
 | `probe/persist/viewport-clear` | Do geometry and a color+Z clear stay inside a reduced DC viewport? | PASS means both did. Timed work is the clear within the 80% viewport; compare with `overhead/color-depth-clear`. A validation failure names the first check that failed. |
 | `probe/swap/interval` | How long is a buffer switch, and where is the delay? | The note gives the period between 200 consecutive switches (the retrace period if switches wait for retrace) and the median time in the switch call and in the following completion wait. |
-| `probe/swap/busy-6ms` | Can CPU work overlap that delay? | Same, with 6 ms of CPU work between the call and the wait. If the wait shrinks by about 6 ms and the period is unchanged, the work overlapped. |
+| `probe/swap/busy-6ms` | Can CPU work overlap that delay? | Same, with 6 ms of CPU work between the call and the wait. If the period is unchanged and the call shrinks by about 6 ms, the switch simply waits for the next retrace and the work only used up part of that wait. |
 
 The lighting and state probes check lit output by readback before changing
 state; the ambient-only and illumination-off images themselves are not
@@ -446,11 +451,17 @@ make XB_FBIO=1
 
 If that fails to compile in `xglbench_xgl.c`, rebuild with plain `make`.
 
+The two switch probes clear both buffers first, so the window stays black
+instead of flickering between leftover images.
+
 Run the probes with the existing cases they are compared against:
 
 ```sh
-./xglbench -extralong -winsize 320 240 -test probe/,overhead/,ui/,submit/strip,submit/multi_polygon/batch-128,submit/triangle_list/batch-128,transform/,texture-map/,subdivide/relight -csv zx-probe.csv >zx-probe.txt 2>&1
+./xglbench -extralong -winsize 320 240 -test probe/,overhead/,ui/,submit/strip,submit/multi_polygon/batch-128,submit/triangle_list/batch-128,transform/,subdivide/relight -csv zx-probe.csv >zx-probe.txt 2>&1
 ```
+
+The Sun ZX results of these probes, and what the renderer does about them,
+are in [docs/hardware.md](../docs/hardware.md).
 
 ## Combined clears and transparency
 
@@ -529,6 +540,14 @@ are accelerated. That is an intended comparison and does not require
 `-allow-fallback`; the existing requirements for the base display/geometry
 path still apply. Results label texture execution `unclassified`. They show
 the cost of the installed XGL pipeline, not proof of hardware texturing.
+
+On the Sun ZX with XGL 3.3 these cases run in software: one frame of 512
+point-sampled triangles at 320x240 took 1.84 seconds, almost all of it host
+CPU time. They are therefore left out of every profile and run only when
+named; the slow-frame rule above then abandons each after its first image.
+The readback gates accept either row order and either red/blue word layout
+for the texture image and report the one in use; the ZX uses the first image
+row for v=0 and `0x00BBGGRR` words.
 
 Unsupported mapping, failed texture readback, or a rendering error leaves
 the requested case skipped. It never becomes an apparently successful

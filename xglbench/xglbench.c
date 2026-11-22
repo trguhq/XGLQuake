@@ -9,6 +9,9 @@
 
 #define XB_MAX_CASES 256
 #define XB_TARGET_FRAME_SECONDS (1.0 / 15.0)
+/* A case whose single frame takes longer than this is abandoned: it is not
+ * interactive, and repeating it only spends the device's and the run's time. */
+#define XB_SLOW_FRAME_SECONDS 1.0
 #if XB_MAX_RESULTS < 2 * XB_MAX_CASES
 #error Result capacity must cover both default resolutions
 #endif
@@ -533,8 +536,11 @@ static int select_cases(const xb_case *cases, int count, const xb_options *o, in
     int i, j, n, quick_count, wanted;
     n = 0;
     if (o->filter || o->profile == XB_EXTRALONG) {
+        /* Native texture mapping ran in software on the Sun ZX, at seconds
+         * per frame. It stays in the registry but runs only when named. */
         for (i = 0; i < count; ++i)
-            if (!o->filter || filter_matches(cases[i].name, o->filter)) order[n++] = i;
+            if (o->filter ? filter_matches(cases[i].name, o->filter) :
+                            cases[i].texture_filter == XB_TEXTURE_OFF) order[n++] = i;
         return n;
     }
     quick_count = (int)(sizeof(quick) / sizeof(quick[0]));
@@ -951,6 +957,15 @@ done:
     return okay;
 }
 
+static int slow_frame(xb_result *r, double seconds)
+{
+    if (!(seconds > XB_SLOW_FRAME_SECONDS)) return 0;
+    r->failure = XB_FAILURE_TIME_LIMIT;
+    sprintf(r->reason, "one frame took %.2f s (limit %.0f s); case abandoned",
+            seconds, XB_SLOW_FRAME_SECONDS);
+    return 1;
+}
+
 static void measure(const xb_options *o, xb_result *r, const int *valid,
                     const enum xb_failure *validation_failure,
                     char validation[XB_METHODS][160])
@@ -1007,13 +1022,17 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
         r->input_bytes = xb_backend_input_bytes(c->method, c->batch);
     }
     xb_backend_label(c->name);
-    /* Show a representative image even for tests which exclude presentation. */
+    /* Show a representative image even for tests which exclude presentation.
+     * This first complete draw is also the earliest point at which a case
+     * too slow to be worth measuring can be recognised. */
+    start = xb_now();
     xb_backend_clear(1, c->zbuffer);
     if (uses_mesh) xb_backend_draw(c->method, c->batch);
     if (c->work == XB_UI && !xb_backend_ui(c->ui, 0)) {
         backend_reason(r, "native UI preview failed"); goto done;
     }
     xb_backend_sync();
+    if (slow_frame(r, xb_now() - start)) goto done;
     if (xb_backend_has_double_buffer()) xb_backend_swap();
     xb_backend_sync();
     preview = xb_backend_events();
@@ -1038,6 +1057,7 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
         if (!one_frame(o, c, &mesh, sequence++, &f)) {
             backend_reason(r, "warm-up preparation/native submission failed"); goto done;
         }
+        if (slow_frame(r, f.total)) goto done;
     } while (xb_now() - start < o->warmup);
     for (trial = 0; trial < o->repeats; ++trial) {
         if (c->lighting != XB_LIGHT_OFF) sequence = 0;
@@ -1060,6 +1080,7 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
             if (!one_frame(o, c, &mesh, sequence++, &f)) {
                 backend_reason(r, "preparation/native submission failed"); goto done;
             }
+            if (slow_frame(r, f.total)) goto done;
             ++frames;
             sum += f.total; prep += f.prepare; render += f.render; present += f.present;
             if (tracks_updates(c)) record_preparation(&updates, f.changes, f.prepare);

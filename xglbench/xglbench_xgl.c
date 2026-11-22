@@ -2684,6 +2684,12 @@ static int probe_swap(double busy, char *note, size_t size)
         fail_kind(XB_FAILURE_UNSUPPORTED, "switch probe needs two window buffers");
         return 0;
     }
+    /* Clear both buffers first: alternating two different leftover images
+     * would make the window flicker for the length of the probe. */
+    for (i = 0; i < 2; ++i) {
+        xb_backend_clear(1, 1);
+        xb_backend_swap();
+    }
     xb_backend_sync();
     xgl_object_set(b.ctx, XGL_CTX_NEW_FRAME_ACTION, XGL_CTX_NEW_FRAME_SWITCH_BUFFER, 0);
     previous = 0; n = 0;
