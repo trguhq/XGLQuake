@@ -16,11 +16,41 @@
 #define UI_DARK 3
 #define UI_EDGE 109
 
+/* What stands in for a picture. Quake draws the same few dozen pictures
+ * every frame, so each is told apart by name once, when it is first asked
+ * for, and drawn from this from then on. */
+enum {
+    UI_PIC_OTHER,      /* a box with the picture's name in it */
+    UI_PIC_MAIN_MENU, UI_PIC_SINGLE_MENU, UI_PIC_MULTI_MENU,
+    UI_PIC_HELP,       /* detail: the page */
+    UI_PIC_LABEL,      /* label in color */
+    UI_PIC_PLAYER,
+    UI_PIC_BOX,        /* detail: UI_BOX_* edges */
+    UI_PIC_PANEL,
+    UI_PIC_INTERMISSION,
+    UI_PIC_DIGIT,      /* one character of a number, in color */
+    UI_PIC_WEAPON,     /* label in a box, both in color */
+    UI_PIC_ARMOR, UI_PIC_KEY,
+    UI_PIC_FACE,       /* detail: UI_FACE_*, or the health level 1..5 */
+    UI_PIC_SIGIL,
+    UI_PIC_ICON        /* label in a panel */
+};
+#define UI_BOX_TOP 1
+#define UI_BOX_BOTTOM 2
+#define UI_BOX_LEFT 4
+#define UI_BOX_RIGHT 8
+#define UI_FACE_QUAD 6
+#define UI_FACE_BOTH 7
+#define UI_FACE_INVULNERABLE 8
+#define UI_FACE_INVISIBLE 9
+
 typedef struct {
     qpic_t pic;
     char source[MAX_QPATH];
     char name[MAX_QPATH];
     int wad;
+    int kind, color, detail;
+    char label[MAX_QPATH];
 } xgl_draw_pic;
 
 static xgl_draw_pic ui_pics[XGL_DRAW_PICS];
@@ -73,6 +103,15 @@ static void ui_border(float x, float y, float w, float h, int color)
     ui_fill(x+w-1, y, 1, h, color, 1);
 }
 
+/* A filled box with an edge one unit wide: the edge's color under the
+ * whole box and the fill over its inside. The same pixels as a fill with
+ * four strips on top, in two rectangles instead of five. */
+static void ui_panel(float x, float y, float w, float h, int fill, int edge)
+{
+    ui_fill(x, y, w, h, edge, 1);
+    ui_fill(x+1, y+1, w-2, h-2, fill, 1);
+}
+
 static void ui_label(float x, float y, float w, float h,
                      const char *text, int color)
 {
@@ -112,12 +151,156 @@ static void ui_number_digit(float x, float y, float w, float h, char digit, int 
     ui_number_w += w;
 }
 
+/* Handles are the descriptors themselves. */
 static xgl_draw_pic *ui_find_pic(qpic_t *pic)
 {
+    unsigned long address, first, offset;
+    address = (unsigned long)pic; first = (unsigned long)ui_pics;
+    if (address < first) return NULL;
+    offset = address - first;
+    if (offset >= (unsigned long)ui_num_pics * sizeof(ui_pics[0]) ||
+        offset % sizeof(ui_pics[0])) return NULL;
+    return &ui_pics[offset / sizeof(ui_pics[0])];
+}
+
+/* Decide once what a picture is drawn as. The tests are made in this order
+ * and the first that fits wins, so a name is taken the same way whichever
+ * game or add-on it comes from. */
+static void ui_classify(xgl_draw_pic *asset)
+{
+    static const struct { const char *name, *label; } labels[] = {
+        {"ttl_main", "QUAKE"}, {"ttl_sgl", "SINGLE PLAYER"},
+        {"p_multi", "MULTIPLAYER"}, {"p_load", "LOAD GAME"}, {"p_save", "SAVE GAME"},
+        {"p_option", "OPTIONS"}, {"ttl_cstm", "CUSTOMIZE CONTROLS"},
+        {"pause", "PAUSED"}, {"loading", "LOADING..."}, {"ranking", "RANKING"},
+        {"complete", "LEVEL COMPLETE"}, {"finale", "THE END"},
+        {"netmen1", "MODEM"}, {"netmen2", "DIRECT CONNECT"}, {"netmen3", "IPX"},
+        {"netmen4", "TCP/IP"}, {"netmen5", "NETWORK"},
+        {"dim_modm", "MODEM (UNAVAILABLE)"}, {"dim_drct", "DIRECT (UNAVAILABLE)"},
+        {"dim_ipx", "IPX (UNAVAILABLE)"}, {"dim_tcp", "TCP/IP (UNAVAILABLE)"}
+    };
+    static const struct { const char *name, *label; } icons[] = {
+        {"sb_shells", "S"}, {"sb_nails", "N"}, {"sb_rocket", "R"}, {"sb_cells", "C"},
+        {"sb_invis", "INV"}, {"sb_invuln", "GOD"}, {"sb_suit", "SUIT"}, {"sb_quad", "QUAD"},
+        {"sb_wsuit", "WET"}, {"sb_eshld", "SHLD"},
+        {"r_shield1", "SHLD"}, {"r_agrav1", "GRAV"},
+        {"r_ammolava", "L"}, {"r_ammomulti", "M"}, {"r_ammoplasma", "P"},
+        {"ram", "MEM"}, {"net", "NET"}, {"turtle", "SLOW"}, {"disc", "IO"}
+    };
+    const char *name, *weapon, *label;
     int i;
-    for (i = 0; i < ui_num_pics; ++i)
-        if (&ui_pics[i].pic == pic) return &ui_pics[i];
-    return NULL;
+    name = asset->name;
+    asset->kind = UI_PIC_OTHER; asset->color = UI_WHITE; asset->detail = 0;
+    asset->label[0] = 0;
+    if (!strcmp(name, "mainmenu")) { asset->kind = UI_PIC_MAIN_MENU; return; }
+    if (!strcmp(name, "sp_menu")) { asset->kind = UI_PIC_SINGLE_MENU; return; }
+    if (!strcmp(name, "mp_menu")) { asset->kind = UI_PIC_MULTI_MENU; return; }
+    if (!strncmp(name, "help", 4)) {
+        asset->kind = UI_PIC_HELP; asset->detail = atoi(name+4);
+        return;
+    }
+    if (!strncmp(name, "menudot", 7) || !strcmp(name, "qplaque")) {
+        asset->kind = UI_PIC_LABEL; asset->color = UI_GOLD;
+        strcpy(asset->label, name[0] == 'q' ? "Q" : ">");
+        return;
+    }
+    if (!strcmp(name, "menuplyr")) { asset->kind = UI_PIC_PLAYER; return; }
+    if (!strncmp(name, "box_", 4)) {
+        asset->kind = UI_PIC_BOX;
+        if (name[4] == 't') asset->detail |= UI_BOX_TOP;
+        if (name[4] == 'b') asset->detail |= UI_BOX_BOTTOM;
+        if (name[4] && name[5] == 'l') asset->detail |= UI_BOX_LEFT;
+        if (name[4] && name[5] == 'r') asset->detail |= UI_BOX_RIGHT;
+        return;
+    }
+    if (!strcmp(name,"sbar") || !strcmp(name,"ibar") || !strcmp(name,"scorebar") ||
+        !strncmp(name,"r_invbar",8) || !strcmp(name,"r_teambord") ||
+        !strcmp(name,"bigbox") || !strcmp(name,"backtile")) {
+        asset->kind = UI_PIC_PANEL;
+        return;
+    }
+    if (!strcmp(name,"inter")) { asset->kind = UI_PIC_INTERMISSION; return; }
+    if (!strcmp(name,"num_colon") || !strcmp(name,"num_slash")) {
+        asset->kind = UI_PIC_LABEL;
+        strcpy(asset->label, !strcmp(name,"num_colon") ? ":" : "/");
+        return;
+    }
+    if (!strncmp(name,"num_",4) || !strncmp(name,"anum_",5)) {
+        label = name + (name[0] == 'a' ? 5 : 4);
+        if (!strcmp(label,"minus")) label = "-";
+        asset->color = name[0] == 'a' ? 251 : UI_WHITE;
+        asset->kind = label[0] && !label[1] ? UI_PIC_DIGIT : UI_PIC_LABEL;
+        strcpy(asset->label, label);
+        return;
+    }
+    if (!strncmp(name,"inv",3) || !strncmp(name,"r_lava",6) ||
+        !strcmp(name,"r_superlava") || !strcmp(name,"r_gren") ||
+        !strcmp(name,"r_multirock") || !strcmp(name,"r_plasma")) {
+        weapon = strchr(name,'_');
+        weapon = weapon ? weapon+1 : name;
+        label = "W";
+        if (!strcmp(weapon,"shotgun")) label = "SG";
+        else if (!strcmp(weapon,"sshotgun")) label = "SSG";
+        else if (!strcmp(weapon,"nailgun")) label = "NG";
+        else if (!strcmp(weapon,"snailgun")) label = "SNG";
+        else if (!strcmp(weapon,"rlaunch")) label = "GL";
+        else if (!strcmp(weapon,"srlaunch")) label = "RL";
+        else if (!strcmp(weapon,"lightng")) label = "LG";
+        else if (strstr(weapon,"prox")) label = "PROX";
+        else if (!strcmp(weapon,"laser")) label = "LAS";
+        else if (!strcmp(weapon,"mjolnir")) label = "HAM";
+        else if (!strcmp(weapon,"lava")) label = "LNG";
+        else if (!strcmp(weapon,"superlava")) label = "LSNG";
+        else if (!strcmp(weapon,"gren")) label = "MGL";
+        else if (!strcmp(weapon,"multirock")) label = "MRL";
+        else if (!strcmp(weapon,"plasma")) label = "PLAS";
+        asset->color = !strncmp(name,"inv_",4) ? 8 : UI_GOLD;
+        if (!strncmp(name,"inva",4) && name[4] >= '1' && name[4] <= '5')
+            asset->color = (name[4] & 1) ? UI_WHITE : UI_GOLD;
+        asset->kind = UI_PIC_WEAPON;
+        strcpy(asset->label, label);
+        return;
+    }
+    if (!strncmp(name,"sb_armor",8)) {
+        asset->kind = UI_PIC_ARMOR;
+        asset->color = name[8] == '1' ? 209 : (name[8] == '2' ? 111 : 251);
+        return;
+    }
+    if (!strncmp(name,"sb_key",6)) {
+        asset->kind = UI_PIC_KEY;
+        asset->color = name[6] == '1' ? UI_WHITE : UI_GOLD;
+        return;
+    }
+    if (!strncmp(name,"face",4)) {
+        asset->kind = UI_PIC_FACE;
+        asset->color = !strncmp(name,"face_p",6) ? 251 : 191;
+        if (!strcmp(name,"face_quad")) asset->detail = UI_FACE_QUAD;
+        else if (!strcmp(name,"face_inv2")) asset->detail = UI_FACE_BOTH;
+        else if (strstr(name,"invul")) asset->detail = UI_FACE_INVULNERABLE;
+        else if (strstr(name,"invis")) asset->detail = UI_FACE_INVISIBLE;
+        else if (name[4] >= '1' && name[4] <= '5') asset->detail = name[4]-'0';
+        return;
+    }
+    if (!strncmp(name,"sb_sigil",8)) {
+        asset->kind = UI_PIC_SIGIL;
+        asset->label[0] = name[8]; asset->label[1] = 0;
+        return;
+    }
+    for (i = 0; i < (int)(sizeof(labels)/sizeof(labels[0])); ++i) {
+        if (!strcmp(name,labels[i].name)) {
+            asset->kind = UI_PIC_LABEL;
+            asset->color = !strncmp(name,"dim_",4) ? 8 : UI_GOLD;
+            strcpy(asset->label, labels[i].label);
+            return;
+        }
+    }
+    for (i = 0; i < (int)(sizeof(icons)/sizeof(icons[0])); ++i) {
+        if (!strcmp(name,icons[i].name)) {
+            asset->kind = UI_PIC_ICON;
+            strcpy(asset->label, icons[i].label);
+            return;
+        }
+    }
 }
 
 static xgl_draw_pic *ui_pic_slot(const char *source, int wad)
@@ -144,6 +327,7 @@ static xgl_draw_pic *ui_pic_slot(const char *source, int wad)
     if (length > 4 && !strcmp(base+length-4, ".lmp")) length -= 4;
     memcpy(asset->name, base, length);
     asset->name[length] = 0;
+    ui_classify(asset);
     return asset;
 }
 
@@ -304,8 +488,7 @@ static void ui_help(float x, float y, float w, float h, int page)
     int i;
     float cell;
     if (page < 0 || page > 5) page = 0;
-    ui_fill(x, y, w, h, UI_DARK, 1);
-    ui_border(x, y, w, h, UI_EDGE);
+    ui_panel(x, y, w, h, UI_DARK, UI_EDGE);
     ui_label(x+8, y+8, w-16, 24, pages[page][0], UI_GOLD);
     for (i = 1; i < 7; ++i) {
         cell = (w-24)/(float)strlen(pages[page][i]);
@@ -319,27 +502,8 @@ static void ui_picture(int ix, int iy, qpic_t *pic, byte *translation)
     static const char *const main_rows[] = {"SINGLE PLAYER", "MULTIPLAYER", "OPTIONS", "HELP", "QUIT"};
     static const char *const single_rows[] = {"NEW GAME", "LOAD", "SAVE"};
     static const char *const multi_rows[] = {"JOIN GAME", "NEW GAME", "SETUP"};
-    static const struct { const char *name, *label; } labels[] = {
-        {"ttl_main", "QUAKE"}, {"ttl_sgl", "SINGLE PLAYER"},
-        {"p_multi", "MULTIPLAYER"}, {"p_load", "LOAD GAME"}, {"p_save", "SAVE GAME"},
-        {"p_option", "OPTIONS"}, {"ttl_cstm", "CUSTOMIZE CONTROLS"},
-        {"pause", "PAUSED"}, {"loading", "LOADING..."}, {"ranking", "RANKING"},
-        {"complete", "LEVEL COMPLETE"}, {"finale", "THE END"},
-        {"netmen1", "MODEM"}, {"netmen2", "DIRECT CONNECT"}, {"netmen3", "IPX"},
-        {"netmen4", "TCP/IP"}, {"netmen5", "NETWORK"},
-        {"dim_modm", "MODEM (UNAVAILABLE)"}, {"dim_drct", "DIRECT (UNAVAILABLE)"},
-        {"dim_ipx", "IPX (UNAVAILABLE)"}, {"dim_tcp", "TCP/IP (UNAVAILABLE)"}
-    };
-    static const struct { const char *name, *label; } icons[] = {
-        {"sb_shells", "S"}, {"sb_nails", "N"}, {"sb_rocket", "R"}, {"sb_cells", "C"},
-        {"sb_invis", "INV"}, {"sb_invuln", "GOD"}, {"sb_suit", "SUIT"}, {"sb_quad", "QUAD"},
-        {"sb_wsuit", "WET"}, {"sb_eshld", "SHLD"},
-        {"r_shield1", "SHLD"}, {"r_agrav1", "GRAV"},
-        {"r_ammolava", "L"}, {"r_ammomulti", "M"}, {"r_ammoplasma", "P"},
-        {"ram", "MEM"}, {"net", "NET"}, {"turtle", "SLOW"}, {"disc", "IO"}
-    };
     xgl_draw_pic *asset;
-    const char *name, *weapon, *label;
+    const char *name;
     char text[MAX_QPATH];
     float x, y, w, h;
     int i, color, count;
@@ -347,133 +511,77 @@ static void ui_picture(int ix, int iy, qpic_t *pic, byte *translation)
     ui_flush_text();
     x = (float)ix; y = (float)iy; w = (float)pic->width; h = (float)pic->height;
     asset = ui_find_pic(pic);
-    name = asset ? asset->name : "picture";
-    if (!strcmp(name, "mainmenu")) { ui_menu_rows(x,y,w,main_rows,5); return; }
-    if (!strcmp(name, "sp_menu")) { ui_menu_rows(x,y,w,single_rows,3); return; }
-    if (!strcmp(name, "mp_menu")) { ui_menu_rows(x,y,w,multi_rows,3); return; }
-    if (!strncmp(name, "help", 4)) { ui_help(x,y,w,h,atoi(name+4)); return; }
-    if (!strncmp(name, "menudot", 7)) {
-        ui_label(x,y,w,h,">", UI_GOLD); return;
-    }
-    if (!strcmp(name, "qplaque")) { ui_label(x,y,w,h,"Q",UI_GOLD); return; }
-    if (!strcmp(name, "menuplyr")) { ui_player(x,y,w,h,translation); return; }
-    if (!strncmp(name, "box_", 4)) {
+    color = asset ? asset->color : UI_WHITE;
+    switch (asset ? asset->kind : UI_PIC_OTHER) {
+    case UI_PIC_MAIN_MENU: ui_menu_rows(x,y,w,main_rows,5); return;
+    case UI_PIC_SINGLE_MENU: ui_menu_rows(x,y,w,single_rows,3); return;
+    case UI_PIC_MULTI_MENU: ui_menu_rows(x,y,w,multi_rows,3); return;
+    case UI_PIC_HELP: ui_help(x,y,w,h,asset->detail); return;
+    case UI_PIC_LABEL: ui_label(x,y,w,h,asset->label,color); return;
+    case UI_PIC_PLAYER: ui_player(x,y,w,h,translation); return;
+    case UI_PIC_BOX:
         ui_fill(x,y,w,h,UI_DARK,1);
-        if (name[4] == 't') ui_fill(x,y,w,1,UI_EDGE,1);
-        if (name[4] == 'b') ui_fill(x,y+h-1,w,1,UI_EDGE,1);
-        if (name[5] == 'l') ui_fill(x,y,1,h,UI_EDGE,1);
-        if (name[5] == 'r') ui_fill(x+w-1,y,1,h,UI_EDGE,1);
+        if (asset->detail & UI_BOX_TOP) ui_fill(x,y,w,1,UI_EDGE,1);
+        if (asset->detail & UI_BOX_BOTTOM) ui_fill(x,y+h-1,w,1,UI_EDGE,1);
+        if (asset->detail & UI_BOX_LEFT) ui_fill(x,y,1,h,UI_EDGE,1);
+        if (asset->detail & UI_BOX_RIGHT) ui_fill(x+w-1,y,1,h,UI_EDGE,1);
         return;
-    }
-    if (!strcmp(name,"sbar") || !strcmp(name,"ibar") || !strcmp(name,"scorebar") ||
-        !strncmp(name,"r_invbar",8) || !strcmp(name,"r_teambord") ||
-        !strcmp(name,"bigbox") || !strcmp(name,"backtile")) {
-        ui_fill(x,y,w,h,UI_DARK,1);
-        ui_border(x,y,w,h,UI_EDGE);
+    case UI_PIC_PANEL:
+        ui_panel(x,y,w,h,UI_DARK,UI_EDGE);
         return;
-    }
-    if (!strcmp(name,"inter")) {
+    case UI_PIC_INTERMISSION:
         ui_fill(x,y,w,h,UI_DARK,1);
         ui_label(x+8,y+8,136,24,"TIME",UI_GOLD);
         ui_label(x+8,y+48,136,24,"SECRETS",UI_GOLD);
         ui_label(x+8,y+88,136,24,"KILLS",UI_GOLD);
         return;
-    }
-    if (!strcmp(name,"num_colon") || !strcmp(name,"num_slash")) {
-        ui_label(x,y,w,h,!strcmp(name,"num_colon") ? ":" : "/",UI_WHITE);
+    case UI_PIC_DIGIT:
+        if (w > 0 && h > 0) ui_number_digit(x,y,w,h,asset->label[0],color);
+        else ui_label(x,y,w,h,asset->label,color);
         return;
-    }
-    if (!strncmp(name,"num_",4) || !strncmp(name,"anum_",5)) {
-        label = name + (name[0] == 'a' ? 5 : 4);
-        if (!strcmp(label,"minus")) label = "-";
-        color = name[0] == 'a' ? 251 : UI_WHITE;
-        if (label[0] && !label[1] && w > 0 && h > 0)
-            ui_number_digit(x,y,w,h,label[0],color);
-        else ui_label(x,y,w,h,label,color);
+    case UI_PIC_WEAPON:
+        ui_panel(x,y,w,h,UI_DARK,color);
+        ui_label(x+1,y+1,w-2,h-2,asset->label,color);
         return;
-    }
-    if (!strncmp(name,"inv",3) || !strncmp(name,"r_lava",6) ||
-        !strcmp(name,"r_superlava") || !strcmp(name,"r_gren") ||
-        !strcmp(name,"r_multirock") || !strcmp(name,"r_plasma")) {
-        weapon = strchr(name,'_');
-        weapon = weapon ? weapon+1 : name;
-        label = "W";
-        if (!strcmp(weapon,"shotgun")) label = "SG";
-        else if (!strcmp(weapon,"sshotgun")) label = "SSG";
-        else if (!strcmp(weapon,"nailgun")) label = "NG";
-        else if (!strcmp(weapon,"snailgun")) label = "SNG";
-        else if (!strcmp(weapon,"rlaunch")) label = "GL";
-        else if (!strcmp(weapon,"srlaunch")) label = "RL";
-        else if (!strcmp(weapon,"lightng")) label = "LG";
-        else if (strstr(weapon,"prox")) label = "PROX";
-        else if (!strcmp(weapon,"laser")) label = "LAS";
-        else if (!strcmp(weapon,"mjolnir")) label = "HAM";
-        else if (!strcmp(weapon,"lava")) label = "LNG";
-        else if (!strcmp(weapon,"superlava")) label = "LSNG";
-        else if (!strcmp(weapon,"gren")) label = "MGL";
-        else if (!strcmp(weapon,"multirock")) label = "MRL";
-        else if (!strcmp(weapon,"plasma")) label = "PLAS";
-        color = !strncmp(name,"inv_",4) ? 8 : UI_GOLD;
-        if (!strncmp(name,"inva",4) && name[4] >= '1' && name[4] <= '5')
-            color = (name[4] & 1) ? UI_WHITE : UI_GOLD;
-        ui_fill(x,y,w,h,UI_DARK,1);
-        ui_border(x,y,w,h,color);
-        ui_label(x+1,y+1,w-2,h-2,label,color);
-        return;
-    }
-    if (!strncmp(name,"sb_armor",8)) {
-        color = name[8] == '1' ? 209 : (name[8] == '2' ? 111 : 251);
+    case UI_PIC_ARMOR:
         ui_fill(x+w*.2f,y+2,w*.6f,h*.6f,color,1);
         ui_fill(x+w*.3f,y+h*.6f,w*.4f,h*.2f,color,1);
         ui_fill(x+w*.4f,y+h*.8f,w*.2f,h*.1f,color,1);
         return;
-    }
-    if (!strncmp(name,"sb_key",6)) {
-        color = name[6] == '1' ? UI_WHITE : UI_GOLD;
+    case UI_PIC_KEY:
         ui_border(x+1,y+1,w*.65f,h*.4f,color);
         ui_fill(x+w*.35f,y+h*.35f,2,h*.55f,color,1);
         ui_fill(x+w*.35f,y+h*.65f,w*.4f,2,color,1);
         return;
-    }
-    if (!strncmp(name,"face",4)) {
-        color = !strncmp(name,"face_p",6) ? 251 : 191;
+    case UI_PIC_FACE:
         ui_fill(x+2,y+1,w-4,h-2,color,1);
         ui_fill(x+w*.23f,y+h*.3f,3,2,1,1);
         ui_fill(x+w*.65f,y+h*.3f,3,2,1,1);
         ui_fill(x+w*.3f,y+h*.72f,w*.4f,2,1,1);
-        if (!strcmp(name,"face_quad")) ui_border(x,y,w,h,219);
-        else if (!strcmp(name,"face_inv2")) {
+        if (asset->detail == UI_FACE_QUAD) ui_border(x,y,w,h,219);
+        else if (asset->detail == UI_FACE_BOTH) {
             ui_border(x,y,w,h,UI_WHITE);
             ui_border(x+1,y+1,w-2,h-2,UI_GOLD);
         }
-        else if (strstr(name,"invul")) ui_border(x,y,w,h,UI_GOLD);
-        else if (strstr(name,"invis")) ui_border(x,y,w,h,UI_WHITE);
-        else if (name[4] >= '1' && name[4] <= '5')
-            ui_fill(x+1,y+h-2,(w-2)*(6-(name[4]-'0'))/5,1,251,1);
+        else if (asset->detail == UI_FACE_INVULNERABLE) ui_border(x,y,w,h,UI_GOLD);
+        else if (asset->detail == UI_FACE_INVISIBLE) ui_border(x,y,w,h,UI_WHITE);
+        else if (asset->detail)
+            ui_fill(x+1,y+h-2,(w-2)*(6-asset->detail)/5,1,251,1);
         return;
-    }
-    if (!strncmp(name,"sb_sigil",8)) {
-        text[0] = name[8]; text[1] = 0;
+    case UI_PIC_SIGIL:
         ui_border(x,y,w,h,UI_GOLD);
-        ui_label(x,y,w,h,text,UI_GOLD);
+        ui_label(x,y,w,h,asset->label,UI_GOLD);
         return;
-    }
-    for (i = 0; i < (int)(sizeof(labels)/sizeof(labels[0])); ++i) {
-        if (!strcmp(name,labels[i].name)) {
-            ui_label(x,y,w,h,labels[i].label,!strncmp(name,"dim_",4) ? 8 : UI_GOLD);
-            return;
-        }
-    }
-    for (i = 0; i < (int)(sizeof(icons)/sizeof(icons[0])); ++i) {
-        if (!strcmp(name,icons[i].name)) {
-            ui_fill(x,y,w,h,UI_DARK,1);
-            ui_border(x,y,w,h,UI_EDGE);
-            ui_label(x,y,w,h,icons[i].label,UI_WHITE);
-            return;
-        }
+    case UI_PIC_ICON:
+        ui_panel(x,y,w,h,UI_DARK,UI_EDGE);
+        ui_label(x,y,w,h,asset->label,UI_WHITE);
+        return;
+    default:
+        break;
     }
     /* Mods can add pictures. Keep an identifiable, dimension-preserving
      * control rather than silently leaving its original UI position empty. */
+    name = asset ? asset->name : "picture";
     count = (int)((w-2)/4);
     if (count < 1) count = 1;
     if (count >= (int)sizeof(text)) count = sizeof(text)-1;
@@ -482,8 +590,7 @@ static void ui_picture(int ix, int iy, qpic_t *pic, byte *translation)
         if (text[i] >= 'a' && text[i] <= 'z') text[i] -= 'a'-'A';
     }
     text[i] = 0;
-    ui_fill(x,y,w,h,UI_DARK,1);
-    ui_border(x,y,w,h,UI_EDGE);
+    ui_panel(x,y,w,h,UI_DARK,UI_EDGE);
     ui_label(x,y,w,h,text,UI_WHITE);
 }
 

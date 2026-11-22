@@ -42,6 +42,8 @@ typedef enum {
     XGL_PROFILE_POLYGON_CALLS,
     XGL_PROFILE_WAIT_CALLS,
     XGL_PROFILE_STATE_CHANGES,
+    /* Frames whose clear left the status bar in place. */
+    XGL_PROFILE_BAR_KEPT,
     /* Detail counters use per-frame averages in the report. Cached world
      * draws include a mesh built earlier in the same frame; they are not
      * lookup hits and must not be divided by the build count as a hit rate. */

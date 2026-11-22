@@ -172,7 +172,13 @@ void Sys_SendKeyEvents(void)
             Key_ClearStates();
             IN_ClearStates();
             break;
+        case MapNotify:
+            Sbar_Changed();
+            break;
         case ConfigureNotify:
+            /* A status bar left in place lives in both window buffers, and
+             * the hidden one need not follow a window that only moved. */
+            Sbar_Changed();
             width = event.xconfigure.width;
             height = event.xconfigure.height;
             /* Window-manager size hints are advisory. Keep the engine's
@@ -191,7 +197,6 @@ void Sys_SendKeyEvents(void)
                 vid.aspect = ((float)height / width) * (320.0f / 240.0f);
                 vid.recalc_refdef = 1;
                 XGLB_Resize(width, height);
-                Sbar_Changed();
                 Con_CheckResize();
                 IN_ClearStates();
             }

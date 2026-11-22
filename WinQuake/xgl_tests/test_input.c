@@ -338,8 +338,14 @@ static void test_resize_limits(void)
     event=event_slot(ConfigureNotify);
     event->xconfigure.width=320;
     event->xconfigure.height=200;
+    status_redraws=0;
     Sys_SendKeyEvents();
-    assert(resize_calls==1 && backend_resizes==2);
+    /* The same size: the window only moved. Its hidden buffer may not have
+     * come with it, so a status bar left in place is drawn again. */
+    assert(resize_calls==1 && backend_resizes==2 && status_redraws==1);
+    event=event_slot(MapNotify);
+    Sys_SendKeyEvents();
+    assert(status_redraws==2 && backend_resizes==2);
     event=event_slot(ConfigureNotify);
     event->xconfigure.width=5000;
     event->xconfigure.height=9000;

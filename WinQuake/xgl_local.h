@@ -85,6 +85,13 @@ extern byte gammatable[256];
 void XGL_BeginFrame(void);
 /* After BeginFrame and before BeginScene, pass the opaque console height
  * in logical screen pixels. Zero leaves the complete game view visible. */
+/* Ask the next frame's clear to leave the bottom `lines` rows of the 2D
+ * screen as they are, for a status bar that has not changed. The request
+ * is for that one frame, and the backend may decline it. */
+void XGL_SetFrameKeep(int lines);
+/* For the frame begun last: 0 if everything was cleared; else the number
+ * of frames running, this one included, whose clears left the same rows. */
+int XGL_FrameKeepStreak(void);
 void XGL_SetConsoleClip(int lines);
 void XGL_BeginScene(void);
 /* Positions and unit normals are in Quake world coordinates. */

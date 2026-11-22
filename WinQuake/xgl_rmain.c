@@ -67,6 +67,8 @@ static void XGL_TimeRefresh_f (void)
     }
     elapsed = Sys_FloatTime() - start;
     r_refdef.viewangles[1] = angle;
+    /* Those frames cleared the status bar away without drawing one. */
+    Sbar_Changed();
     if (elapsed > 0) Con_Printf("%f seconds (%f fps)\n", elapsed, 128 / elapsed);
 }
 

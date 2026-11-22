@@ -168,7 +168,7 @@ void XGL_ProfileEndFrame(void)
         "world %.2f entities %.2f effects %.2f weapon %.2f UI %.2f audio-overlap %.2f ms\n"
         "  native calls (overlap stages): submit %.2f sync %.2f swap %.2f state %.2f ms; "
         "per frame: triangles %.1f glyphs %.1f polygon calls %.1f waits %.1f "
-        "state changes %.1f\n",
+        "state changes %.1f status bar kept %.2f\n",
         total_frames, total_frame * scale, maximum_frame * 1000.0,
         total_sections[XGL_PROFILE_WORLD] * scale,
         total_sections[XGL_PROFILE_ENTITIES] * scale,
@@ -184,7 +184,8 @@ void XGL_ProfileEndFrame(void)
         (double)total_counts[XGL_PROFILE_GLYPHS] / total_frames,
         (double)total_counts[XGL_PROFILE_POLYGON_CALLS] / total_frames,
         (double)total_counts[XGL_PROFILE_WAIT_CALLS] / total_frames,
-        (double)total_counts[XGL_PROFILE_STATE_CHANGES] / total_frames);
+        (double)total_counts[XGL_PROFILE_STATE_CHANGES] / total_frames,
+        (double)total_counts[XGL_PROFILE_BAR_KEPT] / total_frames);
     if (profile_reporting == 2) {
         Sys_Printf("  detail ms (overlap stages; select includes builds): "
             "visibility %.2f select %.2f build %.2f colors %.2f animated %.2f "

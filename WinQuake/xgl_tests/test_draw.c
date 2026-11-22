@@ -277,6 +277,69 @@ static void test_number_runs(void)
     assert(num_ops==3 && strlen(ops[0].text)==XGL_DRAW_NUMBER && !strcmp(ops[1].text,"23"));
 }
 
+/* A picture is told apart by name once, when first asked for; drawing it
+ * looks nothing up. Boxes with an edge take two rectangles. */
+static void test_descriptors_and_panels(void)
+{
+    static qpic_t foreign;
+    xgl_draw_pic *asset;
+    qpic_t *bar, *weapon, *tiny;
+    int i;
+    bar = Draw_PicFromWad("sbar");
+    asset = ui_find_pic(bar);
+    assert(asset && &asset->pic == bar && asset->kind == UI_PIC_PANEL);
+    weapon = Draw_PicFromWad("inva3_lightng");
+    asset = ui_find_pic(weapon);
+    assert(asset->kind == UI_PIC_WEAPON && asset->color == UI_WHITE && !strcmp(asset->label, "LG"));
+    assert(ui_find_pic(Draw_PicFromWad("face3"))->detail == 3);
+    assert(ui_find_pic(Draw_PicFromWad("face_quad"))->detail == UI_FACE_QUAD);
+    assert(ui_find_pic(Draw_PicFromWad("box_tl"))->detail == (UI_BOX_TOP | UI_BOX_LEFT));
+    assert(ui_find_pic(Draw_PicFromWad("box_br"))->detail == (UI_BOX_BOTTOM | UI_BOX_RIGHT));
+    assert(ui_find_pic(Draw_PicFromWad("box_mm"))->detail == 0);
+    assert(ui_find_pic(Draw_PicFromWad("num_minus"))->kind == UI_PIC_DIGIT);
+    assert(ui_find_pic(Draw_PicFromWad("num_12"))->kind == UI_PIC_LABEL);
+    assert(ui_find_pic(Draw_PicFromWad("help3"))->detail == 3);
+    assert(ui_find_pic(Draw_CachePic("gfx/unheard_of.lmp"))->kind == UI_PIC_OTHER);
+    /* Only the handles given out are descriptors. */
+    assert(!ui_find_pic(&foreign) && !ui_find_pic(NULL));
+    assert(!ui_find_pic((qpic_t *)((byte *)bar + 4)));
+    assert(!ui_find_pic(&ui_pics[ui_num_pics].pic));
+    foreign.width = 40; foreign.height = 16;
+    reset_ops();
+    Draw_Pic(0,0,&foreign);
+    assert(has_text("PICTURE"));
+    /* Edge color under the whole box, the fill over its inside. */
+    reset_ops();
+    wad_picture.width = 24;
+    Draw_Pic(10,20,bar);
+    assert(num_ops==2 && ops[0].kind=='Q' && ops[1].kind=='Q');
+    assert(ops[0].x==10 && ops[0].y==20 && ops[0].width==24 && ops[0].height==24);
+    assert(ops[0].color==UI_EDGE);
+    assert(ops[1].x==11 && ops[1].y==21 && ops[1].width==22 && ops[1].height==22);
+    assert(ops[1].color==UI_DARK);
+    reset_ops();
+    Draw_Pic(0,0,weapon);
+    assert(num_ops==3 && ops[0].color==UI_WHITE && ops[1].color==UI_DARK);
+    assert(ops[2].kind=='T' && !strcmp(ops[2].text,"LG") && ops[2].color==UI_WHITE);
+    /* Too small to have an inside: the edge is all there is. */
+    tiny = Draw_CachePic("gfx/ibar.lmp");
+    tiny->width = tiny->height = 2;
+    reset_ops();
+    Draw_Pic(5,5,tiny);
+    assert(num_ops==1 && ops[0].color==UI_EDGE && ops[0].width==2 && ops[0].height==2);
+    /* The status bar's pictures in one go: the same requests each time. */
+    reset_ops();
+    for (i = 0; i < 2; ++i) {
+        Draw_Pic(0,216,bar);
+        Draw_Pic(24,216,Draw_PicFromWad("num_1"));
+        Draw_Pic(48,216,Draw_PicFromWad("num_0"));
+        Draw_Pic(112,216,Draw_PicFromWad("face1"));
+        XGL_DrawFlush();
+        if (!i) { assert(num_ops==9); reset_ops(); }
+    }
+    assert(num_ops==9 && ops[2].kind=='T' && !strcmp(ops[2].text,"10"));
+}
+
 int main(void)
 {
     memset(&vid,0,sizeof(vid));
@@ -290,6 +353,7 @@ int main(void)
     test_cells_and_order();
     test_pictures_and_translation();
     test_number_runs();
+    test_descriptors_and_panels();
     puts("XGL UI adapter semantic tests passed (no device rendering)");
     return 0;
 }

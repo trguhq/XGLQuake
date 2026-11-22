@@ -41,6 +41,14 @@ typedef struct {
     Xgl_pt_f2d advance[95];
 } xgl_font_size_t;
 
+/* A text run waiting to be drawn. box: the screen cells it covers, in 2D
+ * screen units, left, top, right, bottom. */
+typedef struct {
+    float height, spacing, box[4];
+    Xgl_color color;
+    int text, glyphs, sent;
+} xgl_ui_run_t;
+
 typedef struct {
     Xgl_sys_state system;
     Xgl_win_ras raster;
@@ -57,6 +65,11 @@ typedef struct {
     Xgl_pt_list lists[XGL_BATCH_TRIANGLES];
     xgl_font_size_t fonts[XGL_FONT_CACHE];
     Xgl_pt_f2d ui_positions[XGL_UI_GLYPHS];
+    /* Runs from ui_run_first on have not been drawn yet. ui_text_box
+     * encloses them all. */
+    xgl_ui_run_t ui_runs[XGL_UI_GLYPHS];
+    float ui_text_box[4];
+    int ui_run_first;
     char ui_text[XGL_UI_TEXT_BYTES];
     Xgl_pt_f2d ui_points[XGL_UI_QUADS][4];
     Xgl_pt_list ui_lists[XGL_UI_QUADS];
@@ -64,6 +77,13 @@ typedef struct {
     Xgl_facet_list ui_facets[XGL_UI_QUADS];
     char glyphs[95][2];
     int width, height, frame, scene_active, ui_active, overlay_3d, console_lines;
+    /* keep_request: bottom rows the next frame's clear is asked to leave
+     * alone. kept_rows: those the current frame's clear did leave, and
+     * keep_streak for how many frames running. viewport_state: 0 until the
+     * device's own viewport has been read, then 1 if it is the plain row
+     * range a cut can be made in, or -1. */
+    int keep_request, kept_rows, keep_streak, viewport_state;
+    Xgl_bounds_d3d full_viewport;
     int count, lit, zwrite, applied_lit, applied_zwrite;
     int errors, fatal, font_next, ui_glyph_count, ui_quad_count, ui_text_used;
     int scene_pending, ui_pending, ui_quad_first, text_color_valid;
@@ -246,9 +266,75 @@ static void submit_ui_quads(void)
     XGL_AudioUpdate();
 }
 
+static void text_spacing(float spacing);
+
+/* Draw the queued text. The rectangles queued with it go first: none of
+ * them was asked for after a run that it overlaps, so the picture is the
+ * one the calls would have drawn in order. Runs that share a size and a
+ * color are drawn together, each such group once, which leaves the fewest
+ * attribute changes; within a group the order of the calls is kept. */
+static void submit_ui_text(void)
+{
+    xgl_ui_run_t *run, *other;
+    double start;
+    int i, j, count;
+    count = xb.ui_glyph_count;
+    if (xb.ui_run_first == count) return;
+    submit_ui_quads();
+    native_check();
+    for (i = xb.ui_run_first; i < count; ++i) {
+        run = &xb.ui_runs[i];
+        if (run->sent) continue;
+        xb.stage = "UI text attributes";
+        if (xb.current_text_height != run->height) {
+            xgl_object_set(xb.ui, XGL_CTX_STEXT_CHAR_HEIGHT, (double)run->height, 0);
+            native_check();
+            xb.current_text_height = run->height;
+        }
+        text_spacing(run->spacing);
+        if (!xb.text_color_valid || memcmp(&xb.text_color, &run->color, sizeof(run->color))) {
+            xgl_object_set(xb.ui, XGL_CTX_STEXT_COLOR, &run->color, 0);
+            xb.text_color = run->color;
+            xb.text_color_valid = 1;
+        }
+        native_check();
+        xb.stage = "UI text run submission";
+        for (j = i; j < count; ++j) {
+            other = &xb.ui_runs[j];
+            if (other->sent || other->height != run->height || other->spacing != run->spacing ||
+                memcmp(&other->color, &run->color, sizeof(run->color))) continue;
+            start = XGL_ProfileNow();
+            xgl_stroke_text(xb.ui, xb.ui_text + other->text, &xb.ui_positions[j], NULL);
+            XGL_ProfileAdd(XGL_PROFILE_SUBMIT, start);
+            XGL_ProfileCount(XGL_PROFILE_GLYPHS, (unsigned long)other->glyphs);
+            XGL_ProfileCount(XGL_PROFILE_TEXT_CALLS, 1);
+            other->sent = 1;
+        }
+        native_check();
+    }
+    xb.ui_run_first = count;
+    xb.ui_pending = 1;
+    XGL_AudioUpdate();
+}
+
+/* Whether a rectangle would cover any part of a queued text run. */
+static int ui_text_overlaps(float left, float top, float right, float bottom)
+{
+    const xgl_ui_run_t *run;
+    int i;
+    if (xb.ui_run_first == xb.ui_glyph_count) return 0;
+    if (left >= xb.ui_text_box[2] || right <= xb.ui_text_box[0] ||
+        top >= xb.ui_text_box[3] || bottom <= xb.ui_text_box[1]) return 0;
+    for (i = xb.ui_run_first, run = &xb.ui_runs[i]; i < xb.ui_glyph_count; ++i, ++run)
+        if (left < run->box[2] && right > run->box[0] &&
+            top < run->box[3] && bottom > run->box[1]) return 1;
+    return 0;
+}
+
 void XGL_UIFlush(void)
 {
     double start;
+    submit_ui_text();
     submit_ui_quads();
     xb.stage = "UI completion";
     if (xb.ui && xb.ui_pending && !xb.fatal) {
@@ -263,7 +349,7 @@ void XGL_UIFlush(void)
     }
     native_check();
     xb.ui_glyph_count = xb.ui_quad_count = xb.ui_quad_first = 0;
-    xb.ui_text_used = 0;
+    xb.ui_text_used = xb.ui_run_first = 0;
 }
 
 static void set_transparency(float opacity, int zwrite)
@@ -606,8 +692,53 @@ float XGL_AmbientLight(void)
     return bound_color(xgl_ambient.value);
 }
 
+void XGL_SetFrameKeep(int lines)
+{
+    xb.keep_request = lines > 0 ? lines : 0;
+}
+
+int XGL_FrameKeepStreak(void)
+{
+    return xb.keep_streak;
+}
+
+/* Restrict the scene to the rows above the lowest `rows`, so that the clear
+ * that follows leaves those alone. This is the sequence the benchmark's
+ * viewport probe ran on the device: read the viewport XGL chose for the
+ * whole window, then turn its automatic mapping off and set a shorter one.
+ * Returns 0, changing nothing, unless that viewport is the window's rows
+ * counted from the top. */
+static int keep_viewport(int rows)
+{
+    Xgl_bounds_d3d reduced;
+    double extent;
+    if (!xb.viewport_state) {
+        xb.stage = "device viewport inquiry";
+        memset(&xb.full_viewport, 0, sizeof(xb.full_viewport));
+        xgl_object_get(xb.scene, XGL_CTX_DC_VIEWPORT, &xb.full_viewport);
+        native_check();
+        extent = xb.full_viewport.ymax - xb.full_viewport.ymin;
+        xb.viewport_state = xb.full_viewport.ymin == 0 &&
+            (extent == xb.height - 1 || extent == xb.height) ? 1 : -1;
+        /* Said once per window size, on stderr: the console can draw. */
+        if (xb.viewport_state < 0)
+            fprintf(stderr, "XGL: device viewport rows %g..%g for a window of %d; "
+                    "the status bar is redrawn every frame\n",
+                    xb.full_viewport.ymin, xb.full_viewport.ymax, xb.height);
+    }
+    if (xb.viewport_state < 0) return 0;
+    reduced = xb.full_viewport;
+    reduced.ymax -= rows;
+    xb.stage = "reduced clear viewport";
+    xgl_object_set(xb.scene, XGL_CTX_VDC_MAP, XGL_VDC_MAP_OFF,
+                   XGL_CTX_DC_VIEWPORT, &reduced, 0);
+    native_check();
+    return rows;
+}
+
 void XGL_BeginFrame(void)
 {
+    int rows;
     if (!xb.system) return;
     XGL_ProfileBeginFrame();
     XGL_AudioUpdate();
@@ -615,6 +746,10 @@ void XGL_BeginFrame(void)
     XGL_Flush(); XGL_UIFlush(); complete_scene();
     xb.frame = 1; xb.scene_active = 0; xb.ui_active = 0; xb.overlay_3d = 0;
     xb.console_lines = 0;
+    /* Rows are only left alone when a screen row is a device row. */
+    rows = xb.keep_request;
+    xb.keep_request = 0;
+    if (rows >= xb.height || xb.width != (int)vid.width || xb.height != (int)vid.height) rows = 0;
     set_transparency(1, 1);
     xb.stage = "frame clear state";
     xgl_object_set(xb.scene,
@@ -623,10 +758,22 @@ void XGL_BeginFrame(void)
         XGL_3D_CTX_HLHSR_MODE, XGL_HLHSR_Z_BUFFER,
         XGL_CTX_NEW_FRAME_ACTION, XGL_CTX_NEW_FRAME_CLEAR | XGL_CTX_NEW_FRAME_HLHSR_ACTION, 0);
     native_check();
+    if (rows) rows = keep_viewport(rows);
     xb.stage = "frame clear";
     xgl_context_new_frame(xb.scene);
     xb.scene_pending = 1;
     native_check();
+    if (rows) {
+        /* Hand the mapping back to XGL, with its own viewport in place
+         * first in case it would otherwise keep the shorter one. */
+        xb.stage = "full viewport after clear";
+        xgl_object_set(xb.scene, XGL_CTX_DC_VIEWPORT, &xb.full_viewport,
+                       XGL_CTX_VDC_MAP, XGL_VDC_MAP_ALL, 0);
+        native_check();
+        XGL_ProfileCount(XGL_PROFILE_BAR_KEPT, 1);
+    }
+    xb.keep_streak = rows && rows == xb.kept_rows ? xb.keep_streak + 1 : (rows != 0);
+    xb.kept_rows = rows;
 }
 
 void XGL_SetConsoleClip(int lines)
@@ -847,37 +994,26 @@ static xgl_font_size_t *font_size(float cell, float height)
     return font;
 }
 
+/* Text is queued and drawn when the UI is next completed, or sooner if a
+ * rectangle is asked for that would have to cover it. Until then the
+ * rectangles asked for in between collect in one native call instead of
+ * one before every piece of text. */
 void XGL_UIText(float x, float y, const char *text, int color, float cell_width, float height)
 {
     xgl_font_size_t *font;
+    xgl_ui_run_t *queued;
     Xgl_pt_f2d *position;
     Xgl_bounds_f2d *bounds;
     Xgl_color rgb;
     char run[XGL_UI_TEXT_RUN + 1], *saved;
-    double start, next_origin, desired_origin;
-    float sx, sy, width, origin_x, origin_y, next_x;
+    double next_origin, desired_origin;
+    float sx, sy, width, origin_x, origin_y, next_x, right;
     int character, next_character, previous, length, used, glyphs;
     if (!xb.frame || !text || cell_width <= 0 || height <= 0) return;
     native_check();
     begin_ui();
-    /* Submit rectangles before subsequent glyphs, retaining painter order
-     * without synchronizing two primitives on the same UI context. */
-    submit_ui_quads();
     font = font_size(cell_width, height);
-    xb.stage = "UI text attributes";
-    if (xb.current_text_height != font->requested) {
-        xgl_object_set(xb.ui, XGL_CTX_STEXT_CHAR_HEIGHT, (double)font->requested, 0);
-        native_check();
-        xb.current_text_height = font->requested;
-    }
-    text_spacing(font->spacing);
     palette_color(color, &rgb);
-    if (!xb.text_color_valid || memcmp(&xb.text_color, &rgb, sizeof(rgb))) {
-        xgl_object_set(xb.ui, XGL_CTX_STEXT_COLOR, &rgb, 0);
-        xb.text_color = rgb;
-        xb.text_color_valid = 1;
-    }
-    native_check();
     sx = (float)xb.width / vid.width; sy = (float)xb.height / vid.height;
     while (*text) {
         character = ((unsigned char)*text) & 127;
@@ -919,19 +1055,28 @@ void XGL_UIText(float x, float y, const char *text, int color, float cell_width,
             run[length] = 0;
             if (xb.ui_glyph_count == XGL_UI_GLYPHS ||
                 xb.ui_text_used + length + 1 > XGL_UI_TEXT_BYTES) XGL_UIFlush();
+            right = x + length * cell_width;
+            if (xb.ui_run_first == xb.ui_glyph_count) {
+                xb.ui_text_box[0] = x; xb.ui_text_box[1] = y;
+                xb.ui_text_box[2] = right; xb.ui_text_box[3] = y + height;
+            } else {
+                if (x < xb.ui_text_box[0]) xb.ui_text_box[0] = x;
+                if (y < xb.ui_text_box[1]) xb.ui_text_box[1] = y;
+                if (right > xb.ui_text_box[2]) xb.ui_text_box[2] = right;
+                if (y + height > xb.ui_text_box[3]) xb.ui_text_box[3] = y + height;
+            }
+            queued = &xb.ui_runs[xb.ui_glyph_count];
             position = &xb.ui_positions[xb.ui_glyph_count++];
             position->x = origin_x; position->y = origin_y;
             saved = xb.ui_text + xb.ui_text_used;
             memcpy(saved, run, (size_t)length + 1);
+            queued->text = xb.ui_text_used;
             xb.ui_text_used += length + 1;
-            xb.stage = "UI text run submission";
-            start = XGL_ProfileNow();
-            xgl_stroke_text(xb.ui, saved, position, NULL);
-            XGL_ProfileAdd(XGL_PROFILE_SUBMIT, start);
-            XGL_ProfileCount(XGL_PROFILE_GLYPHS, (unsigned long)glyphs);
-            XGL_ProfileCount(XGL_PROFILE_TEXT_CALLS, 1);
-            xb.ui_pending = 1;
-            native_check();
+            queued->glyphs = glyphs; queued->sent = 0;
+            queued->height = font->requested; queued->spacing = font->spacing;
+            queued->color = rgb;
+            queued->box[0] = x; queued->box[1] = y;
+            queued->box[2] = right; queued->box[3] = y + height;
         } else length = 1;
         text += length;
         x += length * cell_width;
@@ -970,6 +1115,8 @@ void XGL_UIFillRGB(float x, float y, float width, float height, const float rgb[
     facets.facet_type = XGL_FACET_COLOR; facets.num_facets = 1;
     facets.facets.color_facets = &color; list.num_pts = 4;
     if (opacity >= .9999f) {
+        /* Text already asked for that this would cover is drawn first. */
+        if (ui_text_overlaps(x, y, x + width, y + height)) submit_ui_text();
         if (xb.ui_quad_count == XGL_UI_QUADS) XGL_UIFlush();
         index = xb.ui_quad_count++;
         memcpy(xb.ui_points[index], points2, sizeof(points2));
@@ -1076,6 +1223,8 @@ void XGLB_Resize(int width, int height)
     if (!xb.system || width < 1 || height < 1) return;
     XGL_Flush(); XGL_UIFlush(); complete_scene();
     xb.width = width; xb.height = height;
+    /* The buffers' contents are gone and the device viewport is another. */
+    xb.keep_request = xb.kept_rows = xb.keep_streak = xb.viewport_state = 0;
     xb.stage = "window resize";
     xgl_window_raster_resize(xb.raster);
     memset(xb.fonts, 0, sizeof(xb.fonts));

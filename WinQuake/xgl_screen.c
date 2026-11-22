@@ -90,6 +90,15 @@ cvar_t		scr_showram = {"showram","1", false, false, 0, NULL};
 cvar_t		scr_showturtle = {"showturtle","0", false, false, 0, NULL};
 cvar_t		scr_showpause = {"showpause","1", false, false, 0, NULL};
 cvar_t		scr_printspeed = {"scr_printspeed","8", false, false, 0, NULL};
+/* Leave an unchanged status bar in place from frame to frame: -1 when the
+ * window is small enough for that to pay, 0 never, 1 whenever possible. */
+cvar_t		xgl_keepbar = {"xgl_keepbar","-1", false, false, 0, NULL};
+/* The largest view above the bar, in pixels, for which -1 does so. */
+#define XGL_KEEPBAR_PIXELS 100000.0
+/* A bar left in place is drawn again after this many frames whatever the
+ * game says, so that nothing unforeseen can leave a wrong one for long. */
+#define XGL_KEEPBAR_REFRESH 128
+static int	xgl_bar_frames;
 
 
 extern	cvar_t	crosshair;
@@ -371,6 +380,7 @@ SCR_Init
 void SCR_Init (void)
 {
 
+	Cvar_RegisterVariable (&xgl_keepbar);
 	Cvar_RegisterVariable (&scr_fov);
 	Cvar_RegisterVariable (&scr_viewsize);
 	Cvar_RegisterVariable (&scr_conspeed);
@@ -831,6 +841,28 @@ static int XGL_ConsoleClipLines(void)
     return (int)scr_con_current;
 }
 
+/* The rows of status bar this frame may leave exactly as earlier frames
+ * drew them, or 0. Quake's status bar code already draws only when
+ * something on the bar has changed, once for each of the two buffers, as it
+ * did for page-flipped video modes. What that needs from the frame is a
+ * clear that stops above the bar, which costs more than clearing the whole
+ * window does: about 2 ms more at 320x240, against several times that for
+ * drawing the bar, and in proportion to the window beyond that. So it is
+ * done only for small windows unless asked for (xgl_keepbar 1). Anything
+ * that could draw over the bar's rows, or that covers them, rules it out. */
+static int XGL_StatusBarKeepLines (void)
+{
+	if (!xgl_keepbar.value || sb_lines <= 0 || sb_lines >= (int)vid.height)
+		return 0;
+	if (scr_con_current || scr_drawdialog || scr_drawloading || cl.intermission ||
+	    key_dest != key_game || scr_centertime_off > 0)
+		return 0;
+	if (xgl_keepbar.value < 0 &&
+	    (double)vid.width * (vid.height - sb_lines) > XGL_KEEPBAR_PIXELS)
+		return 0;
+	return sb_lines;
+}
+
 /*
 ==================
 SCR_UpdateScreen
@@ -848,9 +880,6 @@ void SCR_UpdateScreen (void)
 
 	if (block_drawing)
 		return;
-
-	/* Each XGL frame clears its back buffer; redraw the complete status bar. */
-	Sbar_Changed ();
 
 	scr_copytop = 0;
 	scr_copyeverything = 0;
@@ -871,7 +900,6 @@ void SCR_UpdateScreen (void)
 
 
 	XGL_SMPUpdate ();
-	XGL_BeginFrame ();
 
 	//
 	// determine size of refresh window
@@ -891,10 +919,23 @@ void SCR_UpdateScreen (void)
 	if (vid.recalc_refdef)
 		SCR_CalcRefdef ();
 
+	SCR_SetUpToDrawConsole ();
+
+	/* The clear needs to know what this frame will show, so the two steps
+	 * above, which draw nothing, now come before it. A bar is trusted only
+	 * once two frames running have left its rows alone: before that, one of
+	 * the two buffers still holds whatever an earlier frame put there. */
+	XGL_SetFrameKeep (XGL_StatusBarKeepLines ());
+	XGL_BeginFrame ();
+	if (XGL_FrameKeepStreak () < 2 || ++xgl_bar_frames >= XGL_KEEPBAR_REFRESH)
+	{
+		Sbar_Changed ();
+		xgl_bar_frames = 0;
+	}
+
 //
 // do 3D refresh drawing, and then update the screen
 //
-	SCR_SetUpToDrawConsole ();
 	XGL_SetConsoleClip (XGL_ConsoleClipLines ());
 
 	V_RenderView ();
