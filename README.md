@@ -4,8 +4,9 @@ XGLQuake ports WinQuake 1.06 to Sun XGL on Solaris, targeting a SPARCstation
 10 with a 60 MHz SM61 processor, 64 MB RAM, and Sun ZX (Leo) graphics. It
 approximates textures with sampled-color polygons and draws the HUD and menus
 with native XGL text and geometry. A similar approach can be seen at
-[testglobe.dev](https://testglobe.dev/web). Texture mapping is not supported yet but
-will be added for Sun hardware that supports it.
+[testglobe.dev](https://testglobe.dev/web). XGLQuake originated as a port
+specifically for the ZX graphics card, so texture mapping is not supported yet 
+but it will be added for Sun hardware that supports it.
 
 ## Quick start
 
