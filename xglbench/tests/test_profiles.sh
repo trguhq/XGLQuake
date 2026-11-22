@@ -37,7 +37,7 @@ XB_TEST_LOG="$test_dir/list.log" "$bench" -list >"$test_dir/default.list"
 test ! -e "$test_dir/list.log" || fail "default listing opened the display"
 for profile in quick medium long extralong; do
     "$bench" "-$profile" -list >"$test_dir/$profile.list"
-    case "$profile" in quick) count=16 ;; medium|long) count=34 ;; *) count=237 ;; esac
+    case "$profile" in quick) count=16 ;; medium|long) count=34 ;; *) count=229 ;; esac
     test "$(wc -l <"$test_dir/$profile.list" | tr -d ' ')" = "$count" ||
         fail "$profile selected the wrong number of cases"
     sort "$test_dir/$profile.list" >"$test_dir/$profile.sorted"
@@ -126,7 +126,7 @@ for profile in quick medium long extralong; do
     awk '/^clock-sleep / { if ($2 <= 0 || $2 > .100001) bad++; sleeps++ }
          END { if (!sleeps || bad) exit 1 }' "$test_dir/$profile.log" ||
         fail "$profile disabled mandatory rest or used uninterruptible sleep chunks"
-    case "$profile" in quick) completed=16 ;; medium) completed=34 ;; long) completed=68 ;; *) completed=474 ;; esac
+    case "$profile" in quick) completed=16 ;; medium) completed=34 ;; long) completed=68 ;; *) completed=458 ;; esac
     grep "Completed $completed cases; 0 skipped/failed" "$test_dir/output" >/dev/null ||
         fail "$profile omitted short samples from its selection"
 done
@@ -327,6 +327,25 @@ awk '
 ' "$test_dir/frame-expiry.log" || fail "deadline allowed more rendering before close"
 grep 'profile time budget reached' "$test_dir/output" >/dev/null || fail "expired frame lost its deadline reason"
 
+# One frame slower than a second abandons that case alone, at its first draw
+# (the preview) or at any later one. The run continues with the next case.
+for draw in 1 4; do
+    XB_TEST_CLOCK_STEP=.001 XB_TEST_DRAW_ADVANCE=2 XB_TEST_DRAW_ADVANCE_AT="$draw" \
+        XB_TEST_LOG="$test_dir/slow-$draw.log" "$bench" -quick \
+        -test submit/multi_polygon/batch-128,submit/triangle_list/batch-128 \
+        -seconds .001 -warmup 0 -repeats 1 -pause 0 -triangles 8 >"$test_dir/output" 2>&1 ||
+        fail "one slow case made the whole run fail"
+    grep "^draw-advance $draw 2$" "$test_dir/slow-$draw.log" >/dev/null || fail "slow frame was not injected"
+    grep 'one frame took 2\.[0-9]* s (limit 1 s); case abandoned' "$test_dir/output" >/dev/null ||
+        fail "slow frame $draw was not abandoned"
+    grep 'Completed 1 cases; 1 skipped/failed. Run finished.' "$test_dir/output" >/dev/null ||
+        fail "slow frame $draw stopped the remaining cases"
+    grep '1 time-limit discards' "$test_dir/output" >/dev/null || fail "slow frame $draw was misclassified"
+    if grep 'profile time budget reached' "$test_dir/output" >/dev/null; then
+        fail "slow frame $draw was reported as a profile deadline"
+    fi
+done
+
 # Extralong has a larger finite deadline and keeps protective rest. Setup plus
 # its rest interval can exceed shorter profiles while still fitting extralong.
 XB_TEST_OPEN_ADVANCE=200 "$bench" -extralong -winsize 320 240 -triangles 8 \
@@ -344,7 +363,7 @@ if XB_TEST_OPEN_ADVANCE=2701 XB_TEST_LOG="$test_dir/extra-expiry.log" \
 fi
 grep 'Time limit: 2700 seconds' "$test_dir/output" >/dev/null || fail "extralong overrides changed the ceiling"
 grep 'Profile time budget reached' "$test_dir/output" >/dev/null || fail "extralong remained unbounded"
-grep '474 selected cases not run' "$test_dir/output" >/dev/null || fail "extralong expiry lost unrun cases"
+grep '458 selected cases not run' "$test_dir/output" >/dev/null || fail "extralong expiry lost unrun cases"
 if grep '^lighting-configure ' "$test_dir/extra-expiry.log" >/dev/null; then
     fail "expired extralong profile configured a workload"
 fi
@@ -360,4 +379,4 @@ if grep '^lighting-configure ' "$test_dir/cancel.log" >/dev/null; then fail "can
 test "$(grep -c '^clock-sleep ' "$test_dir/cancel.log")" = 1 || fail "cancellation waited through the entire pause"
 grep 'interrupted' "$test_dir/output" >/dev/null || fail "cooldown cancellation was not reported"
 
-echo 'Profile tests: selection, defaults, overrides, nominal durations, real idle scheduling, mandatory rest, deadline rejection and cancellation passed'
+echo 'Profile tests: selection, defaults, overrides, nominal durations, real idle scheduling, mandatory rest, slow-frame and deadline rejection and cancellation passed'

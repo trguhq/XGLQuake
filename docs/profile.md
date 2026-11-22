@@ -5,84 +5,113 @@ README with the same resolution, demo, audio lookahead, and detail settings
 for each comparison.
 
 Keep the console closed during playback and quit after the timedemo result
-appears. The console stays visible after playback and has a different workload;
-its later profiles must not be averaged into gameplay results. Compare the
-timedemo FPS from both runs to measure profiling overhead. A first frame that
-builds caches should also be distinguished from sustained rendering. Repeat
-the same procedure at another resolution only when testing resolution cost.
+appears. The console stays visible after playback and has a different
+workload; its later reports must not be averaged into gameplay results.
+Compare the timedemo FPS from both runs to measure profiling overhead.
+Repeat the same procedure at another resolution only when testing resolution
+cost.
+
+On the Sun ZX a frame lasts a whole number of 13.12 ms retrace periods, so
+the frame rate moves in steps (12.7, 15.2, 19.1 FPS); see
+[Measured on the Sun ZX](hardware.md#the-buffer-switch-waits-for-retrace).
+A saving shows in the timedemo result only when it carries frames across one
+of those boundaries.
+
+### Reading a report
+
+`xgl_profile 1` prints two lines about once a second. These are from the
+supplied demo1 run of 19 November 2026 (before the `state` fields existed):
+
+```
+XGL profile: 21 frames; gfx 46.61 ms (max 102.92); world 13.51 entities 6.47 effects 0.92 weapon 9.31 UI 7.00 audio-overlap 2.35 ms
+  native calls (overlap stages): submit 14.13 sync 3.79 swap 7.33 ms; per frame: triangles 1298.5 glyphs 18.3 polygon calls 10.5 waits 4.0
+```
+
+- 21 frames were drawn in the interval. Graphics took 46.61 ms per frame on
+  average and 102.92 ms in the slowest frame.
+- The five stages add up to 37.21 ms. The buffer switch (`swap`, 7.33 ms) is
+  outside them; the remaining 2 ms is frame setup and the clear.
+- `submit`, `sync` and `audio-overlap` happen inside the stages. They show
+  where stage time went and must not be added to it: 14.13 of the 37.21 ms
+  was spent in native submission calls.
+- 1,298.5 triangles in 14.13 ms is about 11 µs per triangle, which also
+  covers the text and rectangle calls.
+- `gfx` excludes the server, client and final sound update, a few more
+  milliseconds. Together they put these frames at four retrace periods.
 
 ### Timing scope
 
-The profiler prints graphics-frame mean/max time and world, entity, effects,
-weapon and UI stage times. Native submission, synchronization, buffer-switch and audio
-service timings overlap those stages; do not add them to the graphics total.
-Counts include actual emitted 3D triangles (including alias subdivision and
-particles), native glyphs, polygon calls and completion waits. `gfx` excludes
-server work and the final shared sound update, so it is not a whole-game FPS
-measurement; use the timedemo result for that comparison. Profiling is off
-by default and performs no timing queries when disabled. Terminal reporting
-avoids adding in-game console glyphs to the workload being measured.
+The first line gives graphics-frame mean and maximum time and the world,
+entity, effects, weapon and UI stage times. The second gives native call
+times and per-frame counts:
 
-Level 1 retains the summary report. Level 2 adds more timing queries and
-reports where world preparation time goes, vertex packing, alias cache work,
-cache use, and native text calls. These detail measurements overlap the main
-stages; nested preparation measurements must not be summed into a frame total.
-World detail selection includes mesh construction. Ordinary color timing
-includes cache validation and refresh; animated timing covers sky/water color
-updates. Alias cache/transform timing covers cache lookup/build and the cached
-path's live vertex transforms, excluding recursive fallback drawing and final
-color/output assembly. Packing excludes native submission and direct native
-output; gamma preparation for direct alias output remains in the entity or
-weapon stage. A drop in packing time alone is not an FPS gain. Native triangle
-batches can span stage boundaries, so the stage that flushes a batch can
-include submission work queued by an earlier stage.
+- `submit`: time inside triangle, rectangle and text calls.
+- `sync`: time waiting for the device to finish queued work; `waits` counts
+  those waits.
+- `swap`: the buffer switch, which waits for retrace.
+- `state`: time in the attribute calls that change between illuminated and
+  unlit drawing, select lights or change blending; `state changes` counts
+  them. The device
+  may defer part of a change's cost to the next submission.
+- `triangles` includes alias subdivision and particles; `glyphs` and
+  `polygon calls` include the UI.
 
-Level 2 also separates alias, brush and sprite draw scopes, weapon setup/draw/
-finish, and particle/water effects. Each reports wall time, native submission
-time and synchronization time in milliseconds per frame. Native times are
-included in wall time and refer to calls executed during that scope, including
-any geometry queued earlier. The scopes preserve batching and make timing
-queries only at level 2. Particle time includes the shared particle simulation;
-the effects water scope measures queued water drawing, while the earlier
-water color timer measures animated color preparation.
+Profiling is off by default and makes no timing queries when disabled. Output
+goes to the terminal, so it adds no console glyphs to the workload measured.
 
-Weapon setup includes draining earlier geometry and issuing the depth clear;
-finish includes draining weapon geometry. The separate depth-clear timer
-measures the native clear call itself, with completion waits counted under
-synchronization. Entity visits/frame counts calls to each model-type drawing
-routine, including calls rejected by its visibility checks; it excludes the
-view weapon.
+`xgl_profile 2` adds more timing queries and the detail lines below. Detail
+times overlap the stages and one another; do not add them to a frame total.
 
-The alias entity and weapon detail lines separate world-lighting lookup time
-from cached output and fallback drawing. Lighting times only the actual
-`R_LightPoint` call; unlit flame models and fullbright drawing skip it.
-Cached output covers final position/normal copying, light multiplication,
-gamma preparation and native batch reservations after pose transformation.
-Lighting/gamma preparation in this path is reused for matching palette
-indices within the draw.
-Fallback drawing includes uncached vertex transforms, subdivision, skin
-sampling and generic vertex packing. Each output/fallback scope reports
-wall/submission/synchronization time, including native calls made inside it.
-These are nested measurements within the existing entity or weapon scopes,
-not additional costs to add to them. Audio service after the draw is outside
-these detail scopes.
+- **detail ms**: world visibility; detail selection (which includes mesh
+  builds); mesh builds, where a detailed mesh also pays for the texture and
+  light samples that decide its shape; ordinary color validation and
+  refresh; animated sky/water colors; generic vertex packing; alias cache work plus cached-pose
+  transforms. Packing excludes submission, so a drop in packing time alone is
+  not an FPS gain.
+- **entity scopes**: wall, submission and wait time for alias, brush and
+  sprite drawing, and visits per frame. Native times refer to calls executed
+  during the scope, which can include geometry queued earlier: batches span
+  scope and stage boundaries. Visits count every model handed to its drawing
+  routine, including ones then culled; the view weapon is separate.
+- **weapon scope**: the same three times for drawing the view weapon.
+- **effects scopes**: particles (including the shared particle simulation)
+  and queued translucent water.
+- **alias entity detail** and **view weapon detail**: the light lookup
+  (`R_LightPoint` only; flames and fullbright skip it), cached output (final
+  position, normal and color assembly into the native batch) and fallback
+  drawing (uncached transform, subdivision, skin sampling and packing). These
+  are nested inside the entity and weapon scopes.
+- **SMP alias preparation**: jobs completed by the worker per frame; the main
+  thread's time finding and queuing them (`main prepass`); the worker's time
+  in them, which overlaps world drawing; the main thread's time at the join
+  (`main wait`), both waiting and running jobs the worker had not started;
+  and how many jobs per frame the main thread ran itself. Use the job counts
+  to check whether a scene exercises the worker at all.
 
 ### Counters
 
-Detailed counts are per-frame averages. World cached draws include meshes
-built during that frame, while fallback draws count complete streamed coarse
-faces; they are not a cache-hit percentage. Color reuse/updates count mesh
-update calls, which can occur multiple times for a streamed face. Alias color
-and normal/topology (reported as pose) cache hits, misses, evictions and fallback
-draws expose cache pressure without changing cache limits. Compare native
-text calls with emitted glyphs to see how much the installed font permits
-batching.
+Detailed counts are per-frame averages.
 
-The reuse line separates sky and water time and compares actual animated
-samples with emitted animated vertices. Native cached vertices are queued
-from persistent meshes; native direct vertices are filled in the backend
-batch; packed vertices use the general conversion path. The alias preparation
-line separates cache work from live transforms and reports shared-topology
-hits/misses and pose evictions caused by entry or byte limits. These counters
-identify geometry preparation and cache costs. Measure FPS with profiling
-disabled.
+- **world per frame**: cached draws include meshes built in that frame;
+  fallback draws are faces streamed without a cached mesh, so neither is a
+  hit rate. Color reuse and updates count mesh checks; a streamed face is
+  checked once per triangle. Vertices built and recolored are distinct
+  vertices, each shared by several triangles; animated vertices are triangle
+  corners, and `animated samples` in the reuse line the distinct ones.
+  `detail meshes evicted` counts detailed meshes released because the world
+  cache was full.
+- **world detail per frame**: faces drawn from their detailed mesh and the
+  triangles in them, water on its finer grid included; then the dynamic
+  lights enabled for illuminated geometry and the faces drawn illuminated,
+  both zero in a frame with no dynamic light.
+- **alias cache per frame**: color and pose (normal/topology) cache hits,
+  misses and evictions, and fallback draws, show cache pressure. Compare text
+  calls with glyphs to see how well the installed font allows runs.
+- **reuse**: sky and water color time, distinct animated vertices colored
+  against animated corners emitted, and vertices per frame by path: queued from
+  persistent meshes (`cached native`), written straight into the batch
+  (`direct native`) or converted (`packed`).
+- **alias preparation**: cache work against live transforms, shared-topology
+  hits and misses, and pose evictions by entry or byte limit.
+
+Measure FPS with profiling disabled.

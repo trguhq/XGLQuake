@@ -4,6 +4,28 @@
 
 #define BACKFACE_EPSILON 0.01
 
+/* The view weapon is drawn shrunk toward the eye by this factor: its image
+ * is unchanged, but its depth lies in front of the world, so it needs no
+ * depth clear. The near plane moves in by the same factor, which clips the
+ * weapon exactly where the original four-unit plane did. */
+#define XGL_VIEWMODEL_SCALE 0.125f
+#define XGL_NEAR_CLIP (4.0 * XGL_VIEWMODEL_SCALE)
+/* Particles keep the original four-unit limit: one at the eye would
+ * otherwise fill the view. */
+#define XGL_PARTICLE_NEAR 4.0f
+/* Models are lit by ambient light and one fixed directional fill from above.
+ * With xgl_alias_shade the CPU evaluates that sum for every vertex and the
+ * models are submitted unlit; otherwise the device evaluates it. Both use
+ * these values. The axis is each component of the unit vector that points
+ * toward the fill light. */
+#define XGL_ALIAS_AMBIENT .5f
+#define XGL_ALIAS_FILL .5f
+#define XGL_ALIAS_FILL_AXIS .577350269f
+#define XGL_MAX_POINT_LIGHTS 4
+/* XGL_BrushEntityLights also sets this bit when reduced ambient light alone
+ * requires illuminated submission. */
+#define XGL_LIT_AMBIENT 256
+
 typedef enum {
     pt_static, pt_grav, pt_slowgrav, pt_fire, pt_explode, pt_explode2, pt_blob, pt_blob2
 } ptype_t;
@@ -21,6 +43,13 @@ typedef struct {
     vec3_t position, normal;
     float color[3];
 } xgl_vertex_t;
+
+/* A dynamic light chosen for the scene. Geometry further than range from it
+ * is not illuminated by it; a range of zero means no limit. */
+typedef struct {
+    vec3_t origin;
+    float radius, range;
+} xgl_point_light_t;
 
 /* Matches XGL's RGB point/color/normal record without requiring the SDK in
  * CPU-only renderer files. The native backend checks size and field offsets.
@@ -67,12 +96,21 @@ void XGL_DrawNativeTriangles(const xgl_native_vertex_t *vertices, int count,
 xgl_native_vertex_t *XGL_ReserveTriangles(int *count, int lit,
                                          float opacity, int zwrite);
 unsigned int XGL_ColorRevision(void);
+void XGL_CopyGammaOutput(float output[256]);
 void XGL_PrepareColor(float rgb[3]);
 void XGL_PreparePaletteColor(int index, float rgb[3]);
 void XGL_Flush(void);
 void XGL_EndScene(void);
 void XGL_EndFrame(void);
-void XGL_SetViewModel(int enabled);
+/* The scene's dynamic lights, nearest the viewer first; at most
+ * XGL_MAX_POINT_LIGHTS. Valid after XGL_BeginScene. */
+int XGL_PointLights(const xgl_point_light_t **lights);
+/* Bit i set: light i reaches some geometry that will be drawn illuminated.
+ * The others are switched off for it. BeginScene selects them all. */
+void XGL_UsePointLights(int mask);
+/* xgl_ambient, bounded to 0..1. Below 1, unlit submission would differ from
+ * illuminated submission even with no dynamic light. */
+float XGL_AmbientLight(void);
 void XGL_UIText(float x, float y, const char *text, int color,
                 float cell_width, float height);
 void XGL_UIFill(float x, float y, float width, float height,
@@ -95,6 +133,9 @@ qboolean XGL_TextureHasAlpha(int id);
 qboolean XGL_SampleTextureFiltered(int id, float s, float t,
                                   float footprint_s, float footprint_t,
                                   float rgb[3], const byte *translation);
+/* The mean color of a box of texels about footprint wide around (s, t),
+ * all three in texels. Integer averaging of reduced images; no translation. */
+qboolean XGL_SampleTextureBox(int id, float s, float t, float footprint, byte rgb[3]);
 void XGL_TextureInit(void);
 void XGL_TextureShutdown(void);
 void XGL_MakeAliasModelDisplayLists(model_t *model, aliashdr_t *header);
@@ -102,10 +143,24 @@ void XGL_SubdivideSurface(msurface_t *surface);
 
 void XGL_WorldNewMap(void);
 void XGL_WorldShutdown(void);
+/* XGL_DrawWorld finds the visible faces and draws the walls a dynamic light
+ * reaches, illuminated; XGL_DrawWorldUnlit draws the others. With no such
+ * light XGL_DrawWorld draws every wall unlit. */
 void XGL_DrawWorld(void);
+void XGL_DrawWorldUnlit(void);
+void XGL_DrawWorldSpecial(void);
 void XGL_DrawBrushModel(entity_t *entity);
+/* Nonzero when the brush entity must be submitted illuminated: the scene
+ * lights that reach it, as XGL_UsePointLights bits, plus XGL_LIT_AMBIENT. */
+int XGL_BrushEntityLights(entity_t *entity);
 void XGL_DrawWater(void);
-void XGL_DrawEntities(void);
+void XGL_AliasPrepareFrame(void);
+void XGL_AliasFinishFrame(void);
+/* Entity drawing is split by native state so that R_RenderView can order
+ * the frame with as few lit/unlit changes as possible. */
+void XGL_DrawBrushEntities(int lit);
+void XGL_DrawSprites(void);
+void XGL_DrawAliasEntities(void);
 void XGL_DrawViewModel(void);
 void XGL_EntitiesInit(void);
 void XGL_EntitiesShutdown(void);

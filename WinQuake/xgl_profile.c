@@ -77,6 +77,18 @@ double XGL_ProfileDetailNow(void)
     return profile_active == 2 ? Sys_FloatTime() : 0;
 }
 
+int XGL_ProfileDetailEnabled(void)
+{
+    return profile_active == 2;
+}
+
+void XGL_ProfileSMPWork(unsigned long completed_jobs, double worker_seconds)
+{
+    if (profile_active != 2) return;
+    frame_counts[XGL_PROFILE_SMP_JOBS] += completed_jobs;
+    if (worker_seconds > 0) frame_sections[XGL_PROFILE_SMP_WORKER] += worker_seconds;
+}
+
 void XGL_ProfileAdd(xgl_profile_section_t section, double start)
 {
     double elapsed;
@@ -154,8 +166,9 @@ void XGL_ProfileEndFrame(void)
     scale = 1000.0 / total_frames;
     Sys_Printf("XGL profile: %lu frames; gfx %.2f ms (max %.2f); "
         "world %.2f entities %.2f effects %.2f weapon %.2f UI %.2f audio-overlap %.2f ms\n"
-        "  native calls (overlap stages): submit %.2f sync %.2f swap %.2f ms; "
-        "per frame: triangles %.1f glyphs %.1f polygon calls %.1f waits %.1f\n",
+        "  native calls (overlap stages): submit %.2f sync %.2f swap %.2f state %.2f ms; "
+        "per frame: triangles %.1f glyphs %.1f polygon calls %.1f waits %.1f "
+        "state changes %.1f\n",
         total_frames, total_frame * scale, maximum_frame * 1000.0,
         total_sections[XGL_PROFILE_WORLD] * scale,
         total_sections[XGL_PROFILE_ENTITIES] * scale,
@@ -166,17 +179,21 @@ void XGL_ProfileEndFrame(void)
         total_sections[XGL_PROFILE_SUBMIT] * scale,
         total_sections[XGL_PROFILE_SYNC] * scale,
         total_sections[XGL_PROFILE_SWAP] * scale,
+        total_sections[XGL_PROFILE_STATE] * scale,
         (double)total_counts[XGL_PROFILE_TRIANGLES] / total_frames,
         (double)total_counts[XGL_PROFILE_GLYPHS] / total_frames,
         (double)total_counts[XGL_PROFILE_POLYGON_CALLS] / total_frames,
-        (double)total_counts[XGL_PROFILE_WAIT_CALLS] / total_frames);
+        (double)total_counts[XGL_PROFILE_WAIT_CALLS] / total_frames,
+        (double)total_counts[XGL_PROFILE_STATE_CHANGES] / total_frames);
     if (profile_reporting == 2) {
         Sys_Printf("  detail ms (overlap stages; select includes builds): "
             "visibility %.2f select %.2f build %.2f colors %.2f animated %.2f "
             "pack %.2f alias-cache/transform %.2f\n"
             "  world per frame: cached draws %.1f fallback draws %.1f "
             "builds %.1f failed builds %.1f; color reuse %.1f updates %.1f; "
-            "vertices built %.1f recolored %.1f animated %.1f\n"
+            "vertices built %.1f recolored %.1f animated %.1f; detail meshes evicted %.1f\n"
+            "  world detail per frame: faces %.1f triangles %.1f; "
+            "dynamic lights in use %.2f, faces illuminated %.1f\n"
             "  alias cache per frame: color hits %.1f misses %.1f evictions %.1f; "
             "pose hits %.1f misses %.1f evictions %.1f; fallbacks %.1f; text calls %.1f\n"
             "  reuse: sky %.2f water %.2f ms; animated samples/frame %.1f; "
@@ -186,8 +203,7 @@ void XGL_ProfileEndFrame(void)
             "  entity scopes wall/submit/sync ms (native calls executed during scope): "
             "alias %.2f/%.2f/%.2f brush %.2f/%.2f/%.2f sprite %.2f/%.2f/%.2f; "
             "visits/frame %.1f/%.1f/%.1f\n"
-            "  weapon scopes wall/submit/sync ms: setup %.2f/%.2f/%.2f "
-            "draw %.2f/%.2f/%.2f finish %.2f/%.2f/%.2f; depth clear %.2f ms\n"
+            "  weapon scope wall/submit/sync ms: draw %.2f/%.2f/%.2f\n"
             "  effects scopes wall/submit/sync ms: particles %.2f/%.2f/%.2f "
             "water %.2f/%.2f/%.2f\n"
             "  alias entity detail (overlap): lighting %.2f ms; "
@@ -195,7 +211,10 @@ void XGL_ProfileEndFrame(void)
             "fallback (transform/subdivide/sample/pack) %.2f/%.2f/%.2f ms wall/submit/sync\n"
             "  view weapon detail (overlap): lighting %.2f ms; "
             "cached final vertex/color output %.2f/%.2f/%.2f; "
-            "fallback (transform/subdivide/sample/pack) %.2f/%.2f/%.2f ms wall/submit/sync\n",
+            "fallback (transform/subdivide/sample/pack) %.2f/%.2f/%.2f ms wall/submit/sync\n"
+            "  SMP alias preparation: %.1f jobs/frame; main prepass %.2f worker %.2f "
+            "main wait %.2f ms/frame (overlapping wall times); "
+            "%.1f more jobs/frame run by main while joining\n",
             total_sections[XGL_PROFILE_WORLD_VISIBILITY] * scale,
             total_sections[XGL_PROFILE_WORLD_DETAIL_SELECT] * scale,
             total_sections[XGL_PROFILE_WORLD_BUILD] * scale,
@@ -212,6 +231,11 @@ void XGL_ProfileEndFrame(void)
             (double)total_counts[XGL_PROFILE_WORLD_BUILD_VERTICES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_COLOR_VERTICES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_ANIMATED_VERTICES] / total_frames,
+            (double)total_counts[XGL_PROFILE_WORLD_EVICTIONS] / total_frames,
+            (double)total_counts[XGL_PROFILE_WORLD_DETAIL_SURFACES] / total_frames,
+            (double)total_counts[XGL_PROFILE_WORLD_DETAIL_TRIANGLES] / total_frames,
+            (double)total_counts[XGL_PROFILE_POINT_LIGHTS] / total_frames,
+            (double)total_counts[XGL_PROFILE_WORLD_LIT_SURFACES] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_COLOR_HITS] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_COLOR_MISSES] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_COLOR_EVICTIONS] / total_frames,
@@ -244,16 +268,9 @@ void XGL_ProfileEndFrame(void)
             (double)total_draw[XGL_PROFILE_DRAW_ALIAS].visits / total_frames,
             (double)total_draw[XGL_PROFILE_DRAW_BRUSH].visits / total_frames,
             (double)total_draw[XGL_PROFILE_DRAW_SPRITE].visits / total_frames,
-            total_draw[XGL_PROFILE_DRAW_WEAPON_SETUP].wall * scale,
-            total_draw[XGL_PROFILE_DRAW_WEAPON_SETUP].submit * scale,
-            total_draw[XGL_PROFILE_DRAW_WEAPON_SETUP].sync * scale,
             total_draw[XGL_PROFILE_DRAW_WEAPON_DRAW].wall * scale,
             total_draw[XGL_PROFILE_DRAW_WEAPON_DRAW].submit * scale,
             total_draw[XGL_PROFILE_DRAW_WEAPON_DRAW].sync * scale,
-            total_draw[XGL_PROFILE_DRAW_WEAPON_FINISH].wall * scale,
-            total_draw[XGL_PROFILE_DRAW_WEAPON_FINISH].submit * scale,
-            total_draw[XGL_PROFILE_DRAW_WEAPON_FINISH].sync * scale,
-            total_sections[XGL_PROFILE_WEAPON_CLEAR] * scale,
             total_draw[XGL_PROFILE_DRAW_PARTICLES].wall * scale,
             total_draw[XGL_PROFILE_DRAW_PARTICLES].submit * scale,
             total_draw[XGL_PROFILE_DRAW_PARTICLES].sync * scale,
@@ -273,7 +290,12 @@ void XGL_ProfileEndFrame(void)
             total_draw[XGL_PROFILE_DRAW_WEAPON_OUTPUT].sync * scale,
             total_draw[XGL_PROFILE_DRAW_WEAPON_FALLBACK].wall * scale,
             total_draw[XGL_PROFILE_DRAW_WEAPON_FALLBACK].submit * scale,
-            total_draw[XGL_PROFILE_DRAW_WEAPON_FALLBACK].sync * scale);
+            total_draw[XGL_PROFILE_DRAW_WEAPON_FALLBACK].sync * scale,
+            (double)total_counts[XGL_PROFILE_SMP_JOBS] / total_frames,
+            total_sections[XGL_PROFILE_SMP_PREPASS] * scale,
+            total_sections[XGL_PROFILE_SMP_WORKER] * scale,
+            total_sections[XGL_PROFILE_SMP_WAIT] * scale,
+            (double)total_counts[XGL_PROFILE_SMP_HELPED] / total_frames);
     }
     XGL_ProfileReset();
     report_start = now;

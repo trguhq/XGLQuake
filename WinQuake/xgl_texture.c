@@ -354,3 +354,55 @@ qboolean XGL_SampleTextureFiltered(int id, float s, float t,
     if (count) for (c = 0; c < 3; ++c) rgb[c] = sum[c] / count;
     return true;
 }
+
+/* The mean color of a box of texels about `footprint` wide, centered on a
+ * point: four cells of the reduced image whose cells are half that width,
+ * averaged with integers only. The world mesh builder takes a great many
+ * samples, and this costs a fraction of the interpolating sampler above.
+ * Coordinates are in texels and repeat. Cutout materials, and any material
+ * whose reduced images did not fit the budget, give their nearest texel. */
+qboolean XGL_SampleTextureBox(int id, float s, float t, float footprint, byte rgb[3])
+{
+    xgl_material_t *material;
+    const byte *cells, *row0, *row1;
+    int x, y, level, cell, width, height, x0, x1, y0, y1, c, index;
+    if (!rgb || id <= 0 || id > XGL_MAX_MATERIALS ||
+        !(s > -1000000000.0f && s < 1000000000.0f &&
+          t > -1000000000.0f && t < 1000000000.0f)) return false;
+    material = &xgl_materials[id-1];
+    if (!material->pixels) return false;
+    x = (int)s; y = (int)t;
+    if (!(material->width & (material->width - 1))) x &= material->width - 1;
+    else { x %= material->width; if (x < 0) x += material->width; }
+    if (!(material->height & (material->height - 1))) y &= material->height - 1;
+    else { y %= material->height; if (y < 0) y += material->height; }
+    if (footprint >= 4 && !material->has_alpha) {
+        XGL_BuildTextureFilter(material);
+        if (material->filtered) {
+            level = 0; cell = 2;
+            width = (material->width + 1) / 2; height = (material->height + 1) / 2;
+            while (cell * 4 <= footprint && level + 1 < material->filter_levels) {
+                cell *= 2; ++level;
+                width = (width + 1) / 2; height = (height + 1) / 2;
+            }
+            /* The cell boundary nearest the point has two cells either side. */
+            x1 = (x + cell / 2) >> (level + 1); y1 = (y + cell / 2) >> (level + 1);
+            x0 = x1 - 1; y0 = y1 - 1;
+            if (x0 < 0) x0 = width - 1;
+            if (y0 < 0) y0 = height - 1;
+            if (x1 >= width) x1 = 0;
+            if (y1 >= height) y1 = 0;
+            cells = material->filtered + material->filter_offset[level];
+            row0 = cells + (size_t)y0 * width * 3; row1 = cells + (size_t)y1 * width * 3;
+            for (c = 0; c < 3; ++c)
+                rgb[c] = (byte)((row0[x0 * 3 + c] + row0[x1 * 3 + c] +
+                                 row1[x0 * 3 + c] + row1[x1 * 3 + c] + 2) >> 2);
+            return true;
+        }
+    }
+    index = material->pixels[y * material->width + x];
+    rgb[0] = xgl_palette[index * 3];
+    rgb[1] = xgl_palette[index * 3 + 1];
+    rgb[2] = xgl_palette[index * 3 + 2];
+    return true;
+}

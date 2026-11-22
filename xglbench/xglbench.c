@@ -9,6 +9,9 @@
 
 #define XB_MAX_CASES 256
 #define XB_TARGET_FRAME_SECONDS (1.0 / 15.0)
+/* A case whose single frame takes longer than this is abandoned: it is not
+ * interactive, and repeating it only spends the device's and the run's time. */
+#define XB_SLOW_FRAME_SECONDS 1.0
 #if XB_MAX_RESULTS < 2 * XB_MAX_CASES
 #error Result capacity must cover both default resolutions
 #endif
@@ -61,7 +64,7 @@ static void usage(FILE *f)
     fprintf(f,
         "  -triangles N       Base count, positive even number <=16384 (default 512)\n"
         "  -csv PATH          Write machine-readable per-trial and summary results\n"
-        "  -test TEXT         Select matching names from the complete case registry\n"
+        "  -test TEXT[,TEXT]  Select names containing any TEXT from the complete registry\n"
         "  -display DISPLAY   X display (default DISPLAY environment variable)\n"
         "  -allow-fallback    Permit non-DGA/software/single-buffer investigation\n");
     fprintf(f,
@@ -439,7 +442,59 @@ static int make_cases(xb_case *cases)
             }
         }
     }
+    /* Target-hardware questions. Every lighting/state case draws the same
+     * depth-1 sampled-material mesh; only native state differs. */
+    c = add_case(cases, &n, "probe/lighting/unlit-color-points");
+    c->depth = 1; c->shade = XB_SMOOTH; c->vertex_material = 1;
+    add_lighting_case(cases, &n, "probe/lighting/unlit-normal-points", 3,
+                      XB_LIGHT_LAMBERT, 1, 0, 0, 0, 1, 0);
+    c = &cases[n - 1]; c->vertex_material = 1; c->probe = XB_PROBE_LIT_NO_ILLUM;
+    for (lights = 1; lights <= 4; lights += 3) {
+        sprintf(name, "probe/lighting/lit-lights-off-%d", lights);
+        add_lighting_case(cases, &n, name, 3, XB_LIGHT_LAMBERT, lights, 0, 0, 0, 1, 0);
+        c = &cases[n - 1]; c->vertex_material = 1; c->probe = XB_PROBE_LIGHTS_OFF;
+    }
+    add_lighting_case(cases, &n, "probe/lighting/lit-directional-1", 3,
+                      XB_LIGHT_LAMBERT, 1, 1, 0, 0, 1, 0);
+    cases[n - 1].vertex_material = 1;
+    for (lights = 1; lights <= 4; lights += 3) {
+        sprintf(name, "probe/lighting/lit-point-%d", lights);
+        add_lighting_case(cases, &n, name, 3, XB_LIGHT_LAMBERT, lights, 0, 0, 0, 1, 0);
+        cases[n - 1].vertex_material = 1;
+    }
+    for (mode = 0; mode < 2; ++mode) {
+        add_lighting_case(cases, &n, mode ? "probe/state/lit-unlit-alternating" :
+                          "probe/state/lit-unlit-grouped", 3,
+                          XB_LIGHT_LAMBERT, 1, 0, 0, 0, 1, 0);
+        c = &cases[n - 1]; c->vertex_material = 1;
+        c->probe = mode ? XB_PROBE_STATE_ALTERNATE : XB_PROBE_STATE_GROUPED;
+    }
+    c = add_case(cases, &n, "probe/persist/depth-only-clear");
+    c->work = XB_DEPTH_CLEAR; c->probe = XB_PROBE_PERSIST_DEPTH;
+    c = add_case(cases, &n, "probe/persist/viewport-clear");
+    c->work = XB_COLOR_DEPTH_CLEAR; c->probe = XB_PROBE_PERSIST_VIEWPORT;
+    c = add_case(cases, &n, "probe/swap/interval");
+    c->work = XB_SWAP; c->probe = XB_PROBE_SWAP;
+    c = add_case(cases, &n, "probe/swap/busy-6ms");
+    c->work = XB_SWAP; c->probe = XB_PROBE_SWAP; c->probe_busy = .006;
     return n;
+}
+
+/* -test accepts comma-separated substrings; a case matching any is selected. */
+static int filter_matches(const char *name, const char *filter)
+{
+    const char *end;
+    size_t length, i, name_length;
+    name_length = strlen(name);
+    while (*filter) {
+        end = strchr(filter, ',');
+        length = end ? (size_t)(end - filter) : strlen(filter);
+        for (i = 0; length && i + length <= name_length; ++i)
+            if (!strncmp(name + i, filter, length)) return 1;
+        filter += length;
+        if (*filter == ',') ++filter;
+    }
+    return 0;
 }
 
 /* Sampled-color defaults keep related comparisons together. Native texture
@@ -481,8 +536,11 @@ static int select_cases(const xb_case *cases, int count, const xb_options *o, in
     int i, j, n, quick_count, wanted;
     n = 0;
     if (o->filter || o->profile == XB_EXTRALONG) {
+        /* Native texture mapping ran in software on the Sun ZX, at seconds
+         * per frame. It stays in the registry but runs only when named. */
         for (i = 0; i < count; ++i)
-            if (!o->filter || strstr(cases[i].name, o->filter)) order[n++] = i;
+            if (o->filter ? filter_matches(cases[i].name, o->filter) :
+                            cases[i].texture_filter == XB_TEXTURE_OFF) order[n++] = i;
         return n;
     }
     quick_count = (int)(sizeof(quick) / sizeof(quick[0]));
@@ -899,6 +957,15 @@ done:
     return okay;
 }
 
+static int slow_frame(xb_result *r, double seconds)
+{
+    if (!(seconds > XB_SLOW_FRAME_SECONDS)) return 0;
+    r->failure = XB_FAILURE_TIME_LIMIT;
+    sprintf(r->reason, "one frame took %.2f s (limit %.0f s); case abandoned",
+            seconds, XB_SLOW_FRAME_SECONDS);
+    return 1;
+}
+
 static void measure(const xb_options *o, xb_result *r, const int *valid,
                     const enum xb_failure *validation_failure,
                     char validation[XB_METHODS][160])
@@ -955,13 +1022,17 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
         r->input_bytes = xb_backend_input_bytes(c->method, c->batch);
     }
     xb_backend_label(c->name);
-    /* Show a representative image even for tests which exclude presentation. */
+    /* Show a representative image even for tests which exclude presentation.
+     * This first complete draw is also the earliest point at which a case
+     * too slow to be worth measuring can be recognised. */
+    start = xb_now();
     xb_backend_clear(1, c->zbuffer);
     if (uses_mesh) xb_backend_draw(c->method, c->batch);
     if (c->work == XB_UI && !xb_backend_ui(c->ui, 0)) {
         backend_reason(r, "native UI preview failed"); goto done;
     }
     xb_backend_sync();
+    if (slow_frame(r, xb_now() - start)) goto done;
     if (xb_backend_has_double_buffer()) xb_backend_swap();
     xb_backend_sync();
     preview = xb_backend_events();
@@ -986,6 +1057,7 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
         if (!one_frame(o, c, &mesh, sequence++, &f)) {
             backend_reason(r, "warm-up preparation/native submission failed"); goto done;
         }
+        if (slow_frame(r, f.total)) goto done;
     } while (xb_now() - start < o->warmup);
     for (trial = 0; trial < o->repeats; ++trial) {
         if (c->lighting != XB_LIGHT_OFF) sequence = 0;
@@ -1008,6 +1080,7 @@ static void measure(const xb_options *o, xb_result *r, const int *valid,
             if (!one_frame(o, c, &mesh, sequence++, &f)) {
                 backend_reason(r, "preparation/native submission failed"); goto done;
             }
+            if (slow_frame(r, f.total)) goto done;
             ++frames;
             sum += f.total; prep += f.prepare; render += f.render; present += f.present;
             if (tracks_updates(c)) record_preparation(&updates, f.changes, f.prepare);

@@ -359,9 +359,9 @@ static void test_service_and_settings(void)
     recurse_update = 1;
     XGL_AudioUpdate();
     assert(extra_calls == 1 && clock_calls == 1);
-    clock_time = 1.005;
+    clock_time = 1.020;
     XGL_AudioUpdate(); assert(extra_calls == 1);
-    clock_time = 1.011;
+    clock_time = 1.026;
     XGL_AudioUpdate(); assert(extra_calls == 2);
     clock_time = .5;
     XGL_AudioUpdate(); assert(extra_calls == 3);

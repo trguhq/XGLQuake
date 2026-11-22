@@ -11,6 +11,11 @@ LDFLAGS ?=
 XGLHOME ?= /opt/SUNWits/Graphics-sw/xgl
 OPENWINHOME ?= /usr/openwin
 API_CPPFLAGS = -D__EXTENSIONS__
+# Optional: XB_FBIO=1 also asks the Solaris frame-buffer driver for monitor
+# timing (FBIOMONINFO). Omit it if <sys/fbio.h> does not compile.
+ifdef XB_FBIO
+API_CPPFLAGS += -DXB_FBIO
+endif
 XGL_CPPFLAGS = -I$(XGLHOME)/include -I$(OPENWINHOME)/include
 XGL_LDFLAGS = -L$(XGLHOME)/lib -L$(OPENWINHOME)/lib
 XGL_LIBS ?= -lxgl -lX11 -lXext -ldga -ldl -lm

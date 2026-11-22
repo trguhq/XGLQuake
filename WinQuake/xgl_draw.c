@@ -27,6 +27,13 @@ static xgl_draw_pic ui_pics[XGL_DRAW_PICS];
 static int ui_num_pics;
 static char ui_run[XGL_DRAW_RUN];
 static int ui_run_length, ui_run_x, ui_run_y, ui_run_color;
+/* Status-bar numbers arrive one digit picture at a time. Adjacent digits are
+ * held here and drawn as one native text call when the number ends. */
+#define XGL_DRAW_NUMBER 12
+static char ui_number[XGL_DRAW_NUMBER + 1];
+static int ui_number_length, ui_number_color;
+static float ui_number_x, ui_number_y, ui_number_w, ui_number_h;
+static void ui_flush_number(void);
 static int ui_disc_active;
 byte *draw_chars;
 qpic_t *draw_disc;
@@ -43,6 +50,7 @@ static void ui_flush_text(void)
 
 static void ui_fill(float x, float y, float w, float h, int color, float opacity)
 {
+    ui_flush_number();
     ui_flush_text();
     if (w > 0 && h > 0)
         XGL_UIFill(x, y, w, h, color & 255, opacity);
@@ -51,6 +59,7 @@ static void ui_fill(float x, float y, float w, float h, int color, float opacity
 static void ui_text(float x, float y, const char *text, int color,
                     float cell, float height)
 {
+    ui_flush_number();
     ui_flush_text();
     if (text[0] && cell > 0 && height > 0)
         XGL_UIText(x, y, text, color & 255, cell, height);
@@ -77,6 +86,30 @@ static void ui_label(float x, float y, float w, float h,
     if (cell > 10) cell = 10;
     if (cell * length > w-2) cell = (w-2) / length;
     ui_text(x+(w-cell*length)*.5f, y+(h-height)*.5f, text, color, cell, height);
+}
+
+static void ui_flush_number(void)
+{
+    char text[XGL_DRAW_NUMBER + 1];
+    if (!ui_number_length) return;
+    memcpy(text, ui_number, (size_t)ui_number_length);
+    text[ui_number_length] = 0;
+    ui_number_length = 0; /* The label below re-enters this through ui_text. */
+    ui_label(ui_number_x, ui_number_y, ui_number_w, ui_number_h, text, ui_number_color);
+}
+
+/* Painter's order is kept: anything else drawn in between ends the number. */
+static void ui_number_digit(float x, float y, float w, float h, char digit, int color)
+{
+    if (ui_number_length && (ui_number_color != color || ui_number_y != y ||
+        ui_number_h != h || x != ui_number_x + ui_number_w ||
+        ui_number_length == XGL_DRAW_NUMBER)) ui_flush_number();
+    if (!ui_number_length) {
+        ui_number_x = x; ui_number_y = y; ui_number_h = h;
+        ui_number_w = 0; ui_number_color = color;
+    }
+    ui_number[ui_number_length++] = digit;
+    ui_number_w += w;
 }
 
 static xgl_draw_pic *ui_find_pic(qpic_t *pic)
@@ -201,6 +234,7 @@ void Draw_Character(int x, int y, int num)
     else if (character == 30) character = '=';
     else if (character == 31) character = '>';
     else if (character < 32 || character == 127) character = '?';
+    ui_flush_number();
     if (ui_run_length && (ui_run_color != color || ui_run_y != y ||
         x != ui_run_x+8*ui_run_length || ui_run_length == XGL_DRAW_RUN-1))
         ui_flush_text();
@@ -352,7 +386,10 @@ static void ui_picture(int ix, int iy, qpic_t *pic, byte *translation)
     if (!strncmp(name,"num_",4) || !strncmp(name,"anum_",5)) {
         label = name + (name[0] == 'a' ? 5 : 4);
         if (!strcmp(label,"minus")) label = "-";
-        ui_label(x,y,w,h,label,name[0] == 'a' ? 251 : UI_WHITE);
+        color = name[0] == 'a' ? 251 : UI_WHITE;
+        if (label[0] && !label[1] && w > 0 && h > 0)
+            ui_number_digit(x,y,w,h,label[0],color);
+        else ui_label(x,y,w,h,label,color);
         return;
     }
     if (!strncmp(name,"inv",3) || !strncmp(name,"r_lava",6) ||
@@ -492,6 +529,7 @@ void Draw_EndDisc(void) { ui_disc_active = 0; }
 
 void XGL_DrawFlush(void)
 {
+    ui_flush_number();
     ui_flush_text();
     if (ui_disc_active && draw_disc)
         ui_picture(vid.width-draw_disc->width,0,draw_disc,NULL);

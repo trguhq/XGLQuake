@@ -6,6 +6,7 @@
 #include "quakedef.h"
 #include "xgl_audio.h"
 #include "xgl_profile.h"
+#include "xgl_smp.h"
 
 entity_t r_worldentity, *currententity;
 qboolean r_cache_thrash;
@@ -26,7 +27,8 @@ cvar_t r_fullbright = {"r_fullbright", "0", false, false, 0, NULL};
 cvar_t r_wateralpha = {"r_wateralpha", "1", false, false, 0, NULL};
 cvar_t r_dynamic = {"r_dynamic", "1", false, false, 0, NULL};
 cvar_t r_novis = {"r_novis", "0", false, false, 0, NULL};
-extern cvar_t xgl_subdivide, xgl_detailtris, xgl_detaildistance;
+extern cvar_t xgl_subdivide, xgl_detailtris, xgl_detaildistance, xgl_detailbuild;
+extern cvar_t xgl_detailerror, xgl_detailface, xgl_detailedge;
 void V_SetContentsColor(int contents);
 
 void R_InitTextures (void)
@@ -83,11 +85,16 @@ void R_Init (void)
     Cvar_RegisterVariable(&xgl_subdivide);
     Cvar_RegisterVariable(&xgl_detailtris);
     Cvar_RegisterVariable(&xgl_detaildistance);
+    Cvar_RegisterVariable(&xgl_detailbuild);
+    Cvar_RegisterVariable(&xgl_detailerror);
+    Cvar_RegisterVariable(&xgl_detailface);
+    Cvar_RegisterVariable(&xgl_detailedge);
     Cmd_AddCommand("timerefresh", XGL_TimeRefresh_f);
     Cmd_AddCommand("pointfile", R_ReadPointFile_f);
     XGL_TextureInit();
     XGL_EntitiesInit();
     R_InitParticles();
+    XGL_SMPInit();
     Con_Printf("XGL renderer: sampled material geometry, native lighting and native UI\n");
 }
 
@@ -139,6 +146,9 @@ void R_RenderView (void)
     double start, section_start;
     xgl_profile_draw_scope_t draw_scope;
     if (r_norefresh.value || !cl.worldmodel) return;
+    /* BeginFrame has submitted any leftover geometry. Reclaim the previous
+     * view's job storage here even if Host_Error interrupted that view. */
+    XGL_AliasFinishFrame();
     start = r_speeds.value ? Sys_FloatTime() : 0;
     if (cl.maxclients > 1 && r_fullbright.value) Cvar_Set("r_fullbright", "0");
     R_AnimateLight();
@@ -154,13 +164,32 @@ void R_RenderView (void)
     c_brush_polys = c_alias_polys = 0;
     r_cache_thrash = false;
     XGL_BeginScene();
+    /* Every change between lit and unlit drawing costs about half a
+     * millisecond on the Sun ZX, so the frame is ordered by native state,
+     * not by kind: first the walls and brush entities a dynamic light
+     * reaches, illuminated; then everything else, unlit: the other walls
+     * and brush entities, sky, water, sprites, particles and the models,
+     * which are shaded on the CPU; blended water last. Depth testing makes
+     * the order of opaque geometry irrelevant to the image. */
     section_start = XGL_ProfileNow();
     XGL_DrawWorld();
     XGL_ProfileAdd(XGL_PROFILE_WORLD, section_start);
     /* Like GLQuake, service the original sound mixer during long frames. */
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
-    XGL_DrawEntities();
+    XGL_DrawBrushEntities(1);
+    XGL_ProfileAdd(XGL_PROFILE_ENTITIES, section_start);
+    section_start = XGL_ProfileNow();
+    XGL_DrawWorldUnlit();
+    XGL_ProfileAdd(XGL_PROFILE_WORLD, section_start);
+    section_start = XGL_ProfileNow();
+    XGL_DrawBrushEntities(0);
+    XGL_ProfileAdd(XGL_PROFILE_ENTITIES, section_start);
+    section_start = XGL_ProfileNow();
+    XGL_DrawWorldSpecial();
+    XGL_ProfileAdd(XGL_PROFILE_WORLD, section_start);
+    section_start = XGL_ProfileNow();
+    XGL_DrawSprites();
     XGL_ProfileAdd(XGL_PROFILE_ENTITIES, section_start);
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
@@ -170,14 +199,18 @@ void R_RenderView (void)
     XGL_ProfileAdd(XGL_PROFILE_EFFECTS, section_start);
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
-    XGL_ProfileDrawBegin(&draw_scope);
-    XGL_DrawWater();
-    XGL_ProfileDrawEnd(&draw_scope, XGL_PROFILE_DRAW_WATER);
-    XGL_ProfileAdd(XGL_PROFILE_EFFECTS, section_start);
+    XGL_DrawAliasEntities();
+    XGL_ProfileAdd(XGL_PROFILE_ENTITIES, section_start);
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
     XGL_DrawViewModel();
     XGL_ProfileAdd(XGL_PROFILE_VIEWMODEL, section_start);
+    XGL_AudioUpdate();
+    section_start = XGL_ProfileNow();
+    XGL_ProfileDrawBegin(&draw_scope);
+    XGL_DrawWater();
+    XGL_ProfileDrawEnd(&draw_scope, XGL_PROFILE_DRAW_WATER);
+    XGL_ProfileAdd(XGL_PROFILE_EFFECTS, section_start);
     XGL_AudioUpdate();
     XGL_EndScene();
     if (r_speeds.value)
@@ -187,5 +220,6 @@ void R_RenderView (void)
 
 void D_FlushCaches (void)
 {
+    XGL_AliasFinishFrame();
     XGL_WorldShutdown();
 }

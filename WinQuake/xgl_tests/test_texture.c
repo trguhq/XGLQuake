@@ -132,6 +132,70 @@ static void test_filtered_materials(void)
     XGL_TextureShutdown();
 }
 
+/* The mesh builder's sampler: the mean of a box of texels centered on a
+ * point, from the reduced images, with integer arithmetic only. */
+static void test_box_samples(void)
+{
+    byte pixels[16 * 16], rgb[3], cut[4 * 4], odd[12 * 8];
+    int id, x, y, c, alpha, wide;
+    /* Left half index 10, right half index 200. */
+    for (y = 0; y < 16; ++y)
+        for (x = 0; x < 16; ++x) pixels[y * 16 + x] = (byte)(x < 8 ? 10 : 200);
+    id = XGL_LoadTexture("box", 16, 16, pixels, false, false);
+    assert(id > 0);
+    /* Below four texels: the nearest texel, no filtering. */
+    assert(XGL_SampleTextureBox(id, 7.9f, 3, 2, rgb));
+    for (c = 0; c < 3; ++c) assert(rgb[c] == xgl_palette[10 * 3 + c]);
+    assert(XGL_SampleTextureBox(id, 8.1f, 3, 3.9f, rgb));
+    for (c = 0; c < 3; ++c) assert(rgb[c] == xgl_palette[200 * 3 + c]);
+    /* A four-texel box inside one half is that half's color... */
+    assert(XGL_SampleTextureBox(id, 4, 4, 4, rgb));
+    for (c = 0; c < 3; ++c) assert(rgb[c] == xgl_palette[10 * 3 + c]);
+    /* ...and centered on the boundary it is the mean of both: the point's
+     * own surroundings, not whichever cell it happens to fall in. */
+    assert(XGL_SampleTextureBox(id, 8, 4, 4, rgb));
+    for (c = 0; c < 3; ++c)
+        assert(rgb[c] == (xgl_palette[10 * 3 + c] + xgl_palette[200 * 3 + c] + 1) / 2);
+    /* A wider box the same; wider than the texture, its overall mean. */
+    assert(XGL_SampleTextureBox(id, 8, 12, 8, rgb));
+    for (c = 0; c < 3; ++c)
+        assert(rgb[c] == (xgl_palette[10 * 3 + c] + xgl_palette[200 * 3 + c] + 1) / 2);
+    assert(XGL_SampleTextureBox(id, 3, 5, 1000, rgb));
+    for (c = 0; c < 3; ++c)
+        assert(abs(rgb[c] - (xgl_palette[10 * 3 + c] + xgl_palette[200 * 3 + c]) / 2) <= 1);
+    /* Coordinates repeat in both directions, also across the seam. */
+    assert(XGL_SampleTextureBox(id, 16 * 5 + 4, -16 * 3 + 4, 4, rgb));
+    for (c = 0; c < 3; ++c) assert(rgb[c] == xgl_palette[10 * 3 + c]);
+    assert(XGL_SampleTextureBox(id, 16, 0, 4, rgb));
+    for (c = 0; c < 3; ++c)
+        assert(rgb[c] == (xgl_palette[10 * 3 + c] + xgl_palette[200 * 3 + c] + 1) / 2);
+    assert(XGL_SampleTextureBox(id, 0, 0, 4, rgb));
+    for (c = 0; c < 3; ++c)
+        assert(rgb[c] == (xgl_palette[10 * 3 + c] + xgl_palette[200 * 3 + c] + 1) / 2);
+    /* Invalid input is refused; nothing is written. */
+    rgb[0] = 77;
+    assert(!XGL_SampleTextureBox(0, 0, 0, 4, rgb) && !XGL_SampleTextureBox(id, 0, 0, 4, NULL));
+    assert(!XGL_SampleTextureBox(id, (float)HUGE_VAL, 0, 4, rgb) && rgb[0] == 77);
+    /* A cutout material is never averaged across its holes. */
+    memset(cut, 255, sizeof(cut));
+    cut[5] = 9;
+    alpha = XGL_LoadTexture("box-cutout", 4, 4, cut, false, true);
+    assert(XGL_SampleTextureBox(alpha, 1.5f, 1.5f, 4, rgb));
+    for (c = 0; c < 3; ++c) assert(rgb[c] == xgl_palette[9 * 3 + c]);
+    /* Sizes that are not powers of two repeat correctly too. */
+    for (y = 0; y < 8; ++y)
+        for (x = 0; x < 12; ++x) odd[y * 12 + x] = (byte)(x < 6 ? 30 : 90);
+    wide = XGL_LoadTexture("box-odd", 12, 8, odd, false, false);
+    assert(XGL_SampleTextureBox(wide, 12 * 7 + 2, 8 * 9 + 3, 2, rgb));
+    for (c = 0; c < 3; ++c) assert(rgb[c] == xgl_palette[30 * 3 + c]);
+    assert(XGL_SampleTextureBox(wide, -12 * 4 + 9, -8 * 2 + 3, 2, rgb));
+    for (c = 0; c < 3; ++c) assert(rgb[c] == xgl_palette[90 * 3 + c]);
+    assert(XGL_SampleTextureBox(wide, 6, 4, 4, rgb));
+    for (c = 0; c < 3; ++c)
+        assert(rgb[c] == (xgl_palette[30 * 3 + c] + xgl_palette[90 * 3 + c] + 1) / 2);
+    XGL_TextureShutdown();
+}
+
 int main (void)
 {
     byte pixels[8] = {0, 1, 255, 7, 8, 9, 10, 11};
@@ -188,6 +252,7 @@ int main (void)
 
     test_index_samples();
     test_filtered_materials();
+    test_box_samples();
 
     /* Exact budget exhaustion must fail without evicting live alias IDs. */
     large = (byte *)malloc (1024*1024);

@@ -12,6 +12,9 @@ typedef enum {
     XGL_PROFILE_SUBMIT,
     XGL_PROFILE_SYNC,
     XGL_PROFILE_SWAP,
+    /* Time in lit/unlit and blending attribute calls. It does not overlap
+     * submission, but a device may defer part of the cost to the next batch. */
+    XGL_PROFILE_STATE,
     /* Detail timers are enabled only by xgl_profile 2. They overlap the
      * renderer stages above; detail selection also includes mesh builds. */
     XGL_PROFILE_WORLD_VISIBILITY,
@@ -25,9 +28,11 @@ typedef enum {
     XGL_PROFILE_WORLD_WATER,
     XGL_PROFILE_ALIAS_CACHE,
     XGL_PROFILE_ALIAS_TRANSFORM,
-    XGL_PROFILE_WEAPON_CLEAR,
     XGL_PROFILE_ALIAS_LIGHT,
     XGL_PROFILE_WEAPON_LIGHT,
+    XGL_PROFILE_SMP_PREPASS,
+    XGL_PROFILE_SMP_WORKER,
+    XGL_PROFILE_SMP_WAIT,
     XGL_PROFILE_SECTION_COUNT
 } xgl_profile_section_t;
 
@@ -36,6 +41,7 @@ typedef enum {
     XGL_PROFILE_GLYPHS,
     XGL_PROFILE_POLYGON_CALLS,
     XGL_PROFILE_WAIT_CALLS,
+    XGL_PROFILE_STATE_CHANGES,
     /* Detail counters use per-frame averages in the report. Cached world
      * draws include a mesh built earlier in the same frame; they are not
      * lookup hits and must not be divided by the build count as a hit rate. */
@@ -64,6 +70,13 @@ typedef enum {
     XGL_PROFILE_ALIAS_POSE_BYTE_EVICTIONS,
     XGL_PROFILE_ALIAS_TOPOLOGY_HITS,
     XGL_PROFILE_ALIAS_TOPOLOGY_MISSES,
+    XGL_PROFILE_SMP_JOBS,
+    XGL_PROFILE_SMP_HELPED,
+    XGL_PROFILE_WORLD_EVICTIONS,
+    XGL_PROFILE_WORLD_DETAIL_SURFACES,
+    XGL_PROFILE_WORLD_DETAIL_TRIANGLES,
+    XGL_PROFILE_WORLD_LIT_SURFACES,
+    XGL_PROFILE_POINT_LIGHTS,
     XGL_PROFILE_COUNTER_COUNT
 } xgl_profile_counter_t;
 
@@ -71,9 +84,7 @@ typedef enum {
     XGL_PROFILE_DRAW_ALIAS,
     XGL_PROFILE_DRAW_BRUSH,
     XGL_PROFILE_DRAW_SPRITE,
-    XGL_PROFILE_DRAW_WEAPON_SETUP,
     XGL_PROFILE_DRAW_WEAPON_DRAW,
-    XGL_PROFILE_DRAW_WEAPON_FINISH,
     XGL_PROFILE_DRAW_PARTICLES,
     XGL_PROFILE_DRAW_WATER,
     XGL_PROFILE_DRAW_ALIAS_OUTPUT,
@@ -96,6 +107,10 @@ void XGL_ProfileBeginFrame(void);
 void XGL_ProfileEndFrame(void);
 double XGL_ProfileNow(void);
 double XGL_ProfileDetailNow(void);
+/* Main thread only. Snapshot the level before handing work to the helper,
+ * then collect its measured wall time after it finishes. */
+int XGL_ProfileDetailEnabled(void);
+void XGL_ProfileSMPWork(unsigned long completed_jobs, double worker_seconds);
 void XGL_ProfileAdd(xgl_profile_section_t section, double start);
 void XGL_ProfileCount(xgl_profile_counter_t counter, unsigned long count);
 void XGL_ProfileDrawBegin(xgl_profile_draw_scope_t *scope);

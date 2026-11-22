@@ -1,5 +1,6 @@
 /* Alias command/pose contract tests. GPL-2.0-or-later. */
 #include "quakedef.h"
+#include "xgl_alias.h"
 #include <assert.h>
 #include <stdarg.h>
 
@@ -145,6 +146,7 @@ int main (void)
     model_t model;
     int i, words, saved_words, saved_poseverts, saved_bytes;
     byte *snapshot;
+    const xgl_alias_identity_t *identity, *previous;
     memset (&model, 0, sizeof(model));
     strcpy (model.name, "synthetic.mdl");
     setup (8, 6);
@@ -192,8 +194,19 @@ int main (void)
     setup (MAXALIASTRIS, MAXALIASVERTS);
     XGL_MakeAliasModelDisplayLists (&model, pheader);
     assert (check_commands () == saved_words && pheader->poseverts == saved_poseverts);
+    /* Every load is a new generation; nothing else may differ. The record
+     * sits directly before the commands and describes exactly those words. */
+    identity = XGL_AliasIdentity (pheader);
+    assert (identity && identity->words == saved_words);
+    assert (identity->hash == XGL_AliasCommandHash (
+        (const int *)((const byte *)pheader + pheader->commands), saved_words));
+    previous = (const xgl_alias_identity_t *)
+        (snapshot + ((const byte *)identity - hunk.bytes));
+    assert (previous->magic == XGL_ALIAS_IDENTITY_MAGIC);
+    assert (previous->generation && identity->generation == previous->generation + 1);
+    ((xgl_alias_identity_t *)previous)->generation = identity->generation;
     assert (hunk_used == saved_bytes && !memcmp(snapshot, hunk.bytes, saved_bytes));
     free (snapshot);
-    puts ("XGL alias mesh: topology, seams, pose reordering, 2048-triangle bounds and determinism passed");
+    puts ("XGL alias mesh: topology, seams, pose reordering, 2048-triangle bounds, identity record and determinism passed");
     return 0;
 }

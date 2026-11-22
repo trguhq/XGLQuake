@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define XB_VERSION "0.9.1"
+#define XB_VERSION "0.9.3"
 #define XB_MAX_QUEUE 8
 #define XB_MAX_LIGHTS 4
 #define XB_STYLE_LAYERS 4
@@ -47,6 +47,12 @@ enum xb_shade { XB_FLAT, XB_SMOOTH };
 enum xb_light_model { XB_LIGHT_OFF, XB_LIGHT_BAKED, XB_LIGHT_LAMBERT, XB_LIGHT_QUAKE };
 enum xb_texture_filter { XB_TEXTURE_OFF, XB_TEXTURE_POINT,
                          XB_TEXTURE_BILINEAR, XB_TEXTURE_TRILINEAR };
+/* Hardware questions asked by probe/ cases. Each changes native state or runs
+ * an untimed readback/measurement during configuration; see the README. */
+enum xb_probe { XB_PROBE_NONE, XB_PROBE_LIT_NO_ILLUM, XB_PROBE_LIGHTS_OFF,
+                XB_PROBE_STATE_GROUPED, XB_PROBE_STATE_ALTERNATE,
+                XB_PROBE_PERSIST_DEPTH, XB_PROBE_PERSIST_VIEWPORT,
+                XB_PROBE_SWAP };
 enum xb_profile { XB_QUICK, XB_MEDIUM, XB_LONG, XB_EXTRALONG };
 enum xb_failure { XB_FAILURE_NONE, XB_FAILURE_ERROR, XB_FAILURE_API,
                   XB_FAILURE_VALIDATION, XB_FAILURE_UNSUPPORTED,
@@ -82,6 +88,8 @@ typedef struct {
     int sim_fps; /* zero selects the 15 FPS deterministic simulation default */
     int transparency, blend_zwrite;
     float opacity; /* 0..1; used only for blended transparency cases */
+    enum xb_probe probe;
+    double probe_busy; /* XB_PROBE_SWAP: CPU seconds between switch and wait */
 } xb_case;
 
 typedef struct {

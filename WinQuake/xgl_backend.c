@@ -23,14 +23,14 @@ typedef char xgl_native_vertex_layout[
 
 #define XGL_BATCH_TRIANGLES 256
 #define XGL_FONT_CACHE 128
-#define XGL_POINT_LIGHTS 4
+#define XGL_POINT_LIGHTS XGL_MAX_POINT_LIGHTS
 #define XGL_UI_GLYPHS 2048
 #define XGL_UI_TEXT_BYTES (XGL_UI_GLYPHS * 2)
 #define XGL_UI_TEXT_RUN 128
 #define XGL_UI_QUADS 256
 
 typedef struct {
-    int valid, batchable;
+    int valid, batchable, spaces;
     float cell, height, requested, ascent, spacing, extra_advance;
     Xgl_bounds_f2d bounds[95];
     Xgl_pt_f2d advance[95];
@@ -58,6 +58,9 @@ typedef struct {
     int count, lit, zwrite, applied_lit, applied_zwrite;
     int errors, fatal, font_next, ui_glyph_count, ui_quad_count, ui_text_used;
     int scene_pending, ui_pending, ui_quad_first, text_color_valid;
+    /* The scene's dynamic lights, and which of them lit world geometry uses. */
+    xgl_point_light_t point_lights[XGL_POINT_LIGHTS];
+    int light_count, light_mask, applied_mask;
     Xgl_color text_color;
     byte gamma_snapshot[256];
     float gamma_output[256];
@@ -71,6 +74,12 @@ typedef struct {
 static xgl_backend_t xb;
 static cvar_t xgl_ambient = {"xgl_ambient", "1", true, false, 0, NULL};
 static cvar_t xgl_maxlights = {"xgl_maxlights", "4", true, false, 0, NULL};
+/* A dynamic light's strength at distance d is 1 / (1 + falloff * d / radius).
+ * Geometry further than range radii from a light is not illuminated by it.
+ * A falloff of 8 proved too steep on the Sun ZX: a muzzle flash added a
+ * third to the floor beneath it, for a frame or two, and went unnoticed. */
+static cvar_t xgl_lightfalloff = {"xgl_lightfalloff", "2", false, false, 0, NULL};
+static cvar_t xgl_lightrange = {"xgl_lightrange", "4", false, false, 0, NULL};
 
 static void update_gamma(void);
 
@@ -101,6 +110,12 @@ unsigned int XGL_ColorRevision(void)
 {
     if (!xb.color_revision) update_gamma();
     return xb.color_revision;
+}
+
+void XGL_CopyGammaOutput(float output[256])
+{
+    if (!xb.color_revision) update_gamma();
+    memcpy(output, xb.gamma_output, sizeof(xb.gamma_output));
 }
 
 void XGL_PrepareColor(float rgb[3])
@@ -261,7 +276,19 @@ static void set_transparency(float opacity, int zwrite)
 static void apply_draw_state(void)
 {
     Xgl_color ambient;
+    double start;
     float amount;
+    int i, relight;
+    if (xb.applied_lit == xb.lit && xb.applied_opacity == xb.opacity &&
+        xb.applied_zwrite == xb.zwrite &&
+        (!xb.lit || xb.applied_mask == xb.light_mask)) return;
+    /* Each change costs about half a millisecond on the Sun ZX, so the
+     * renderer draws in state order; count what remains. */
+    start = XGL_ProfileNow();
+    XGL_ProfileCount(XGL_PROFILE_STATE_CHANGES, 1);
+    /* Unlit drawing ignores every light: its ambient level and switches are
+     * left as they were and set only when illumination is next needed. */
+    relight = xb.lit && (xb.applied_lit != xb.lit || xb.applied_mask != xb.light_mask);
     if (xb.applied_lit != xb.lit) {
         xb.stage = "surface illumination";
         xgl_object_set(xb.scene,
@@ -269,23 +296,35 @@ static void apply_draw_state(void)
             XGL_3D_CTX_SURF_FRONT_ILLUMINATION,
                 xb.lit ? XGL_ILLUM_PER_VERTEX : XGL_ILLUM_NONE_INTERP_COLOR, 0);
         native_check();
-        amount = bound_color(xgl_ambient.value) * (xb.lit == 2 ? .5f : 1.0f);
-        memset(&ambient, 0, sizeof(ambient));
-        ambient.rgb.r = ambient.rgb.g = ambient.rgb.b = amount;
-        xb.stage = "ambient light";
-        xgl_object_set(xb.lights[0], XGL_LIGHT_COLOR, &ambient, 0);
-        native_check();
+        if (xb.lit) {
+            amount = bound_color(xgl_ambient.value) * (xb.lit == 2 ? XGL_ALIAS_AMBIENT : 1.0f);
+            memset(&ambient, 0, sizeof(ambient));
+            ambient.rgb.r = ambient.rgb.g = ambient.rgb.b = amount;
+            xb.stage = "ambient light";
+            xgl_object_set(xb.lights[0], XGL_LIGHT_COLOR, &ambient, 0);
+            native_check();
+        }
+        xb.applied_lit = xb.lit;
+    }
+    if (relight) {
+        /* World geometry (1) uses the lights that reach it; natively lit
+         * models (2) use them all, with the directional fill. */
+        xb.light_switches[0] = TRUE;
+        for (i = 0; i < XGL_POINT_LIGHTS; ++i)
+            xb.light_switches[i+1] = i < xb.light_count &&
+                (xb.lit == 2 || ((xb.light_mask >> i) & 1)) ? TRUE : FALSE;
         xb.light_switches[5] = xb.lit == 2 ? TRUE : FALSE;
         xb.stage = "light switches";
         xgl_object_set(xb.scene, XGL_3D_CTX_LIGHT_SWITCHES, xb.light_switches, 0);
         native_check();
-        xb.applied_lit = xb.lit;
+        xb.applied_mask = xb.light_mask;
     }
     if (xb.applied_opacity != xb.opacity || xb.applied_zwrite != xb.zwrite) {
         set_transparency(xb.opacity, xb.zwrite);
         xb.applied_opacity = xb.opacity;
         xb.applied_zwrite = xb.zwrite;
     }
+    XGL_ProfileAdd(XGL_PROFILE_STATE, start);
     native_check();
 }
 
@@ -424,9 +463,10 @@ void XGL_DrawTriangles(const xgl_vertex_t *vertices, int count, int lit,
 static void update_lights(void)
 {
     int chosen[XGL_POINT_LIGHTS], i, j, insert, limit;
-    double distances[XGL_POINT_LIGHTS], distance, dx, dy, dz;
+    double distances[XGL_POINT_LIGHTS], distance, dx, dy, dz, falloff, range;
     Xgl_pt_d3d position;
     Xgl_color color;
+    xgl_point_light_t *light;
     for (i = 0; i < XGL_POINT_LIGHTS; ++i) { chosen[i] = -1; distances[i] = 1e30; }
     limit = (int)xgl_maxlights.value;
     if (limit < 0) limit = 0;
@@ -445,12 +485,22 @@ static void update_lights(void)
     }
     memset(&color, 0, sizeof(color));
     color.rgb.r = color.rgb.g = color.rgb.b = 1;
-    xb.light_switches[0] = TRUE;
-    xb.light_switches[5] = FALSE;
-    for (i = 0; i < XGL_POINT_LIGHTS; ++i) {
-        xb.light_switches[i+1] = chosen[i] >= 0 ? TRUE : FALSE;
-        if (chosen[i] < 0) continue;
+    /* XGL attenuates by 1 / (C1 + C2 * distance) and offers nothing steeper.
+     * A falloff of 1 is the gentle curve this renderer began with, which is
+     * still a fifth at four radii; larger values pull the light in toward
+     * its source so that geometry beyond the range can go unlit unnoticed. */
+    falloff = xgl_lightfalloff.value;
+    if (!(falloff >= 1)) falloff = 1;
+    if (falloff > 64) falloff = 64;
+    range = xgl_lightrange.value;
+    if (!(range > 0)) range = 0;
+    xb.light_count = 0;
+    for (i = 0; i < XGL_POINT_LIGHTS && chosen[i] >= 0; ++i) {
         j = chosen[i];
+        light = &xb.point_lights[xb.light_count++];
+        VectorCopy(cl_dlights[j].origin, light->origin);
+        light->radius = cl_dlights[j].radius;
+        light->range = (float)(range * cl_dlights[j].radius);
         position.x = cl_dlights[j].origin[0];
         position.y = cl_dlights[j].origin[1];
         position.z = cl_dlights[j].origin[2];
@@ -458,12 +508,32 @@ static void update_lights(void)
         xgl_object_set(xb.lights[i+1], XGL_LIGHT_TYPE, XGL_LIGHT_POSITIONAL,
             XGL_LIGHT_COLOR, &color, XGL_LIGHT_POSITION, &position,
             XGL_LIGHT_ATTENUATION_1, 1.0,
-            XGL_LIGHT_ATTENUATION_2, 1.0 / (double)cl_dlights[j].radius, 0);
+            XGL_LIGHT_ATTENUATION_2, falloff / (double)cl_dlights[j].radius, 0);
         native_check();
     }
-    xb.stage = "light switches";
-    xgl_object_set(xb.scene, XGL_3D_CTX_LIGHT_SWITCHES, xb.light_switches, 0);
-    native_check();
+    /* The switches are set with the illumination state, when and if lit
+     * geometry is drawn: most frames have none. */
+    xb.light_mask = (1 << xb.light_count) - 1;
+}
+
+int XGL_PointLights(const xgl_point_light_t **lights)
+{
+    if (lights) *lights = xb.point_lights;
+    return xb.light_count;
+}
+
+void XGL_UsePointLights(int mask)
+{
+    mask &= (1 << xb.light_count) - 1;
+    if (mask == xb.light_mask) return;
+    /* Geometry already batched was meant for the previous selection. */
+    if (xb.count && xb.lit) XGL_Flush();
+    xb.light_mask = mask;
+}
+
+float XGL_AmbientLight(void)
+{
+    return bound_color(xgl_ambient.value);
 }
 
 void XGL_BeginFrame(void)
@@ -539,7 +609,7 @@ void XGL_BeginScene(void)
             XGL_CLIP_YMAX | XGL_CLIP_ZMIN | XGL_CLIP_ZMAX,
         XGL_3D_CTX_HLHSR_MODE, XGL_HLHSR_Z_BUFFER, 0);
     native_check();
-    near_clip = 4; far_clip = 4096;
+    near_clip = XGL_NEAR_CLIP; far_clip = 4096;
     a = far_clip / (far_clip - near_clip);
     offset = -near_clip * a;
     tx = 1.0 / tan(r_refdef.fov_x * M_PI / 360.0);
@@ -561,33 +631,9 @@ void XGL_BeginScene(void)
     xgl_transform_write(xb.view, matrix);
     native_check();
     update_lights();
-    xb.applied_lit = xb.applied_zwrite = -1; xb.applied_opacity = -1;
+    xb.applied_lit = xb.applied_zwrite = xb.applied_mask = -1; xb.applied_opacity = -1;
     xb.scene_active = 1; xb.ui_active = 0; xb.overlay_3d = 0;
     native_check();
-}
-
-void XGL_SetViewModel(int enabled)
-{
-    double start;
-    if (!xb.frame || !xb.scene_active) return;
-    XGL_Flush(); complete_scene();
-    if (enabled) {
-        /* Weapon is the last 3D layer; clear depth only, retaining the world
-         * color. No extra world render or texture/lightmap pass is needed. */
-        if (xb.applied_opacity != 1 || xb.applied_zwrite != 1) {
-            set_transparency(1, 1);
-            xb.applied_opacity = 1; xb.applied_zwrite = 1;
-        }
-        xb.stage = "weapon depth clear state";
-        xgl_object_set(xb.scene, XGL_CTX_NEW_FRAME_ACTION, XGL_CTX_NEW_FRAME_HLHSR_ACTION, 0);
-        native_check();
-        xb.stage = "weapon depth clear";
-        start = XGL_ProfileDetailNow();
-        xgl_context_new_frame(xb.scene);
-        XGL_ProfileAdd(XGL_PROFILE_WEAPON_CLEAR, start);
-        xb.scene_pending = 1;
-        native_check();
-    }
 }
 
 void XGL_EndScene(void)
@@ -614,11 +660,11 @@ static void text_spacing(float spacing)
 
 static void font_run_spacing(xgl_font_size_t *font, double cell)
 {
-    Xgl_bounds_f2d pair, wider, fitted;
+    Xgl_bounds_f2d pair, wider, fitted, spaced;
     Xgl_pt_f2d advance;
     const Xgl_bounds_f2d *capital;
     double unit, spacing;
-    char sample[3];
+    char sample[3], gap[4];
     /* XGL implementations can report spacing in font-dependent units.
      * Calibrate from measured ink separation, not an assumed em size, and
      * verify the result before using it. Single glyphs remain the fallback.
@@ -655,6 +701,19 @@ static void font_run_spacing(xgl_font_size_t *font, double cell)
                 font->spacing = (float)spacing;
                 font->extra_advance = fitted.xmax - pair.xmax;
                 font->batchable = 1;
+                /* A space may stay inside a run only if it advances exactly
+                 * one cell, as in a monospaced font. Measure, never assume. */
+                gap[0] = gap[2] = 'H'; gap[1] = ' '; gap[3] = 0;
+                xb.stage = "font space measurement";
+                xgl_stroke_text_extent(xb.ui, gap, &spaced, &advance);
+                native_check();
+                if (fabs(spaced.xmax - capital->xmax - 2 * cell) <= .002 &&
+                    fabs(spaced.xmin - pair.xmin) <= .002 &&
+                    fabs(spaced.ymin - pair.ymin) <= .002 &&
+                    fabs(spaced.ymax - pair.ymax) <= .002) {
+                    font->advance[0] = font->advance['H' - 32];
+                    font->spaces = 1;
+                }
             }
         }
     }
@@ -727,7 +786,7 @@ void XGL_UIText(float x, float y, const char *text, int color, float cell_width,
     char run[XGL_UI_TEXT_RUN + 1], *saved;
     double start, next_origin, desired_origin;
     float sx, sy, width, origin_x, origin_y, next_x;
-    int character, next_character, previous, length;
+    int character, next_character, previous, length, used, glyphs;
     if (!xb.frame || !text || cell_width <= 0 || height <= 0) return;
     native_check();
     begin_ui();
@@ -759,26 +818,34 @@ void XGL_UIText(float x, float y, const char *text, int color, float cell_width,
             width = bounds->xmax - bounds->xmin;
             origin_x = x * sx + (cell_width*sx - width)*.5f - bounds->xmin;
             origin_y = y * sy + font->ascent;
-            run[0] = (char)(character + 32); length = 1;
+            run[0] = (char)(character + 32); length = used = glyphs = 1;
             previous = character; next_origin = origin_x;
             while (font->batchable && length < XGL_UI_TEXT_RUN && text[length]) {
                 next_character = ((unsigned char)text[length]) & 127;
                 if (next_character < 32 || next_character > 126) next_character = '?';
                 next_x = x + length * cell_width;
-                /* Spaces and clipped cells split runs; their width never
-                 * depends on the native font's space or missing glyph. */
-                if (next_character == ' ' || next_x + cell_width <= 0 || next_x >= vid.width)
-                    break;
+                /* Clipped cells split runs. So do spaces, unless this font's
+                 * measured space advances exactly one cell. */
+                if (next_x + cell_width <= 0 || next_x >= vid.width) break;
+                next_origin += font->advance[previous].x + font->extra_advance;
+                if (fabs(font->advance[previous].y) > .00001) break;
+                if (next_character == ' ') {
+                    if (!font->spaces) break;
+                    run[length++] = ' ';
+                    previous = 0;
+                    continue;
+                }
                 next_character -= 32;
                 bounds = &font->bounds[next_character];
                 desired_origin = next_x * sx +
                     (cell_width*sx - (bounds->xmax - bounds->xmin))*.5f - bounds->xmin;
-                next_origin += font->advance[previous].x + font->extra_advance;
-                if (!(fabs(next_origin - desired_origin) <= .002 &&
-                      fabs(font->advance[previous].y) <= .00001)) break;
+                if (!(fabs(next_origin - desired_origin) <= .002)) break;
                 run[length++] = (char)(next_character + 32);
+                used = length; ++glyphs;
                 previous = next_character;
             }
+            /* Trailing spaces draw nothing; the outer loop skips their cells. */
+            length = used;
             run[length] = 0;
             if (xb.ui_glyph_count == XGL_UI_GLYPHS ||
                 xb.ui_text_used + length + 1 > XGL_UI_TEXT_BYTES) XGL_UIFlush();
@@ -791,7 +858,7 @@ void XGL_UIText(float x, float y, const char *text, int color, float cell_width,
             start = XGL_ProfileNow();
             xgl_stroke_text(xb.ui, saved, position, NULL);
             XGL_ProfileAdd(XGL_PROFILE_SUBMIT, start);
-            XGL_ProfileCount(XGL_PROFILE_GLYPHS, (unsigned long)length);
+            XGL_ProfileCount(XGL_PROFILE_GLYPHS, (unsigned long)glyphs);
             XGL_ProfileCount(XGL_PROFILE_TEXT_CALLS, 1);
             xb.ui_pending = 1;
             native_check();
@@ -975,6 +1042,7 @@ void XGLB_Init(Display *display, Window window, int width, int height)
     xb.current_text_height = xb.current_text_spacing = -1;
     xb.stage = "native initialization";
     Cvar_RegisterVariable(&xgl_ambient); Cvar_RegisterVariable(&xgl_maxlights);
+    Cvar_RegisterVariable(&xgl_lightfalloff); Cvar_RegisterVariable(&xgl_lightrange);
     xb.system = xgl_open((Xgl_attribute)NULL);
     if (!xb.system) Sys_Error("xgl_open failed");
     xgl_object_set(xb.system, XGL_SYS_ST_ERROR_NOTIFICATION_FUNCTION, native_error,
@@ -1044,8 +1112,10 @@ void XGLB_Init(Display *display, Window window, int width, int height)
     native_check();
     for (i = 0; i < 6; ++i) if (!xb.lights[i]) Sys_Error("XGL did not create all requested lights");
     xgl_object_set(xb.lights[0], XGL_LIGHT_TYPE, XGL_LIGHT_AMBIENT, 0);
-    color.rgb.r = color.rgb.g = color.rgb.b = .5f;
-    direction.x = -.577350269f; direction.y = -.577350269f; direction.z = -.577350269f;
+    /* The fill light travels down and away from +x+y+z; XGL_ALIAS_FILL_AXIS
+     * is the vector toward it, which CPU model shading uses instead. */
+    color.rgb.r = color.rgb.g = color.rgb.b = XGL_ALIAS_FILL;
+    direction.x = direction.y = direction.z = -XGL_ALIAS_FILL_AXIS;
     xgl_object_set(xb.lights[5], XGL_LIGHT_TYPE, XGL_LIGHT_DIRECTIONAL,
                    XGL_LIGHT_COLOR, &color, XGL_LIGHT_DIRECTION, &direction, 0);
     up.x = 0; up.y = 1;
@@ -1080,6 +1150,9 @@ void XGLB_Init(Display *display, Window window, int width, int height)
         xb.lists[i].num_pts = 3;
         xb.lists[i].pts.color_normal_f3d = (Xgl_pt_color_normal_f3d *)(xb.points + i*3);
     }
+    /* Unlit geometry may leave a reserved record's normal as it was. Start
+     * every record with a valid one so that none is ever submitted unset. */
+    for (i = 0; i < XGL_BATCH_TRIANGLES * 3; ++i) xb.points[i].normal[2] = 1;
     (void)font_size(8, 8); (void)font_size(16, 16);
     native_check();
     Con_SafePrintf("XGL: sampled colors, native ambient/point lighting, %d-triangle batches\n", XGL_BATCH_TRIANGLES);
