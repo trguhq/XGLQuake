@@ -37,7 +37,7 @@ XB_TEST_LOG="$test_dir/list.log" "$bench" -list >"$test_dir/default.list"
 test ! -e "$test_dir/list.log" || fail "default listing opened the display"
 for profile in quick medium long extralong; do
     "$bench" "-$profile" -list >"$test_dir/$profile.list"
-    case "$profile" in quick) count=16 ;; medium|long) count=34 ;; *) count=229 ;; esac
+    case "$profile" in quick) count=16 ;; medium|long) count=34 ;; *) count=233 ;; esac
     test "$(wc -l <"$test_dir/$profile.list" | tr -d ' ')" = "$count" ||
         fail "$profile selected the wrong number of cases"
     sort "$test_dir/$profile.list" >"$test_dir/$profile.sorted"
@@ -126,7 +126,7 @@ for profile in quick medium long extralong; do
     awk '/^clock-sleep / { if ($2 <= 0 || $2 > .100001) bad++; sleeps++ }
          END { if (!sleeps || bad) exit 1 }' "$test_dir/$profile.log" ||
         fail "$profile disabled mandatory rest or used uninterruptible sleep chunks"
-    case "$profile" in quick) completed=16 ;; medium) completed=34 ;; long) completed=68 ;; *) completed=458 ;; esac
+    case "$profile" in quick) completed=16 ;; medium) completed=34 ;; long) completed=68 ;; *) completed=466 ;; esac
     grep "Completed $completed cases; 0 skipped/failed" "$test_dir/output" >/dev/null ||
         fail "$profile omitted short samples from its selection"
 done
@@ -363,7 +363,7 @@ if XB_TEST_OPEN_ADVANCE=2701 XB_TEST_LOG="$test_dir/extra-expiry.log" \
 fi
 grep 'Time limit: 2700 seconds' "$test_dir/output" >/dev/null || fail "extralong overrides changed the ceiling"
 grep 'Profile time budget reached' "$test_dir/output" >/dev/null || fail "extralong remained unbounded"
-grep '458 selected cases not run' "$test_dir/output" >/dev/null || fail "extralong expiry lost unrun cases"
+grep '466 selected cases not run' "$test_dir/output" >/dev/null || fail "extralong expiry lost unrun cases"
 if grep '^lighting-configure ' "$test_dir/extra-expiry.log" >/dev/null; then
     fail "expired extralong profile configured a workload"
 fi

@@ -72,10 +72,10 @@ grep -x 'texture-map/facet-flat/draw/depth-0' "$test_dir/output" >/dev/null ||
 if grep -E '^texture-map/(point|bilinear|trilinear)/' "$test_dir/output" >/dev/null; then
     fail "extralong selected native texture cases without being asked"
 fi
-test "$(grep -c . "$test_dir/output")" = 229 || fail "extralong selected the wrong number of cases"
+test "$(grep -c . "$test_dir/output")" = 233 || fail "extralong selected the wrong number of cases"
 # Every name contains a slash: this lists the complete registry.
 run_bench -extralong -test / -list >"$test_dir/output" 2>&1
-test "$(grep -c . "$test_dir/output")" = 250 || fail "registry has the wrong number of cases"
+test "$(grep -c . "$test_dir/output")" = 254 || fail "registry has the wrong number of cases"
 grep 'submit/multi_polygon/batch-128' "$test_dir/output" >/dev/null || fail "missing stable case"
 run_bench -extralong -test probe/swap,overhead/swap, -list >"$test_dir/comma" 2>&1
 test "$(grep -c . "$test_dir/comma")" = 3 || fail "comma-separated -test selected the wrong cases"

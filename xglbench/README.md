@@ -68,7 +68,7 @@ requires builds and readback checks against those installed SDKs/runtimes.
 
 ## Run
 
-Version 0.9.3 defaults to the **quick** profile at **320x240**, with a one-minute
+Version 0.9.4 defaults to the **quick** profile at **320x240**, with a one-minute
 elapsed-time limit:
 
 ```sh
@@ -433,6 +433,9 @@ selected only by `-test` or `-extralong`. Each prints its finding on the
 | `probe/lighting/lit-lights-off-1`, `-4` | What does per-vertex illumination cost with only ambient light, and does the number of allocated but switched-off lights matter? | Compare with `unlit-normal-points` and with each other. |
 | `probe/lighting/lit-directional-1`, `lit-point-1`, `lit-point-4` | Cost of static directional and positional lights. | Compare with `lit-lights-off-*`. |
 | `probe/state/lit-unlit-grouped`, `-alternating` | Price of changing between lit and unlit state within a frame. | Both draw half the batches unlit. The `render_ms` difference divided by the difference in state changes (in the notes) is the cost of one change. |
+| `probe/mesh/polygons` | Baseline for the three rows below: a mesh of 2,048 small triangles shaded between vertex colors, each triangle on its own, 256 to a call. This is how the renderer submits triangles. | Reference `render_ms`. All four draw the same triangles with the same colors. |
+| `probe/mesh/triangle-list` | Is one `xgl_triangle_list` of independent triangles per 256 quicker than 256 polygons? | Compare with `polygons`. The point data is the same size. |
+| `probe/mesh/strips-8`, `strips-32` | Do triangle strips pay, and from what length? Strips of at most 8 and 32 triangles; a strip of n triangles sends n+2 points instead of 3n. | Compare with `polygons`. The note gives the points and calls per frame. |
 | `probe/persist/depth-only-clear` | Does an undrawn region survive buffer switches when frames clear only Z? | PASS means it did, on both buffers. Timed work is a Z-only clear. |
 | `probe/persist/viewport-clear` | Do geometry and a color+Z clear stay inside a reduced DC viewport? | PASS means both did. Timed work is the clear within the 80% viewport; compare with `overhead/color-depth-clear`. A validation failure names the first check that failed. |
 | `probe/swap/interval` | How long is a buffer switch, and where is the delay? | The note gives the period between 200 consecutive switches (the retrace period if switches wait for retrace) and the median time in the switch call and in the following completion wait. |
@@ -453,6 +456,19 @@ If that fails to compile in `xglbench_xgl.c`, rebuild with plain `make`.
 
 The two switch probes clear both buffers first, so the window stays black
 instead of flickering between leftover images.
+
+The mesh probes shade strips and triangle lists between vertex colors, which
+no other case does. Each first passes the usual single-triangle readback of
+a mixture of three corner colors, then draws its mesh once as independent
+polygons and once its own way and reads both pictures back at the same 48
+pixels. A device that takes the call differently fails validation, naming
+the first pixel that differs, and is not timed. Run them on their own: about
+two seconds of drawing in all, and about fifteen seconds with the usual rests
+between cases:
+
+```sh
+./xglbench -medium -winsize 320 240 -test probe/mesh -csv zx-mesh.csv >zx-mesh.txt 2>&1
+```
 
 Run the probes with the existing cases they are compared against:
 
@@ -1008,6 +1024,10 @@ rejection of setup or rendering failures, without allowing UI raster copies.
 A scalar
 color/depth model also injects clear, blending, depth and readback faults to
 verify that the new correctness gates reject them and restore drawing state.
+A model device that keeps the triangles it is given checks that the mesh
+probes submit the strips and lists they report, and that one which draws a
+strip as separate triangles, a list as a strip, without interpolation, or
+not at all is rejected.
 This separate target uses GNU-compatible
 section garbage collection to link only the tested backend functions; it
 does not require or emulate the XGL runtime and is not a Solaris build target.

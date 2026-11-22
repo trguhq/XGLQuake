@@ -469,6 +469,17 @@ static int make_cases(xb_case *cases)
         c = &cases[n - 1]; c->vertex_material = 1;
         c->probe = mode ? XB_PROBE_STATE_ALTERNATE : XB_PROBE_STATE_GROUPED;
     }
+    /* Would connected geometry pay? One smooth sampled-material mesh,
+     * submitted as the renderer does now and three other ways. */
+    for (mode = 0; mode < 4; ++mode) {
+        c = add_case(cases, &n, mode == 0 ? "probe/mesh/polygons" :
+                     (mode == 1 ? "probe/mesh/triangle-list" :
+                      (mode == 2 ? "probe/mesh/strips-8" : "probe/mesh/strips-32")));
+        c->connected = 1; c->depth = 1; c->shade = XB_SMOOTH; c->vertex_material = 1;
+        c->method = mode == 0 ? XB_MULTI : (mode == 1 ? XB_TLIST : XB_STRIP);
+        c->batch = mode < 2 ? 256 : (mode == 2 ? 8 : 32);
+        c->probe = XB_PROBE_MESH;
+    }
     c = add_case(cases, &n, "probe/persist/depth-only-clear");
     c->work = XB_DEPTH_CLEAR; c->probe = XB_PROBE_PERSIST_DEPTH;
     c = add_case(cases, &n, "probe/persist/viewport-clear");

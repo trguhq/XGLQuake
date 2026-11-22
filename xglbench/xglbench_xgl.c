@@ -69,6 +69,10 @@ typedef struct {
     enum xb_failure failure;
     Xgl_pt_f3d *points, *strip_points;
     Xgl_pt_color_f3d *color_points;
+    /* Smooth strips: a colored point for each strip point, and the triangle
+     * corner each takes its color from. */
+    Xgl_pt_color_f3d *strip_color_points;
+    size_t *strip_corners;
     Xgl_pt_color_normal_f3d *lit_points;
     Xgl_color_normal_facet *lit_facets;
     Xgl_pt_list *lists;
@@ -1015,6 +1019,8 @@ static void free_geometry(void)
     native_free(b.color_points); native_free(b.lit_points); native_free(b.lit_facets);
     native_free(b.facets); native_free(b.restart_facets); native_free(b.strips);
     native_free(b.batch_facets);
+    native_free(b.strip_color_points); native_free(b.strip_corners);
+    b.strip_color_points = NULL; b.strip_corners = NULL;
     b.points = b.strip_points = NULL;
     b.color_points = NULL;
     b.lit_points = NULL;
@@ -1158,6 +1164,43 @@ void xb_backend_info(FILE *out)
         fprintf(out, "DIAGNOSTIC FALLBACK: these results do not establish ZX hardware performance.\n");
 }
 
+/* Give every strip point the position, and note the color source, of the
+ * corner it is in the strip's own triangles. Triangle k of a strip uses its
+ * points k, k+1 and k+2; the mesh holds the same triangles corner by corner. */
+static int strip_corners(const xb_mesh *mesh)
+{
+    const xb_point *point, *corner;
+    size_t s, j, k, c, triangles, facet;
+    for (s = 0; s < mesh->strip_count; ++s) {
+        if (mesh->strips[s].point_count < 3 ||
+            mesh->strips[s].first_point + mesh->strips[s].point_count > mesh->strip_point_count ||
+            mesh->strips[s].first_facet + mesh->strips[s].point_count - 2 > mesh->triangles) {
+            fail("strip description exceeds the mesh");
+            return 0;
+        }
+        triangles = mesh->strips[s].point_count - 2;
+        for (j = 0; j < mesh->strips[s].point_count; ++j) {
+            k = j < triangles ? j : triangles - 1;
+            facet = mesh->strips[s].first_facet + k;
+            point = &mesh->strip_points[mesh->strips[s].first_point + j];
+            for (c = 0; c < 3; ++c) {
+                corner = &mesh->points[facet * 3 + c];
+                if (corner->x == point->x && corner->y == point->y && corner->z == point->z) break;
+            }
+            if (c == 3) {
+                fail("strip points do not match the mesh's triangles");
+                return 0;
+            }
+            k = mesh->strips[s].first_point + j;
+            b.strip_corners[k] = facet * 3 + c;
+            b.strip_color_points[k].x = point->x;
+            b.strip_color_points[k].y = point->y;
+            b.strip_color_points[k].z = point->z;
+        }
+    }
+    return 1;
+}
+
 int xb_backend_upload(const xb_mesh *mesh)
 {
     size_t i, start, count, batch_count;
@@ -1197,7 +1240,13 @@ int xb_backend_upload(const xb_mesh *mesh)
                                                       sizeof(*b.lit_facets));
     }
     if (b.method == XB_STRIP) {
-        b.strip_points = (Xgl_pt_f3d *)native_calloc(mesh->strip_point_count,
+        if (b.shading == XB_SMOOTH) {
+            if (b.hardware_lighting) { fail("smooth strips are drawn unlit only"); return 0; }
+            b.strip_color_points = (Xgl_pt_color_f3d *)native_calloc(mesh->strip_point_count,
+                                                sizeof(*b.strip_color_points));
+            b.strip_corners = (size_t *)native_calloc(mesh->strip_point_count,
+                                                sizeof(*b.strip_corners));
+        } else b.strip_points = (Xgl_pt_f3d *)native_calloc(mesh->strip_point_count,
                                             sizeof(*b.strip_points));
         b.strips = (xb_strip *)native_calloc(mesh->strip_count, sizeof(*b.strips));
     }
@@ -1215,7 +1264,9 @@ int xb_backend_upload(const xb_mesh *mesh)
         (b.shading == XB_SMOOTH && !(b.hardware_lighting ? (void *)b.lit_points :
                                                           (void *)b.color_points)) ||
         (b.shading != XB_SMOOTH && b.hardware_lighting && !b.lit_facets) ||
-        (b.method == XB_STRIP && (!b.strips || !b.strip_points)) ||
+        (b.method == XB_STRIP && (!b.strips ||
+            (b.shading == XB_SMOOTH ? !b.strip_color_points || !b.strip_corners :
+                                      !b.strip_points))) ||
         (b.method == XB_TLIST && !b.restart_facets) ||
         (b.method == XB_MULTI && !b.batch_facets)) {
         fail("out of memory building native XGL submission arrays");
@@ -1262,6 +1313,10 @@ int xb_backend_upload(const xb_mesh *mesh)
         b.strip_points[i].x = mesh->strip_points[i].x;
         b.strip_points[i].y = mesh->strip_points[i].y;
         b.strip_points[i].z = mesh->strip_points[i].z;
+    }
+    if (b.strip_color_points && !strip_corners(mesh)) {
+        free_geometry();
+        return 0;
     }
     for (i = 0; b.lists && i < mesh->triangles; ++i) {
         b.lists[i].pt_type = XGL_PT_F3D;
@@ -1313,6 +1368,11 @@ void xb_backend_colors(const xb_mesh *mesh)
         color->rgb.g = mesh->vertex_colors[i].g;
         color->rgb.b = mesh->vertex_colors[i].b;
     }
+    for (i = 0; b.strip_color_points && i < b.strip_point_count; ++i) {
+        b.strip_color_points[i].color.rgb.r = mesh->vertex_colors[b.strip_corners[i]].r;
+        b.strip_color_points[i].color.rgb.g = mesh->vertex_colors[b.strip_corners[i]].g;
+        b.strip_color_points[i].color.rgb.b = mesh->vertex_colors[b.strip_corners[i]].b;
+    }
     if (b.method != XB_TLIST) return;
     batch = b.batch > 0 ? b.batch : 128;
     for (start = 0; start < b.triangles; start += count) {
@@ -1334,6 +1394,17 @@ size_t xb_backend_input_bytes(enum xb_method method, int batch)
     if (method != b.method) return 0;
     if (b.texture_points) return b.point_count * 5 * sizeof(float);
     if (b.lit_points) return b.point_count * sizeof(*b.lit_points);
+    if (b.strip_color_points) {
+        /* Each call repeats the two points it continues from. */
+        if (batch <= 0) batch = 128;
+        points = 0;
+        for (i = 0; i < b.strip_count; ++i) {
+            count = b.strips[i].point_count - 2;
+            batches = (count + (size_t)batch - 1) / (size_t)batch;
+            points += count + 2 * batches;
+        }
+        return points * sizeof(*b.strip_color_points);
+    }
     if (b.color_points) return b.point_count * sizeof(*b.color_points);
     if (b.lit_facets)
         return b.point_count * sizeof(*b.points) + b.triangles * sizeof(*b.lit_facets);
@@ -1613,8 +1684,12 @@ static int configure_lighting(const xb_case *test)
     b.shading = test->shade;
     b.hardware_lighting = test->xgl_lighting;
     b.light_count = test->xgl_lighting ? test->lights : 0;
+    /* The mesh probes alone shade strips and triangle lists between vertex
+     * colors, unlit, and compare the picture with polygons before timing. */
     if ((test->shade != XB_FLAT || test->lighting != XB_LIGHT_OFF) &&
-        (test->method != XB_MULTI && test->method != XB_POLYGON)) {
+        (test->method != XB_MULTI && test->method != XB_POLYGON) &&
+        !(test->probe == XB_PROBE_MESH && test->lighting == XB_LIGHT_OFF &&
+          !test->xgl_lighting)) {
         fail_kind(XB_FAILURE_UNSUPPORTED, "lighting and smooth-color cases require polygon or multi-polygon draws");
         return 0;
     }
@@ -1927,6 +2002,15 @@ size_t xb_backend_draw(enum xb_method method, int batch)
                 count = available - offset;
                 if (count > (size_t)batch) count = (size_t)batch;
                 points.num_pts = (Xgl_usgn32)(count + 2);
+                if (b.strip_color_points) {
+                    /* Shaded between the points' own colors: no facet data. */
+                    points.pt_type = XGL_PT_COLOR_F3D;
+                    points.pts.color_f3d = b.strip_color_points +
+                                           b.strips[i].first_point + offset;
+                    xgl_triangle_strip(b.ctx, NULL, &points);
+                    ++calls;
+                    continue;
+                }
                 points.pts.f3d = b.strip_points + b.strips[i].first_point + offset;
                 facets.num_facets = (Xgl_usgn32)count;
                 facets.facets.color_facets = b.facets +
@@ -1952,6 +2036,12 @@ size_t xb_backend_draw(enum xb_method method, int batch)
                 b.shading == XB_SMOOTH || b.texture_filter != XB_TEXTURE_OFF ?
                     NULL : &b.batch_facets[calls],
                 NULL, (Xgl_usgn32)count, b.lists + start);
+        } else if (b.shading == XB_SMOOTH) {
+            /* Independent triangles shaded between their corners' colors. */
+            points.pt_type = XGL_PT_COLOR_F3D;
+            points.num_pts = (Xgl_usgn32)(count * 3);
+            points.pts.color_f3d = b.color_points + start * 3;
+            xgl_triangle_list(b.ctx, NULL, &points, XGL_TLIST_FLAG_TRI_RESTART);
         } else {
             points.num_pts = (Xgl_usgn32)(count * 3);
             points.pts.f3d = b.points + start * 3;
@@ -2718,6 +2808,100 @@ static int probe_swap(double busy, char *note, size_t size)
     return 1;
 }
 
+/* Would connected geometry pay? The case's own mesh is drawn once as
+ * independent polygons, which is how the renderer submits triangles now and
+ * is validated at startup, and once the way the case will be timed. Both
+ * pictures are read back at the same pixels: a strip or list call that the
+ * device takes differently is rejected here instead of being timed. */
+#define XB_MESH_COLUMNS 8
+#define XB_MESH_ROWS 6
+#define XB_MESH_CHUNK 64
+static int probe_mesh(const xb_case *test, char *note, size_t size)
+{
+    Xgl_pt_list lists[XB_MESH_CHUNK];
+    xb_rgb reference[XB_MESH_COLUMNS * XB_MESH_ROWS], actual;
+    char text[240];
+    size_t start, count, i, calls, points;
+    int x, y, n, px, py, shown;
+    if (b.shading != XB_SMOOTH || b.hardware_lighting || !b.color_points ||
+        b.texture_filter != XB_TEXTURE_OFF || test->work != XB_DRAW ||
+        test->update != XB_STATIC || test->perspective || !b.triangles) {
+        fail_kind(XB_FAILURE_UNSUPPORTED,
+            "mesh probes need static, unlit, smooth-colored draws");
+        return 0;
+    }
+    xb_backend_clear(1, 1);
+    for (start = 0; start < b.triangles && !b.errors && !xb_cancel_requested(); start += count) {
+        count = b.triangles - start;
+        if (count > XB_MESH_CHUNK) count = XB_MESH_CHUNK;
+        for (i = 0; i < count; ++i) {
+            memset(&lists[i], 0, sizeof(lists[i]));
+            lists[i].pt_type = XGL_PT_COLOR_F3D;
+            lists[i].num_pts = 3;
+            lists[i].pts.color_f3d = b.color_points + (start + i) * 3;
+        }
+        xgl_multi_simple_polygon(b.ctx,
+            XGL_FACET_FLAG_SIDES_ARE_3 | XGL_FACET_FLAG_SHAPE_CONVEX,
+            NULL, NULL, (Xgl_usgn32)count, lists);
+    }
+    /* The local descriptors are complete before they go out of use. */
+    xb_backend_sync();
+    if (b.errors || xb_cancel_requested()) return 0;
+    shown = 0;
+    for (y = 0; y < XB_MESH_ROWS; ++y) {
+        for (x = 0; x < XB_MESH_COLUMNS; ++x) {
+            n = y * XB_MESH_COLUMNS + x;
+            /* Inside the mesh, which spans the middle nine tenths. */
+            px = (int)((.08 + .84 * (x + .5) / XB_MESH_COLUMNS) * (b.width - 1));
+            py = (int)((.08 + .84 * (y + .5) / XB_MESH_ROWS) * (b.height - 1));
+            if (!read_pixel(px, py, &reference[n])) return 0;
+            if (reference[n].r + reference[n].g + reference[n].b > .05f) ++shown;
+        }
+    }
+    if (shown * 2 < XB_MESH_COLUMNS * XB_MESH_ROWS) {
+        fail_kind(XB_FAILURE_VALIDATION, "mesh probe: the reference picture is mostly empty");
+        return 0;
+    }
+    xb_backend_clear(1, 1);
+    calls = xb_backend_draw(b.method, b.batch);
+    xb_backend_sync();
+    if (b.errors || xb_cancel_requested()) return 0;
+    if (!calls) {
+        fail_kind(XB_FAILURE_VALIDATION, "mesh probe: nothing was submitted");
+        return 0;
+    }
+    for (y = 0; y < XB_MESH_ROWS; ++y) {
+        for (x = 0; x < XB_MESH_COLUMNS; ++x) {
+            n = y * XB_MESH_COLUMNS + x;
+            px = (int)((.08 + .84 * (x + .5) / XB_MESH_COLUMNS) * (b.width - 1));
+            py = (int)((.08 + .84 * (y + .5) / XB_MESH_ROWS) * (b.height - 1));
+            if (!read_pixel(px, py, &actual)) return 0;
+            if (!(fabs(actual.r - reference[n].r) <= 0.065) ||
+                !(fabs(actual.g - reference[n].g) <= 0.065) ||
+                !(fabs(actual.b - reference[n].b) <= 0.065)) {
+                sprintf(text, "mesh probe: %s differs from independent polygons at pixel "
+                        "(%d,%d): RGB (%.5g,%.5g,%.5g), polygons (%.5g,%.5g,%.5g)",
+                        xb_method_name(b.method), px, py,
+                        (double)actual.r, (double)actual.g, (double)actual.b,
+                        (double)reference[n].r, (double)reference[n].g,
+                        (double)reference[n].b);
+                fail_kind(XB_FAILURE_VALIDATION, text);
+                return 0;
+            }
+        }
+    }
+    xb_backend_clear(1, 1);
+    xb_backend_sync();
+    points = b.method == XB_STRIP ?
+        xb_backend_input_bytes(b.method, b.batch) / sizeof(Xgl_pt_color_f3d) : b.point_count;
+    sprintf(text, "%lu smooth triangles as %lu points in %lu %s call(s); "
+            "picture matches independent polygons at %d pixels",
+            (unsigned long)b.triangles, (unsigned long)points, (unsigned long)calls,
+            xb_method_name(b.method), XB_MESH_COLUMNS * XB_MESH_ROWS);
+    copy_text(note, size, text);
+    return !b.errors;
+}
+
 static int apply_probe(const xb_case *test, char *note, size_t size)
 {
     char text[160];
@@ -2728,6 +2912,7 @@ static int apply_probe(const xb_case *test, char *note, size_t size)
     case XB_PROBE_PERSIST_DEPTH: return probe_persist(0, note, size);
     case XB_PROBE_PERSIST_VIEWPORT: return probe_persist(1, note, size);
     case XB_PROBE_SWAP: return probe_swap(test->probe_busy, note, size);
+    case XB_PROBE_MESH: return probe_mesh(test, note, size);
     default: break;
     }
     if (!b.hardware_lighting || b.shading != XB_SMOOTH || test->method != XB_MULTI ||
@@ -3088,11 +3273,18 @@ static int validate_lighting(void)
     xb_point points[3], normals[3], facet_normal;
     xb_rgb corners[3], colors[1], expected, reflected[3];
     xb_light_state state, saved;
+    xb_strip strip;
     double wx, wy, weight[3];
     int i, phase, px, py, result;
     if (b.shading == XB_FLAT && !b.hardware_lighting) return 1;
     memset(&mesh, 0, sizeof(mesh));
     mesh.triangles = 1; mesh.point_count = 3;
+    if (b.method == XB_STRIP) {
+        /* One triangle is also a strip of three points. */
+        strip.first_point = strip.first_facet = 0; strip.point_count = 3;
+        mesh.strips = &strip; mesh.strip_count = 1;
+        mesh.strip_points = points; mesh.strip_point_count = 3;
+    }
     mesh.points = points; mesh.colors = mesh.base_colors = colors;
     mesh.vertex_colors = corners; mesh.vertex_normals = normals;
     mesh.facet_normals = &facet_normal;
