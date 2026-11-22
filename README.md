@@ -121,9 +121,6 @@ default 0.3-second lookahead trades some sound latency for tolerance of long
 frames. A single blocking graphics call longer than the queued audio can
 still cause a gap; this is not an independent audio thread.
 
-An existing `config.cfg` may restore `_snd_mixahead 0.1`. The commands in
-this document pass `+_snd_mixahead 0.3` so that a run does not depend on it.
-
 ## More documentation
 
 - [Rendering and tuning](docs/render.md): how the renderer works and every setting.
