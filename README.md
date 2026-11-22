@@ -10,7 +10,7 @@ with native XGL text and geometry. A similar approach can be seen at
 
 ### Build
 
-Install GNU make, GCC (for example [tgcware](https://jupiterrise.com/tgcware/sunos5.6_sparc/stable/)), the [Sun XGL SDK](https://archive.org/details/xgl-solaris2.6), and OpenWindows development files.
+Install GNU make (tested on 3.8.2), GCC (tested on 4.3.6, for example from [tgcware](https://jupiterrise.com/tgcware/sunos5.6_sparc/stable/)), the [Sun XGL SDK](https://archive.org/details/xgl-solaris2.6), and OpenWindows development files.
 From the repository root:
 
 ```sh
