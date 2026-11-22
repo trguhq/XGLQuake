@@ -26,12 +26,13 @@ void R_AnimateLight (void)
 
 /* Samples are cached separately for every style. Changing a style never
  * resamples a texture or traces the BSP; native point lights handle moving
- * lights without recoloring the CPU mesh. */
-void XGL_SurfaceLightSamples (msurface_t *surface, const float *position,
-                              byte samples[MAXLIGHTMAPS])
+ * lights without recoloring the CPU mesh. s and t are the face's texture
+ * coordinates in texels. */
+void XGL_LightSamplesAt (msurface_t *surface, float s, float t,
+                         byte samples[MAXLIGHTMAPS])
 {
     int width, height, x, y, nextx, nexty, layer, stride;
-    float s, t, fx, fy, a, b, value;
+    float fx, fy, a, b, value;
     byte *map;
     memset(samples, 0, MAXLIGHTMAPS);
     if (!surface->samples ||
@@ -39,10 +40,8 @@ void XGL_SurfaceLightSamples (msurface_t *surface, const float *position,
     width = (surface->extents[0] >> 4) + 1;
     height = (surface->extents[1] >> 4) + 1;
     if (width <= 0 || height <= 0) return;
-    s = (DotProduct(position, surface->texinfo->vecs[0]) +
-         surface->texinfo->vecs[0][3] - surface->texturemins[0]) / 16.0f;
-    t = (DotProduct(position, surface->texinfo->vecs[1]) +
-         surface->texinfo->vecs[1][3] - surface->texturemins[1]) / 16.0f;
+    s = (s - surface->texturemins[0]) / 16.0f;
+    t = (t - surface->texturemins[1]) / 16.0f;
     if (s < 0) s = 0;
     if (t < 0) t = 0;
     if (s > width - 1) s = width - 1;
@@ -60,6 +59,14 @@ void XGL_SurfaceLightSamples (msurface_t *surface, const float *position,
         samples[layer] = (byte)(value + .5f);
         map += stride;
     }
+}
+
+void XGL_SurfaceLightSamples (msurface_t *surface, const float *position,
+                              byte samples[MAXLIGHTMAPS])
+{
+    XGL_LightSamplesAt(surface,
+        DotProduct(position, surface->texinfo->vecs[0]) + surface->texinfo->vecs[0][3],
+        DotProduct(position, surface->texinfo->vecs[1]) + surface->texinfo->vecs[1][3], samples);
 }
 
 static int XGL_RecursiveLightPoint (mnode_t *node, const float *start, const float *end)

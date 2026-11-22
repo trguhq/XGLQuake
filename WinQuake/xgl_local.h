@@ -133,6 +133,9 @@ qboolean XGL_TextureHasAlpha(int id);
 qboolean XGL_SampleTextureFiltered(int id, float s, float t,
                                   float footprint_s, float footprint_t,
                                   float rgb[3], const byte *translation);
+/* The mean color of a box of texels about footprint wide around (s, t),
+ * all three in texels. Integer averaging of reduced images; no translation. */
+qboolean XGL_SampleTextureBox(int id, float s, float t, float footprint, byte rgb[3]);
 void XGL_TextureInit(void);
 void XGL_TextureShutdown(void);
 void XGL_MakeAliasModelDisplayLists(model_t *model, aliashdr_t *header);

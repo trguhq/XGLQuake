@@ -63,8 +63,9 @@ goes to the terminal, so it adds no console glyphs to the workload measured.
 times overlap the stages and one another; do not add them to a frame total.
 
 - **detail ms**: world visibility; detail selection (which includes mesh
-  builds); mesh builds; ordinary color validation and refresh; animated
-  sky/water colors; generic vertex packing; alias cache work plus cached-pose
+  builds); mesh builds, where a detailed mesh also pays for the texture and
+  light samples that decide its shape; ordinary color validation and
+  refresh; animated sky/water colors; generic vertex packing; alias cache work plus cached-pose
   transforms. Packing excludes submission, so a drop in packing time alone is
   not an FPS gain.
 - **entity scopes**: wall, submission and wait time for alias, brush and
@@ -94,17 +95,20 @@ Detailed counts are per-frame averages.
 - **world per frame**: cached draws include meshes built in that frame;
   fallback draws are faces streamed without a cached mesh, so neither is a
   hit rate. Color reuse and updates count mesh checks; a streamed face is
-  checked once per triangle. `detail meshes evicted` counts detailed meshes
-  released because the world cache was full.
+  checked once per triangle. Vertices built and recolored are distinct
+  vertices, each shared by several triangles; animated vertices are triangle
+  corners, and `animated samples` in the reuse line the distinct ones.
+  `detail meshes evicted` counts detailed meshes released because the world
+  cache was full.
 - **world detail per frame**: faces drawn from their detailed mesh and the
-  triangles in them; then the dynamic lights enabled for illuminated
-  geometry and the faces drawn illuminated. Both are zero in a frame with
-  no dynamic light.
+  triangles in them, water on its finer grid included; then the dynamic
+  lights enabled for illuminated geometry and the faces drawn illuminated,
+  both zero in a frame with no dynamic light.
 - **alias cache per frame**: color and pose (normal/topology) cache hits,
   misses and evictions, and fallback draws, show cache pressure. Compare text
   calls with glyphs to see how well the installed font allows runs.
-- **reuse**: sky and water color time, animated samples taken against
-  animated vertices emitted, and vertices per frame by path: queued from
+- **reuse**: sky and water color time, distinct animated vertices colored
+  against animated corners emitted, and vertices per frame by path: queued from
   persistent meshes (`cached native`), written straight into the batch
   (`direct native`) or converted (`packed`).
 - **alias preparation**: cache work against live transforms, shared-topology

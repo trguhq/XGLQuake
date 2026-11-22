@@ -1,7 +1,8 @@
 ## Rendering and tuning
 
 World, brush, alias and sprite materials remain CPU palette data. Geometry
-is subdivided and sampled into vertex colors, then submitted to XGL; the
+is subdivided and sampled into vertex colors, then submitted to XGL as
+smooth-shaded triangles; the
 renderer does not upload textures or draw UI image rasters. BSP/PVS
 visibility, brush/model transforms, animation and game collision use the
 existing engine structures and rules. Sky and water use animated sampled
@@ -56,35 +57,60 @@ effects appear as native overlay geometry.
 
 ### World detail
 
-Every face has a coarse mesh: its polygon as a triangle fan, colored at the
-corners. Faces near the viewer may also get a detailed mesh, subdivided up to
-twice wherever a triangle spans more than `xgl_subdivide` texels. Colors are
-filtered CPU samples of the texture; RGB mip averages for that share the
-material memory budget and are never uploaded as XGL textures. Filtering
-removes arbitrary single-texel colors; it cannot reproduce texture detail
-smaller than the submitted triangles.
+Every face has a coarse mesh: its own polygon, cut into a zig-zag of
+triangles and colored at its corners. Faces near the viewer may also get a
+detailed mesh, which starts from the coarse one and adds triangles where they
+would show something:
+
+- An edge longer than `xgl_subdivide` texels is always split. That keeps
+  baked light adequately sampled across large plain faces.
+- Any other edge is split if a vertex at its middle would differ, in any
+  color channel, by more than `xgl_detailerror` of 255 from what its two ends
+  already interpolate. The comparison is of filtered texture times baked
+  light, so texture shapes and shadow edges both attract triangles and even
+  areas get none. An edge's quarter points and a triangle's middle are
+  checked too, so that something lying between the vertices is not missed.
+- Edges of `xgl_detailedge` texels or less are never split, and a face never
+  gets more than `xgl_detailface` triangles. When that limit binds, the
+  edges with the largest differences are split first.
+
+Every triangle that has a split edge uses the same new vertex, so no seam can
+open inside a face. Each distinct vertex is colored once and shared by the
+triangles around it. Its texture color is the mean of a box of texels about
+three quarters as wide as the spacing of the vertices around it, taken from
+reduced RGB images. Those share the material memory budget and are never
+uploaded as XGL textures.
+
+A mesh therefore shows a texture's shapes at about the scale of its
+triangles: with the defaults, features of roughly 16 texels and more, such as
+arches, discs, panels and borders. A pattern finer than that, such as small
+bricks, averages to one color and is given no triangles.
 
 - Coarse meshes and their texture samples are built while the map loads, up
   to five eighths of the world cache; faces beyond that, on very large maps,
   are built when first seen.
-- Detailed meshes are built on demand, at most `xgl_detailbuild` vertices per
-  frame, so entering a new area fills in over a few frames instead of
-  stalling one.
+- Detailed meshes are built on demand, at most `xgl_detailbuild` triangles
+  per frame, so entering a new area fills in over a number of frames instead
+  of stalling one. A face with nothing to show in more detail is examined
+  once and keeps only its coarse mesh.
 - Each frame, visible faces within `xgl_detaildistance` are ranked by
-  projected size and the largest receive detail until `xgl_detailtris`
-  triangles are used. A face detailed in the previous frame ranks slightly
-  higher, so faces near the cut-off do not flicker between their two meshes.
+  projected size and the largest receive their detailed mesh until
+  `xgl_detailtris` triangles are used. A face detailed in the previous frame
+  ranks slightly higher, so faces near the cut-off do not flicker between
+  their two meshes.
 - When the 8 MiB world cache is full, detailed meshes that have not been
   drawn recently are released to make room. Coarse meshes are kept.
 - External brush models such as ammo and health boxes keep meshes of their
   own for the length of the map: up to 16 models of at most 64 faces each.
   Larger or further ones are streamed.
 
-When a mesh cannot be built at all the face is still drawn, streamed as a
-coarse fan each frame.
+When a mesh cannot be built at all the face is still drawn, streamed as a fan
+each frame.
 
-Light, lightstyle and gamma changes recolor a mesh from its stored texture
-samples with integer arithmetic; the texture is not sampled again.
+Light, lightstyle and gamma changes recolor a mesh's distinct vertices from
+their stored texture samples with integer arithmetic. The texture is not
+sampled again and the mesh keeps its shape, which was decided with every
+light style at its nominal level.
 
 ### Frame order
 
@@ -149,9 +175,24 @@ Measure the benefit on the target with the
 
 ### Sky and water
 
-Animated meshes sample each distinct vertex once per frame and reuse its
-color at repeated triangle corners. Animation is updated every frame,
-including sky scrolling, camera-relative sky projection and turbulent UVs.
+Sky and water faces are cut on regular grids aligned to the world axes, so
+that neighboring faces share every vertex along their common edges: 128 units
+for sky and for distant water, 64 units for water within
+`xgl_detaildistance`. Each distinct vertex is colored once per frame.
+
+A grid of that size cannot show a liquid texture's own 64-texel pattern, and
+a single texel taken at each vertex only flickers. Each water, slime, lava or
+teleporter vertex instead moves between the texture's two tones, the averages
+of its darker and its lighter half, on a long slow wave with a slight swell
+in brightness. On the finer grid a shorter crossing wave is added; it fades
+out with distance, so the change to the coarser grid cannot be seen. The
+texture is sampled once, when first used. Water in range always uses its
+finer grid and is not charged to `xgl_detailtris`.
+
+For sky, each of the two layers is reduced to 16 by 16 cells, the cloud layer
+with its coverage. A vertex takes the scrolling cloud layer laid over the
+scrolling back layer, interpolated between cells, through GLQuake's sky
+projection.
 
 ### Native UI
 
@@ -166,10 +207,13 @@ per digit, so they sit closer together than the original 24-pixel spacing.
 
 | Setting | Default | Effect |
 | --- | ---: | --- |
-| `xgl_subdivide` | 128 | Texel span above which a detailed world triangle is split, clamped to 8–256; smaller is finer. |
-| `xgl_detailtris` | 1024 | Detailed world/brush triangles per frame; faces beyond the allowance draw their coarse mesh. |
-| `xgl_detaildistance` | 512 | Distance within which world faces are considered for detail. |
-| `xgl_detailbuild` | 256 | Detailed-mesh vertices built per frame; one mesh is always allowed, 0 removes the limit. |
+| `xgl_subdivide` | 128 | Edge length, in texels, above which a detailed mesh always splits an edge, clamped to 8–256; smaller is finer. |
+| `xgl_detailerror` | 16 | Color difference, of 255, that a new vertex must make to be worth adding, clamped to 1–255; smaller is finer. |
+| `xgl_detailedge` | 16 | Edges of this many texels or less are never split, clamped to 4–64; smaller is finer. |
+| `xgl_detailface` | 192 | Most triangles in one face's detailed mesh, clamped to 4–1024. |
+| `xgl_detailtris` | 2048 | Detailed wall and brush-entity triangles per frame; faces beyond the allowance draw their coarse mesh. |
+| `xgl_detaildistance` | 512 | Distance within which faces are considered for detail and water uses its finer grid. |
+| `xgl_detailbuild` | 128 | Detailed-mesh triangles built per frame; one mesh is always allowed, 0 removes the limit. |
 | `xgl_alias_subdivide` | 1 | Alias subdivision depth, 0–2; distant models use less. |
 | `xgl_entity_triangles` | 512 | Additional alias subdivision triangles per frame; original model triangles remain. |
 | `xgl_sprite_cells` | 8 | Sample grid per sprite dimension, clamped to 2–16. |
@@ -183,6 +227,9 @@ per digit, so they sit closer together than the original 24-pixel spacing.
 | `xgl_profile` | 0 | 1 reports graphics timings and native call counts; 2 adds preparation and cache detail. Output goes to the terminal once per second. |
 | `_snd_mixahead` | 0.3 | Audio lookahead in seconds for XGL; an existing archived value overrides this default. |
 | `r_wateralpha` | 1 | Water opacity; values below 1 request native blending. |
+
+Changing `xgl_subdivide`, `xgl_detailerror`, `xgl_detailedge` or
+`xgl_detailface` rebuilds the mesh cache.
 
 Settings in configuration files or command-line options override these
 defaults. In particular, `xgl_entity_triangles` is saved in `config.cfg`, so

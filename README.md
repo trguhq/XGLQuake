@@ -48,14 +48,16 @@ locations and shareware restrictions.
 | `+_snd_mixahead 0.3` | Buffer 0.3 seconds of audio; see [audio](#solaris-audio-and-hardware-interfaces). |
 | `+xgl_alias_subdivide 0` | Keep original model triangles without extra subdivision. |
 | `+xgl_smp 0` | Select serial vertex preparation. The default detects multiple CPUs. Use 1 to request a helper. |
-| `+xgl_detailtris 1024` | Set the detailed world triangle allowance; complete coarse faces remain. |
+| `+xgl_detailtris 2048` | Set the detailed world triangle allowance; complete coarse faces remain. |
+| `+xgl_detailerror 16` | Set how much a texture or shadow must differ before it is given more triangles; larger is coarser. |
 | `+xgl_profile 0` | Disable profiling for FPS measurements. Use 1 for summary timings or 2 for detail. |
 
 More detail draws more triangles and costs frame rate: a larger
 `xgl_detailtris` or `xgl_alias_subdivide` adds detail, and so does a
-*smaller* `xgl_subdivide`, which is the texel span at which a world triangle
-is split. The detail allowance is not a cap on all drawn triangles. See the
-[full settings table](docs/render.md#renderer-settings) for defaults and
+*smaller* `xgl_detailerror`, `xgl_detailedge` or `xgl_subdivide`. The detail
+allowance is not a cap on all drawn triangles. See
+[world detail](docs/render.md#world-detail) for how triangles are placed and
+the [full settings table](docs/render.md#renderer-settings) for defaults and
 other controls.
 
 ### Measure performance
@@ -91,8 +93,9 @@ The existing Solaris main allocates a 16 MiB engine heap. World geometry
 cache storage is capped at another 8 MiB, CPU material pixels and optional
 filter levels at another 8 MiB, and alias color caches at 1 MiB. The alias
 normal/topology cache, its fixed entry table and reusable work array together
-are capped at another 1 MiB. The XGL audio ring is 32 KiB, and a
-multiprocessor worker adds about 0.75 MiB of scratch space.
+are capped at another 1 MiB. The XGL audio ring is 32 KiB, building world
+meshes uses about 0.35 MiB of fixed scratch space, and a multiprocessor
+worker adds about 0.75 MiB.
 Native contexts, window buffers, program data and
 library allocations are additional. These limits are not a measurement of
 total process memory.
