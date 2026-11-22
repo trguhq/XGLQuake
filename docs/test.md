@@ -8,7 +8,11 @@ The SMP tests use a real POSIX worker with controlled CPU counts and startup
 failures to check mode selection, queuing, reclaiming of unstarted jobs,
 draining, and shutdown. The world and entity tests also cover drawing order
 by native state, map-load mesh building, the per-frame build limit, detail
-eviction and the identity record that lets model caches skip comparisons.
+eviction and the identity record that lets model caches skip comparisons;
+detail placed by contrast and by apparent size; and geometry submitted with
+and without normals, including the copies walls keep for dynamic lights.
+The screen tests cover when an unchanged status bar is left in place, and
+the UI tests that every picture name draws what it did before.
 Run from `WinQuake/`:
 
 ```sh
@@ -42,8 +46,10 @@ against the SDK headers; it does not require Python. It captures SDK calls to ch
 clipping, lighting selection/state changes and their count, gamma and
 native font placement/cache behavior, including spaces kept inside text
 runs. It also checks view placement after
-resizing, strided/prepared vertex colors, cached/direct geometry batches,
-UI batch ordering and lifetimes, completion waits, and error diagnostics
+resizing, strided/prepared vertex colors, cached/direct geometry batches of
+points with and without normals, a clear that leaves the status bar's rows
+alone and the mapping restored after it, queued UI text and rectangles and
+their order and lifetimes, completion waits, and error diagnostics
 with missing library message fields.
 It does not rasterize those calls.
 

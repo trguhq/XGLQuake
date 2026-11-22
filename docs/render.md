@@ -72,11 +72,30 @@ would show something:
   color channel, by more than `xgl_detailerror` of 255 from what its two ends
   already interpolate. The comparison is of filtered texture times baked
   light, so texture shapes and shadow edges both attract triangles and even
-  areas get none. An edge's quarter points and a triangle's middle are
-  checked too, so that something lying between the vertices is not missed.
+  areas get none.
+- The difference is judged relative to the light there: divided by the
+  brighter of the two baked light levels, as a fraction of full light and
+  never less than a quarter. A texture in shadow then earns the triangles
+  the same texture earns in the open, where an absolute difference would
+  leave dim walls coarse beside bright ones.
+- An edge whose middle agrees is not let pass on that alone. It is walked at
+  the finest spacing a mesh may reach, up to 16 points, and each triangle is
+  looked at in its middle and toward its corners; whatever that finds,
+  further splits close in on. Otherwise the same texture is caught on one
+  wall and missed on the next, according to where their corners happen to
+  fall. These second looks stop once the edges already marked would use all
+  the triangles the face may have.
 - Edges of `xgl_detailedge` texels or less are never split, and a face never
-  gets more than `xgl_detailface` triangles. When that limit binds, the
-  edges with the largest differences are split first.
+  gets more triangles than its limit. When that limit binds, the edges with
+  the largest differences are split first.
+- The limit follows how large the face appears: `xgl_detaildensity` times
+  its area over its squared distance, at most `xgl_detailface`. A face is
+  built with half as many again in hand, and built again, larger, once the
+  viewer has come close enough to double what it may have. Walking away
+  keeps the finer mesh. One whose limit would be under 8 triangles keeps its
+  coarse mesh. With a density of 0 every face may have `xgl_detailface`
+  triangles at any distance, as before; the frame's allowance then goes to
+  the first few large faces and the rest of the room stays coarse.
 
 Every triangle that has a split edge uses the same new vertex, so no seam can
 open inside a face. Each distinct vertex is colored once and shared by the
@@ -110,6 +129,17 @@ bricks, averages to one color and is given no triangles.
 
 When a mesh cannot be built at all the face is still drawn, streamed as a fan
 each frame.
+
+Meshes are stored as XGL color points, a position and a color, without a
+normal: illumination is the only thing that reads one, and nearly every wall
+is drawn unlit. The device draws such points about a tenth faster and the
+meshes are a third smaller. A wall that a dynamic light reaches is drawn
+from a second copy that has the face's normal, made the first time it is
+needed, kept in step with the wall's colors, and given up when the cache is
+short of room and no light has reached the face for a while. Without room
+for a copy the wall is illuminated all the same, copied out with its normal
+each frame. Sky, water, sprites, particles and CPU-shaded models are color
+points too; a native call holds points of one kind.
 
 Light, lightstyle and gamma changes recolor a mesh's distinct vertices from
 their stored texture samples with integer arithmetic. The texture is not
@@ -200,12 +230,49 @@ projection.
 
 ### Native UI
 
-Consecutive opaque rectangles share one polygon call. A run of characters is
-one text call when the font's measured advances keep every glyph in its
-fixed cell; otherwise glyphs are placed individually. Spaces stay inside a
-run when the font's space is measured to advance exactly one cell. The digits
-of a status-bar number are drawn as one centered text call rather than one
-per digit, so they sit closer together than the original 24-pixel spacing.
+A run of characters is one text call when the font's measured advances keep
+every glyph in its fixed cell; otherwise glyphs are placed individually.
+Spaces stay inside a run when the font's space is measured to advance exactly
+one cell. The digits of a status-bar number are drawn as one centered text
+call rather than one per digit, so they sit closer together than the original
+24-pixel spacing.
+
+Text is not drawn when it is asked for. It waits until the UI is complete,
+or until a rectangle is asked for that would cover part of it, and the
+opaque rectangles asked for in the meantime go out in one polygon call
+instead of one before every piece of text. The picture is the one the
+requests would have drawn in order. Runs of one size and color are then
+drawn together, which leaves the fewest attribute changes. A status bar is
+one polygon call followed by its dozen text calls.
+
+Each picture Quake draws is told apart by its name once, when first asked
+for, and found by its handle after that. A box with an edge is two
+rectangles, the edge color under the fill, not a fill and four strips.
+
+### Status bar
+
+Quake's status bar code already knows when the bar has changed and draws it
+only then, once for each of the two buffers; that is how it worked on
+page-flipped video modes. The renderer used to clear the whole window every
+frame and so had to draw the bar every frame, the largest fixed cost in one.
+
+A frame now asks its clear to stop above the bar and leaves the bar to
+Quake. The clear is cut short the way the benchmark's viewport probe did it
+on the Sun ZX: XGL's automatic mapping is turned off and a shorter device
+viewport set for the clear alone, then XGL's own mapping of the whole window
+is restored before anything is drawn. Such a clear is slower than clearing
+everything, by about 2 ms at 320x240 and in proportion to the view beyond
+that, so `xgl_keepbar` -1 does this only where the view above the bar is at
+most 100,000 pixels; 1 does it at any size and 0 never.
+
+The bar's rows have to hold nothing but the bar. A frame with the console
+showing, a menu, a dialog, the loading plaque, an intermission, a chat line
+or a center message clears and draws everything as before, and so do the two
+frames after one, since each buffer still holds what that frame left. The
+bar is also drawn again when the window is moved, mapped or exposed, and
+every 128 frames whatever the game says. If the device's viewport is not the
+window's rows counted from the top, or the window is scaled, the bar is not
+kept at all; a line on the terminal says so.
 
 ### Renderer settings
 
@@ -215,6 +282,7 @@ per digit, so they sit closer together than the original 24-pixel spacing.
 | `xgl_detailerror` | 16 | Color difference, of 255, that a new vertex must make to be worth adding, clamped to 1–255; smaller is finer. |
 | `xgl_detailedge` | 16 | Edges of this many texels or less are never split, clamped to 4–64; smaller is finer. |
 | `xgl_detailface` | 192 | Most triangles in one face's detailed mesh, clamped to 4–1024. |
+| `xgl_detaildensity` | 160 | Triangles a face may have for its apparent size: this times its area over its squared distance, up to `xgl_detailface`. Larger gives near faces their limit sooner; 0 gives every face `xgl_detailface`. |
 | `xgl_detailtris` | 2048 | Detailed wall and brush-entity triangles per frame; faces beyond the allowance draw their coarse mesh. |
 | `xgl_detaildistance` | 512 | Distance within which faces are considered for detail and water uses its finer grid. |
 | `xgl_detailbuild` | 128 | Detailed-mesh triangles built per frame; one mesh is always allowed, 0 removes the limit. |
@@ -227,13 +295,14 @@ per digit, so they sit closer together than the original 24-pixel spacing.
 | `xgl_lightfalloff` | 2 | How fast a dynamic light fades with distance, clamped to 1–64; 1 is the slowest and brightest. |
 | `xgl_lightrange` | 4 | Distance, in light radii, beyond which geometry is not illuminated by a dynamic light; 0 removes the limit. |
 | `xgl_alias_shade` | 1 | Shade models on the CPU and submit them unlit; 0 uses native illumination. |
+| `xgl_keepbar` | -1 | Leave an unchanged status bar in place instead of clearing and redrawing it: -1 in small windows only, 0 never, 1 whenever possible. |
 | `xgl_smp` | -1 | Worker thread for model preparation: -1 automatic, 0 off, 1 on. |
 | `xgl_profile` | 0 | 1 reports graphics timings and native call counts; 2 adds preparation and cache detail. Output goes to the terminal once per second. |
 | `_snd_mixahead` | 0.3 | Audio lookahead in seconds for XGL; an existing archived value overrides this default. |
 | `r_wateralpha` | 1 | Water opacity; values below 1 request native blending. |
 
-Changing `xgl_subdivide`, `xgl_detailerror`, `xgl_detailedge` or
-`xgl_detailface` rebuilds the mesh cache.
+Changing `xgl_subdivide`, `xgl_detailerror`, `xgl_detailedge`,
+`xgl_detailface` or `xgl_detaildensity` rebuilds the mesh cache.
 
 Settings in configuration files or command-line options override these
 defaults. In particular, `xgl_entity_triangles` is saved in `config.cfg`, so
@@ -247,8 +316,10 @@ available.
 
 The 3D context uses the benchmark's automatic full-raster VDC mapping.
 Quake's view rectangle is selected through the VDC window and view clipping,
-without explicitly setting `XGL_CTX_DC_VIEWPORT`. This preserves `viewsize`
-and the space reserved for the status bar. Native UI uses device coordinates.
+so geometry is drawn with XGL's own device viewport. This preserves
+`viewsize` and the space reserved for the status bar. The one explicit
+`XGL_CTX_DC_VIEWPORT` is the shorter one a clear uses to leave the status
+bar alone, described above. Native UI uses device coordinates.
 
 While the opaque console slides over the view, the 3D clip boundary follows
 its lower edge without changing the camera or scaling the exposed scene.

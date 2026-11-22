@@ -45,7 +45,8 @@ can change the result, and each point light adds about 1.8 µs to every lit
 triangle. The number of lights merely allocated and switched off does not
 matter. The renderer therefore illuminates only the walls and brush entities
 a dynamic light reaches, enables only the lights that reach something, and
-shades models on the CPU.
+shades models on the CPU. Unlit geometry is submitted as color-only points;
+only the walls a light reaches carry normals.
 
 At this size the device is limited by triangle count, not pixels: the same
 triangles at 640x480, four times the area, take the same time. Triangles of
@@ -74,7 +75,13 @@ The others fill at about 27 million pixels per second and so grow with the
 window. The view weapon therefore no longer gets a depth clear of its own.
 
 A region that is neither cleared nor redrawn keeps its contents on both
-buffers across buffer switches.
+buffers across buffer switches, and geometry and a clear both stay inside a
+device viewport set shorter than the window. The renderer uses this to
+[leave an unchanged status bar in place](render.md#status-bar) in small
+windows, where the slower clear costs about 2 ms and drawing the bar cost
+several times that. The probe checked the middle of the view and of the
+band, not the row where they meet; the renderer's use of it has not yet been
+run on the device.
 
 ## Submission calls
 
@@ -88,13 +95,20 @@ buffers across buffer switches.
 Each call costs about 33 µs on top of its triangles, so batching matters far
 more than the choice of batched primitive.
 
+Those are flat triangles. Whether strips or triangle lists pay for the
+smooth-shaded triangles the renderer draws has not been measured; the
+`probe/mesh` cases of [xglbench](../xglbench/README.md#hardware-probes) are
+there to find out.
+
 ## Native stroke text
 
 Text costs about 23 µs per glyph and about 0.2 ms per call. A status bar of
 four lines took 3.2 ms and a twelve-line console 8.0 ms, each including one
 polygon call for its rectangles and one completion wait. The renderer keeps
 the number of text calls down: one per run of characters, spaces included,
-and one per status-bar number.
+and one per status-bar number. It also queues text so that a status bar's
+rectangles go out in one polygon call, and draws the bar only when it has
+changed where the window is small enough.
 
 ## Native texture mapping
 

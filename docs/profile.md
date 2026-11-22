@@ -20,7 +20,8 @@ of those boundaries.
 ### Reading a report
 
 `xgl_profile 1` prints two lines about once a second. These are from the
-supplied demo1 run of 19 November 2026 (before the `state` fields existed):
+supplied demo1 run of 19 November 2026 (before the `state` and
+`status bar kept` fields existed):
 
 ```
 XGL profile: 21 frames; gfx 46.61 ms (max 102.92); world 13.51 entities 6.47 effects 0.92 weapon 9.31 UI 7.00 audio-overlap 2.35 ms
@@ -55,6 +56,10 @@ times and per-frame counts:
   may defer part of a change's cost to the next submission.
 - `triangles` includes alias subdivision and particles; `glyphs` and
   `polygon calls` include the UI.
+- `status bar kept`: the share of frames, 0 to 1, whose clear left the status
+  bar in place. In the rest the bar may have been drawn; `glyphs` shows how
+  often it was. Zero throughout means the bar is not being kept: see
+  [the status bar](render.md#status-bar) for what rules it out.
 
 Profiling is off by default and makes no timing queries when disabled. Output
 goes to the terminal, so it adds no console glyphs to the workload measured.
@@ -78,7 +83,8 @@ times overlap the stages and one another; do not add them to a frame total.
   and queued translucent water.
 - **alias entity detail** and **view weapon detail**: the light lookup
   (`R_LightPoint` only; flames and fullbright skip it), cached output (final
-  position, normal and color assembly into the native batch) and fallback
+  position and color assembly into the native batch, with a normal only
+  under native illumination) and fallback
   drawing (uncached transform, subdivision, skin sampling and packing). These
   are nested inside the entity and weapon scopes.
 - **SMP alias preparation**: jobs completed by the worker per frame; the main
@@ -106,7 +112,8 @@ Detailed counts are per-frame averages.
   both zero in a frame with no dynamic light.
 - **alias cache per frame**: color and pose (normal/topology) cache hits,
   misses and evictions, and fallback draws, show cache pressure. Compare text
-  calls with glyphs to see how well the installed font allows runs.
+  calls with glyphs to see how well the installed font allows runs. Both are
+  counted when the text is drawn, not when it is asked for.
 - **reuse**: sky and water color time, distinct animated vertices colored
   against animated corners emitted, and vertices per frame by path: queued from
   persistent meshes (`cached native`), written straight into the batch
