@@ -1309,8 +1309,10 @@ static void XGL_PlanAliasEntities(void)
     xgl_alias_planned = 1;
 }
 
-/* Unlit flames are drawn first, straight after the other unlit geometry, and
- * lit models after them: one illumination change instead of one per torch. */
+/* Under native illumination (xgl_alias_shade 0) the unlit flames are drawn
+ * first, straight after the other unlit geometry, and the lit models after
+ * them: one illumination change instead of one per torch. With CPU shading
+ * every model is unlit and the two passes differ in nothing. */
 static int XGL_AliasPassEntity(int pass, int index)
 {
     entity_t *entity;
@@ -1541,7 +1543,7 @@ void XGL_DrawViewModel(void)
         (cl.items & IT_INVISIBILITY) || cl.stats[STAT_HEALTH] <= 0 ||
         !cl.viewent.model || cl.viewent.model->type != mod_alias) return;
     currententity = &cl.viewent;
-    /* The weapon joins the lit models' batch. XGL_ProcessAlias draws it
+    /* The weapon joins the other models' batch. XGL_ProcessAlias draws it
      * shrunk toward the eye, in front of the world by depth alone, so the
      * frame needs no second depth clear or completion wait. */
     XGL_ProfileDrawBegin(&profile);
