@@ -29,19 +29,23 @@ approximates Quake's additive dynamic lighting.
 Dynamic lights are XGL point lights: the `xgl_maxlights` lights nearest the
 viewer, at most four. XGL attenuates a light by 1/(C1 + C2·d) and offers
 nothing steeper, so a light's strength at distance d is
-1/(1 + `xgl_lightfalloff`·d/radius). With the default of 8 that is a third at
-a quarter of the light's radius, a ninth at its radius and a seventeenth at
-two radii. Quake's own lights end at their radius; these never quite do.
+1/(1 + `xgl_lightfalloff`·d/radius). With the default of 2 that is two thirds
+at a quarter of the light's radius, a third at its radius and a ninth at four
+radii. Quake's own lights end at their radius; these never quite do. A light
+multiplies the vertex color, so it shows most on dim surfaces and cannot
+brighten one that is already at full brightness.
 
 Only geometry a light can reach is illuminated: walls that face a light and
 lie within `xgl_lightrange` radii of it, and brush entities whose bounds do.
 Every other wall, and every wall while no dynamic light is active, is
 submitted unlit with identical colors, which the device draws considerably
 faster. A light that reaches nothing visible is switched off. At the default
-range the light that is cut off adds about 6% to a surface facing it
-directly. `xgl_lightfalloff 1` with `xgl_lightrange 0` restores the earlier
-behavior: a slow falloff applied to every wall facing a light. `xgl_ambient`
-below 1 keeps every wall illuminated.
+range of four radii the light that is cut off adds about 11% to a surface
+facing it directly. A larger `xgl_lightfalloff` draws the light in toward its
+source and makes that step smaller, at the price of a fainter light: 8 left a
+muzzle flash barely visible. `xgl_lightfalloff 1` with `xgl_lightrange 0` is
+the original behavior, a slow falloff applied to every wall facing a light.
+`xgl_ambient` below 1 keeps every wall illuminated.
 
 Animated models are shaded on the CPU and submitted unlit. Each vertex color
 is multiplied by ambient light plus a fixed directional fill from above,
@@ -220,8 +224,8 @@ per digit, so they sit closer together than the original 24-pixel spacing.
 | `xgl_playercolors` | 1 | Apply original player shirt/pants palette translations to sampled skins. |
 | `xgl_ambient` | 1 | Ambient contribution, clamped to 0–1; below 1 keeps the world illuminated. |
 | `xgl_maxlights` | 4 | Maximum native point lights, clamped to 0–4. |
-| `xgl_lightfalloff` | 8 | How fast a dynamic light fades with distance, clamped to 1–64; 1 is the slowest. |
-| `xgl_lightrange` | 2 | Distance, in light radii, beyond which geometry is not illuminated by a dynamic light; 0 removes the limit. |
+| `xgl_lightfalloff` | 2 | How fast a dynamic light fades with distance, clamped to 1–64; 1 is the slowest and brightest. |
+| `xgl_lightrange` | 4 | Distance, in light radii, beyond which geometry is not illuminated by a dynamic light; 0 removes the limit. |
 | `xgl_alias_shade` | 1 | Shade models on the CPU and submit them unlit; 0 uses native illumination. |
 | `xgl_smp` | -1 | Worker thread for model preparation: -1 automatic, 0 off, 1 on. |
 | `xgl_profile` | 0 | 1 reports graphics timings and native call counts; 2 adds preparation and cache detail. Output goes to the terminal once per second. |

@@ -75,9 +75,11 @@ static xgl_backend_t xb;
 static cvar_t xgl_ambient = {"xgl_ambient", "1", true, false, 0, NULL};
 static cvar_t xgl_maxlights = {"xgl_maxlights", "4", true, false, 0, NULL};
 /* A dynamic light's strength at distance d is 1 / (1 + falloff * d / radius).
- * Geometry further than range radii from a light is not illuminated by it. */
-static cvar_t xgl_lightfalloff = {"xgl_lightfalloff", "8", false, false, 0, NULL};
-static cvar_t xgl_lightrange = {"xgl_lightrange", "2", false, false, 0, NULL};
+ * Geometry further than range radii from a light is not illuminated by it.
+ * A falloff of 8 proved too steep on the Sun ZX: a muzzle flash added a
+ * third to the floor beneath it, for a frame or two, and went unnoticed. */
+static cvar_t xgl_lightfalloff = {"xgl_lightfalloff", "2", false, false, 0, NULL};
+static cvar_t xgl_lightrange = {"xgl_lightrange", "4", false, false, 0, NULL};
 
 static void update_gamma(void);
 
