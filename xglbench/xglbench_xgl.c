@@ -86,6 +86,7 @@ typedef struct {
     Xgl_boolean stream_previous_volatile;
     enum xb_probe probe;
     int probe_lit, viewport_reduced;
+    int texture_layout; /* bit 0: raster row zero is v=0; bit 1: 0x00RRGGBB words */
     Xgl_boolean probe_switches[XB_MAX_LIGHTS + 1];
 } xb_native;
 
@@ -425,9 +426,12 @@ static Xgl_usgn32 *texture_raster_pixels(int level)
 
 static Xgl_usgn32 texture_word(const xb_rgb *rgb)
 {
-    return ((Xgl_usgn32)(rgb->b * 255.0f + .5f) << 16) |
-           ((Xgl_usgn32)(rgb->g * 255.0f + .5f) << 8) |
-           (Xgl_usgn32)(rgb->r * 255.0f + .5f);
+    Xgl_usgn32 red, blue;
+    red = (Xgl_usgn32)(rgb->r * 255.0f + .5f);
+    blue = (Xgl_usgn32)(rgb->b * 255.0f + .5f);
+    if (b.texture_layout & 2) return (red << 16) |
+        ((Xgl_usgn32)(rgb->g * 255.0f + .5f) << 8) | blue;
+    return (blue << 16) | ((Xgl_usgn32)(rgb->g * 255.0f + .5f) << 8) | red;
 }
 
 static int texture_build_image(int pattern)
@@ -452,10 +456,13 @@ static int texture_build_image(int pattern)
                 rgb.b = x < XB_TEXTURE_WIDTH / 2 && y >= XB_TEXTURE_WIDTH / 2;
             } else if (pattern == 2) rgb.r = rgb.g = rgb.b = (float)(x & 1);
             else rgb = image[y * XB_TEXTURE_WIDTH + x];
-            /* CPU row zero denotes v=0. Memory Raster row zero is the top;
-             * XGL texture v=0 is the bottom. Native word layout is 0x00BBGGRR.
+            /* CPU row zero denotes v=0. The documented layout puts v=0 on
+             * the last Memory Raster row with 0x00BBGGRR words; the readback
+             * gates select another row order or word layout if the device
+             * differs (see configure_texture).
              */
-            pixels[(XB_TEXTURE_WIDTH - 1 - y) * XB_TEXTURE_WIDTH + x] = texture_word(&rgb);
+            pixels[((b.texture_layout & 1) ? y : XB_TEXTURE_WIDTH - 1 - y) *
+                   XB_TEXTURE_WIDTH + x] = texture_word(&rgb);
         }
     }
     if (xb_cancel_requested()) return 0;
@@ -568,6 +575,7 @@ static int validate_texture(void)
     static const double bary[5][2] = {{.1,.1},{.35,.1},{.1,.35},{.65,.2},{.2,.65}};
     static const double weights[3] = {.27,.58,.15};
     static const double footprint[4] = {1.1,1.25,1.5,1.75};
+    xb_rgb level_color;
     int i, j, phase, level, side, middle, mixed;
     char context[96];
     memset(&fallback, 0, sizeof(fallback));
@@ -666,7 +674,10 @@ static int validate_texture(void)
             pixels = texture_raster_pixels(level);
             if (!pixels) return 0;
             side = XB_TEXTURE_WIDTH >> level;
-            for (j = 0; j < side * side; ++j) pixels[j] = level ? 0x0000ff00UL : 0x000000ffUL;
+            level_color.r = level ? 0.0f : 1.0f;
+            level_color.g = level ? 1.0f : 0.0f;
+            level_color.b = 0;
+            for (j = 0; j < side * side; ++j) pixels[j] = texture_word(&level_color);
         }
         xgl_object_set(b.texture_mipmap, XGL_MIPMAP_TEXTURE_MEM_RAS_LIST,
                        b.texture_rasters, 0);
@@ -712,7 +723,30 @@ static int configure_texture(const xb_case *test)
         fail_kind(XB_FAILURE_UNSUPPORTED, "texture readback gates require at least a 128x128 drawable"); return 0;
     }
     b.texture_filter = test->texture_filter;
-    if (!texture_build_image(1) || !texture_set_descriptor() || !validate_texture()) return 0;
+    {
+        /* Try the last accepted image layout first, then the other row
+         * orders and word layouts. Only a readback mismatch moves on; the
+         * first mismatch is reported if no layout passes every gate. */
+        char first[sizeof(b.error)];
+        int attempt, start;
+        start = b.texture_layout & 3;
+        first[0] = '\0';
+        for (attempt = 0; attempt < 4; ++attempt) {
+            b.texture_layout = start ^ attempt;
+            if (texture_build_image(1) && texture_set_descriptor() && validate_texture()) break;
+            if (b.errors || b.fatal || xb_cancel_requested() ||
+                b.failure != XB_FAILURE_VALIDATION) return 0;
+            if (!first[0]) copy_text(first, sizeof(first), b.error);
+            if (attempt == 3) {
+                b.texture_layout = start;
+                copy_text(b.error, sizeof(b.error), first);
+                return 0;
+            }
+            b.failure = XB_FAILURE_NONE;
+            b.error[0] = '\0';
+            if (!texture_enable(0)) return 0;
+        }
+    }
     /* Each selected filter is proved on calibration images above; restore the
      * shared procedural image and build its full 64..1 pyramid before timing.
      */
@@ -1793,9 +1827,14 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
     if (test->xgl_lighting && b.inquiry.lighting != XGL_INQ_HARDWARE)
         copy_text(reason, size,
             "diagnostic fallback: lighting not reported in hardware; readback passed");
-    if (b.texture_filter != XB_TEXTURE_OFF)
-        copy_text(reason, size,
-            "texture RGB/UV/wrap/filter/off gates passed; execution unclassified, may use software");
+    if (b.texture_filter != XB_TEXTURE_OFF) {
+        char note[160];
+        sprintf(note, "texture RGB/UV/wrap/filter/off gates passed (%s rows, %s words); "
+                "execution unclassified, may use software",
+                (b.texture_layout & 1) ? "v=0 first" : "v=0 last",
+                (b.texture_layout & 2) ? "0x00RRGGBB" : "0x00BBGGRR");
+        copy_text(reason, size, note);
+    }
     if (test->probe != XB_PROBE_NONE) {
         char note[160];
         b.stage = "hardware probe";
