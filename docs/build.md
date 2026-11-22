@@ -2,8 +2,9 @@
 
 The native target requires 32-bit SPARC Solaris. Development and hardware
 testing use Solaris 2.6 and the [tgcware](https://jupiterrise.com/tgcware/)
-GNU utilities. The current target is the single-SM61 system described above;
-the project's envisaged larger system has two SM61 processors and 128 MB RAM.
+GNU utilities. The current target is the single-SM61 SPARCstation 10
+described in the [README](../README.md); the project's envisaged larger
+system has two SM61 processors and 128 MB RAM.
 
 Run all `Makefile.XGL` and `Makefile.Solaris` commands in this document from
 `WinQuake/`.

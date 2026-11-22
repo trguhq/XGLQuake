@@ -5,8 +5,11 @@ queueing and profiling tests need no SDK or game data. They run against
 controlled engine/backend mocks. Alias color checks also use the real CPU
 texture sampler to compare cached output with the original color calculation.
 The SMP tests use a real POSIX worker with controlled CPU counts and startup
-failures to check mode selection, queuing, draining, and shutdown. Run from
-`WinQuake/`:
+failures to check mode selection, queuing, reclaiming of unstarted jobs,
+draining, and shutdown. The world and entity tests also cover drawing order
+by native state, map-load mesh building, the per-frame build limit, detail
+eviction and the identity record that lets model caches skip comparisons.
+Run from `WinQuake/`:
 
 ```sh
 make -f Makefile.XGL check
@@ -36,8 +39,9 @@ the compiler log are reported by the script.
 
 The `native-contract-check` target builds and runs mocked backend tests
 against the SDK headers; it does not require Python. It captures SDK calls to check projection,
-clipping, lighting selection/state changes, depth-clear state, gamma and
-native font placement/cache behavior. It also checks view placement after
+clipping, lighting selection/state changes and their count, gamma and
+native font placement/cache behavior, including spaces kept inside text
+runs. It also checks view placement after
 resizing, strided/prepared vertex colors, cached/direct geometry batches,
 UI batch ordering and lifetimes, completion waits, and error diagnostics
 with missing library message fields.
@@ -75,6 +79,7 @@ The single-SM61 should report single-threaded rendering.
 
 To locate a timing difference, repeat both commands with `+xgl_profile 2`
 and separate log filenames. Use the unprofiled runs for the FPS comparison.
-The supplied profiled run on Sun LEO recorded 969 frames in 77.3 seconds
-(12.5 FPS). Dual-SM61 speedup and the 15 FPS target still require hardware
-measurements.
+The profiled single-CPU run of 19 November 2026, made before the changes
+that [Measured on the Sun ZX](hardware.md) led to, recorded 969 frames in
+77.3 seconds (12.5 FPS). Dual-SM61 speedup and the 15 FPS target still
+require hardware measurements.

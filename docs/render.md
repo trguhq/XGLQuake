@@ -1,8 +1,8 @@
 ## Rendering and tuning
 
 World, brush, alias and sprite materials remain CPU palette data. Geometry
-is subdivided and sampled into triangle or vertex colors, then submitted to
-XGL; the renderer does not upload textures or draw UI image rasters. BSP/PVS
+is subdivided and sampled into vertex colors, then submitted to XGL; the
+renderer does not upload textures or draw UI image rasters. BSP/PVS
 visibility, brush/model transforms, animation and game collision use the
 existing engine structures and rules. Sky and water use animated sampled
 geometry. Menu, HUD, console and image-based labels use native stroke text
@@ -14,123 +14,166 @@ renderer does not implement the OpenGL renderer's optional mirrors, projected
 alias shadows or environment-map capture. Those features in the existing
 OpenGL target are unchanged.
 
+Several choices below follow from measurements of the target device; see
+[Measured on the Sun ZX](hardware.md).
+
+### Lighting
+
 Baked BSP lighting and animated lightstyles are folded into the sampled
-material colors. XGL supplies ambient lighting, up to four nearest active
-point lights, and directional fill for alias models. A small material-light
-floor permits native lights to affect dark surfaces. This intentionally
-approximates Quake's additive dynamic lighting and uses one world shading
-pass. Translucent water and screen color effects use native blending;
-palette effects appear as native overlay geometry.
+vertex colors, so the world needs one shading pass. A small light floor keeps
+dark materials from going fully black, which lets native lights, which
+multiply the vertex color, still show on them. This intentionally
+approximates Quake's additive dynamic lighting.
 
-Ordinary world materials use cached, filtered CPU color samples. Optional
-RGB mip averages share the existing material memory budget; they are never
-uploaded as XGL textures. Large visible surfaces receive priority within
-the same detail-triangle allowance. The depth-two limit still means large
-faces may have coarse patches even when `xgl_subdivide` is small. Filtering
-reduces arbitrary single-texel gradients; it cannot reproduce texture detail
-smaller than the submitted geometry.
+Dynamic lights are XGL point lights: the `xgl_maxlights` lights nearest the
+viewer, at most four. Their strength at distance d is 1/(1 + d/radius): half
+at the light's radius and a fifth at four radii, never reaching zero as
+Quake's does.
 
-### Native vertex storage
+Walls and brush entities are submitted with native illumination only while it
+can change the image, that is, while a dynamic light is active or
+`xgl_ambient` is below 1. Otherwise they are submitted unlit with identical
+colors, which the device draws considerably faster. Alias models are always
+illuminated, by ambient light and a fixed directional fill plus any dynamic
+lights; the two torch flame models are unlit. Sky and water are never
+illuminated.
 
-World meshes store contiguous native XGL vertex records separately from
-texture/light metadata. Static geometry is queued by reference, avoiding a
-conversion and copy every frame; cached colors
-change only with material/lightstyle/gamma state. Transformed brush and
-cached alias output is written into the backend's batch storage directly.
-Particles also write directly into that storage, preparing the palette/gamma
-color once per particle instead of converting each corner separately.
-The backend checks its vertex layout against the installed SDK and retains
-the existing triangle order, shading and 256-triangle batching limit.
+Translucent water and screen color effects use native blending; palette
+effects appear as native overlay geometry.
 
-### Animated model caching
+### World detail
 
-Animated models cache sampled skin palette indices while retaining current
-transforms, lighting, skins and player colors. Cached output prepares each
-used palette color's lighting and gamma once per model draw, then reuses its
-RGB values at repeated corners. A fixed table of about 3.3 KiB lasts only for
-that draw, so lighting and gamma changes take effect immediately. Color
-entries use 16 bytes per triangle instead of 40; existing cache limits remain
-unchanged. Fallback and sprite drawing retain the generic color conversion
-path, including their original cutout coverage and corner-color rules.
+Every face has a coarse mesh: its polygon as a triangle fan, colored at the
+corners. Faces near the viewer may also get a detailed mesh, subdivided up to
+twice wherever a triangle spans more than `xgl_subdivide` texels. Colors are
+filtered CPU samples of the texture; RGB mip averages for that share the
+material memory budget and are never uploaded as XGL textures. Filtering
+removes arbitrary single-texel colors; it cannot reproduce texture detail
+smaller than the submitted triangles.
 
-Subdivision commands, parent links and triangle indices are shared between
-poses; smaller pose entries cache model-local normals. Hashes reject
-different command/normal sequences quickly, with exact comparisons before
-reuse. Current pose positions are still transformed each frame. All model
-cache storage remains bounded, with recursive drawing when caching fails.
-Sampled skin caches retain their visible-triangle count, avoiding a repeated
-coverage scan when emitting a cached pose.
-The two flame models remain unlit and skip the world-lighting lookup.
+- Coarse meshes and their texture samples are built while the map loads, up
+  to five eighths of the world cache; faces beyond that, on very large maps,
+  are built when first seen.
+- Detailed meshes are built on demand, at most `xgl_detailbuild` vertices per
+  frame, so entering a new area fills in over a few frames instead of
+  stalling one.
+- Each frame, visible faces within `xgl_detaildistance` are ranked by
+  projected size and the largest receive detail until `xgl_detailtris`
+  triangles are used. A face detailed in the previous frame ranks slightly
+  higher, so faces near the cut-off do not flicker between their two meshes.
+- When the 8 MiB world cache is full, detailed meshes that have not been
+  drawn recently are released to make room. Coarse meshes are kept.
+- External brush models such as ammo and health boxes keep meshes of their
+  own for the length of the map: up to 16 models of at most 64 faces each.
+  Larger or further ones are streamed.
 
-Sprites collect their sampled triangles in the same bounded fallback buffer
-used by alias models. This reduces CPU draw calls while preserving triangle
-order and per-triangle cutout sampling. Weapon depth clearing reuses the
-tracked opaque/depth-write state; its completion waits remain in place.
+When a mesh cannot be built at all the face is still drawn, streamed as a
+coarse fan each frame.
+
+Light, lightstyle and gamma changes recolor a mesh from its stored texture
+samples with integer arithmetic; the texture is not sampled again.
+
+### Frame order
+
+Changing between illuminated and unlit drawing is expensive on the Sun ZX,
+so a frame is drawn in order of native state rather than kind:
+
+1. walls, then brush entities;
+2. sky and opaque water, sprites and particles (all unlit);
+3. torch flames (unlit), then the illuminated models and the view weapon;
+4. translucent water.
+
+Depth testing makes the order of opaque geometry irrelevant to the image.
+With no dynamic light active the first two groups share one state.
+
+### View weapon
+
+The weapon is drawn shrunk toward the eye to one eighth of its size. Every
+vertex stays on its line of sight, so the image is unchanged, but the weapon
+is nearer than any world geometry and needs no depth clear or extra
+completion wait. The near clip plane is at 0.5 units instead of Quake's 4 so
+that the shrunken weapon is clipped exactly where it used to be. As a side
+effect, other models closer than four units to the eye are no longer cut
+away; particles keep the four-unit limit.
+
+### Animated models
+
+Sampled skin colors are cached per model, skin, subdivision depth and player
+colors as palette indices, so lighting, gamma and color changes take effect
+at once. Subdivision topology is shared between poses, normals are cached
+per pose, and positions are transformed from the live pose every frame. Each
+loaded model carries an identity record, so a cache lookup compares a few
+numbers instead of the model's command list. All of this is bounded: 1 MiB
+for colors and 1 MiB for topology, normals and work space. A model whose
+caches cannot be built is drawn by direct recursion instead.
+
+`xgl_alias_subdivide` and `xgl_entity_triangles` bound the extra triangles.
+The allowance is spent in visible-list order whatever the drawing order.
 
 ### Multiprocessor rendering
 
 `xgl_smp` controls CPU preparation of vertices for animated models. The
-default (`-1`) selects SMP automatically when multiple CPUs are online.
-Use `0` to select the serial path or `1` to request the helper explicitly.
-While the main thread draws the world, the helper can transform cached alias
-model positions and normals and prepare shaded, gamma-adjusted vertex colors.
-The main thread submits the results to XGL in the original entity order.
-Cold caches, a full work queue, and the view weapon use the serial path.
-If the helper fails to start, the renderer reports the failure and continues
-in serial mode.
+default (`-1`) uses a worker thread when more than one CPU is online, which
+means none on a single-processor machine. Use `0` to select the serial path
+or `1` to request the worker explicitly.
 
-The renderer allocates scratch space on demand for up to 32 model draws
-and 8,190 output vertices per frame. This adds less than 512 KiB on 32-bit
-SPARC, plus the worker's thread stack. Models beyond these limits draw
-serially at the detail level selected for that frame.
+While the main thread draws the world, the worker transforms cached model
+positions and normals and prepares shaded, gamma-adjusted colors. When the
+main thread reaches the models it runs any jobs the worker has not started,
+waits for the one in progress, and submits the results to XGL in drawing
+order. Models with cold caches and the view weapon use the serial path. If
+the worker fails to start, the renderer reports the failure and continues
+serially.
+
+Up to 32 models and 16,380 output vertices per frame are prepared this way,
+using about 0.75 MiB of scratch space allocated on first use plus the
+worker's stack. Models beyond these limits draw serially at the detail level
+already chosen for them.
 
 Measure the benefit on the target with the
 [Sun ZX timedemo comparison](test.md#compare-single-cpu-and-smp-rendering-on-the-sun-zx).
 
-### Sky and water sampling
+### Sky and water
 
-Animated meshes sample matching vertices once per update and reuse their
-colors at repeated triangle corners. The sample map is built with the mesh
-and charged to the world cache limit. If allocation fails, each triangle
-corner is sampled separately. Indexed samples use a
-direct palette-to-gamma lookup. Animation is still updated every frame,
+Animated meshes sample each distinct vertex once per frame and reuse its
+color at repeated triangle corners. Animation is updated every frame,
 including sky scrolling, camera-relative sky projection and turbulent UVs.
 
-### UI batching
+### Native UI
 
-Consecutive opaque UI rectangles are batched without changing their drawing
-order. Native text runs combine only when measured font advances and spacing
-preserve the existing fixed-cell glyph positions. Incompatible metrics,
-spaces and clipped cells split runs, retaining individual-glyph drawing as
-needed. This does not assume that Roman_M is monospaced. Completion waits are
-issued only when native work is pending.
+Consecutive opaque rectangles share one polygon call. A run of characters is
+one text call when the font's measured advances keep every glyph in its
+fixed cell; otherwise glyphs are placed individually. Spaces stay inside a
+run when the font's space is measured to advance exactly one cell. The digits
+of a status-bar number are drawn as one centered text call rather than one
+per digit, so they sit closer together than the original 24-pixel spacing.
 
 ### Renderer settings
 
 | Setting | Default | Effect |
 | --- | ---: | --- |
-| `xgl_subdivide` | 128 | World texture-coordinate subdivision step, clamped to 8–256; smaller adds detail. |
-| `xgl_detailtris` | 1024 | Detailed world/brush triangle allowance; visible world faces are ranked by projected-size estimate, with complete coarse faces when exhausted. |
-| `xgl_detaildistance` | 512 | Distance within which detailed world surfaces are considered. |
-| `xgl_alias_subdivide` | 1 | Alias subdivision depth, 0–2; distant models use less detail. |
-| `xgl_smp` | -1 | Automatically select multiprocessor preparation; 0 selects serial and 1 requests the helper. |
+| `xgl_subdivide` | 128 | Texel span above which a detailed world triangle is split, clamped to 8–256; smaller is finer. |
+| `xgl_detailtris` | 1024 | Detailed world/brush triangles per frame; faces beyond the allowance draw their coarse mesh. |
+| `xgl_detaildistance` | 512 | Distance within which world faces are considered for detail. |
+| `xgl_detailbuild` | 256 | Detailed-mesh vertices built per frame; one mesh is always allowed, 0 removes the limit. |
+| `xgl_alias_subdivide` | 1 | Alias subdivision depth, 0–2; distant models use less. |
 | `xgl_entity_triangles` | 512 | Additional alias subdivision triangles per frame; original model triangles remain. |
 | `xgl_sprite_cells` | 8 | Sample grid per sprite dimension, clamped to 2–16. |
 | `xgl_playercolors` | 1 | Apply original player shirt/pants palette translations to sampled skins. |
-| `xgl_ambient` | 1 | Native ambient contribution, clamped to 0–1. |
+| `xgl_ambient` | 1 | Native ambient contribution, clamped to 0–1; below 1 keeps the world illuminated. |
 | `xgl_maxlights` | 4 | Maximum native point lights, clamped to 0–4. |
-| `xgl_profile` | 0 | 1 reports graphics timings and native call counts; 2 adds geometry preparation and cache statistics. Output goes to the terminal once per second. |
-| `_snd_mixahead` | 0.3 | Audio lookahead in seconds for XGL; existing archived values override this default. |
+| `xgl_smp` | -1 | Worker thread for model preparation: -1 automatic, 0 off, 1 on. |
+| `xgl_profile` | 0 | 1 reports graphics timings and native call counts; 2 adds preparation and cache detail. Output goes to the terminal once per second. |
+| `_snd_mixahead` | 0.3 | Audio lookahead in seconds for XGL; an existing archived value overrides this default. |
 | `r_wateralpha` | 1 | Water opacity; values below 1 request native blending. |
 
-Settings in configuration files or command-line options override these defaults.
-In particular, `xgl_entity_triangles` is saved in `config.cfg`, so an older
-saved value remains in effect until changed.
+Settings in configuration files or command-line options override these
+defaults. In particular, `xgl_entity_triangles` is saved in `config.cfg`, so
+an older saved value remains in effect until changed.
 
 The original `r_dynamic`, `r_fullbright`, `r_novis`, `r_drawentities`,
 `r_drawviewmodel`, `viewsize`, `fov`, `gamma` and `r_speeds` controls are also
-available. The initial settings are bounded starting points, not measured
-Sun ZX performance recommendations.
+available.
 
 ### Display mapping
 
@@ -142,6 +185,4 @@ and the space reserved for the status bar. Native UI uses device coordinates.
 While the opaque console slides over the view, the 3D clip boundary follows
 its lower edge without changing the camera or scaling the exposed scene.
 One device pixel overlaps beneath the panel to avoid seams. Fully covered
-views submit no 3D geometry; simulation continues normally. Partial coverage
-reduces hidden rasterization, but geometry preparation still runs. This is
-automatic and does not affect performance with the console closed.
+views submit no 3D geometry; simulation continues normally.

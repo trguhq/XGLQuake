@@ -9,7 +9,6 @@ with native XGL text and geometry. A similar approach can be seen at
 ## Quick start
 
 ### Build
-see [build details](docs/build.md) for information.
 
 Install GNU make, GCC (for example [tgcware](https://jupiterrise.com/tgcware/sunos5.6_sparc/stable/)), the [Sun XGL SDK](https://archive.org/details/xgl-solaris2.6), and OpenWindows development files.
 From the repository root:
@@ -42,20 +41,22 @@ See [game data and display setup](docs/setup.md) for alternate
 locations and shareware restrictions.
 
 ### Common options
-see [renderer help](docs/render.md) for full list of available options.
 
 | Command-line option | Purpose |
 | --- | --- |
 | `-winsize 640 480` | Set the window size. |
-| `+_snd_mixahead 0.3` | Buffer 0.3 seconds of audio. |
+| `+_snd_mixahead 0.3` | Buffer 0.3 seconds of audio; see [audio](#solaris-audio-and-hardware-interfaces). |
 | `+xgl_alias_subdivide 0` | Keep original model triangles without extra subdivision. |
 | `+xgl_smp 0` | Select serial vertex preparation. The default detects multiple CPUs. Use 1 to request a helper. |
 | `+xgl_detailtris 1024` | Set the detailed world triangle allowance; complete coarse faces remain. |
 | `+xgl_profile 0` | Disable profiling for FPS measurements. Use 1 for summary timings or 2 for detail. |
 
-Lower subdivision makes sampled textures and lighting coarser. The detail
-allowance is not a cap on all drawn triangles. See the
-[full settings table](docs/render.md#renderer-settings) for defaults and other controls.
+More detail draws more triangles and costs frame rate: a larger
+`xgl_detailtris` or `xgl_alias_subdivide` adds detail, and so does a
+*smaller* `xgl_subdivide`, which is the texel span at which a world triangle
+is split. The detail allowance is not a cap on all drawn triangles. See the
+[full settings table](docs/render.md#renderer-settings) for defaults and
+other controls.
 
 ### Measure performance
 
@@ -72,13 +73,17 @@ Then collect a detailed profile with the same resolution and detail settings:
 ```
 
 Keep the console closed during playback and quit after each timedemo finishes.
-See [profiling details](docs/profile.md#profiling-details) for interpreting the results.
+See [profiling details](docs/profile.md#profiling-details) for interpreting the
+results. On the Sun ZX the frame rate moves in steps of whole retrace periods
+(12.7, 15.2, 19.1 FPS), so small savings may not change the result.
 
 ## Hardware
 ### XGL benchmark
 
 [xglbench](xglbench/README.md) tests basic graphics-card functionality and
-performance and generates reports independently of the game.
+performance and generates reports independently of the game. What it measured
+on the Sun ZX, and how the renderer uses it, is in
+[Measured on the Sun ZX](docs/hardware.md).
 
 ### Memory limits
 
@@ -86,12 +91,14 @@ The existing Solaris main allocates a 16 MiB engine heap. World geometry
 cache storage is capped at another 8 MiB, CPU material pixels and optional
 filter levels at another 8 MiB, and alias color caches at 1 MiB. The alias
 normal/topology cache, its fixed entry table and reusable work array together
-are capped at another 1 MiB. The XGL audio ring is 32 KiB.
+are capped at another 1 MiB. The XGL audio ring is 32 KiB, and a
+multiprocessor worker adds about 0.75 MiB of scratch space.
 Native contexts, window buffers, program data and
 library allocations are additional. These limits are not a measurement of
 total process memory.
-World cache/detail exhaustion falls back to complete coarse faces; exceeding
-the CPU material limit reports an error rather than silently dropping assets.
+A full world cache releases detailed meshes that have not been drawn recently
+and otherwise falls back to complete coarse faces; exceeding the CPU material
+limit reports an error rather than silently dropping assets.
 
 ### Solaris audio and hardware interfaces
 
@@ -104,19 +111,18 @@ the original Solaris source files and libraries.
 The original Solaris submission path writes at most 1,024 bytes per update,
 only about 23 ms of stereo audio. The XGL path submits all available mixed
 sound, retains unwritten data on partial writes/backpressure, and services
-the mixer during rendering and cache preparation. Its default 0.3-second
-lookahead trades some sound latency for tolerance of long frames. A single
-blocking graphics call longer than the queued audio can still cause a gap;
-this is not an independent audio thread.
+the mixer during rendering and cache preparation, at most every 25 ms. Its
+default 0.3-second lookahead trades some sound latency for tolerance of long
+frames. A single blocking graphics call longer than the queued audio can
+still cause a gap; this is not an independent audio thread.
 
-An existing `config.cfg` may restore `_snd_mixahead 0.1`; use
-`+_snd_mixahead 0.3` to override that value for a run.
+An existing `config.cfg` may restore `_snd_mixahead 0.1`. The commands in
+this document pass `+_snd_mixahead 0.3` so that a run does not depend on it.
 
-## Renderer
-see [renderer help](docs/render.md) for information on renderer, including full list of options for performance and visual quality.
+## More documentation
 
-## Profiling
-see [profiling help](docs/profile.md) for information.
-
-## Testing
-see [testing help](docs/test.md) for information.
+- [Rendering and tuning](docs/render.md): how the renderer works and every setting.
+- [Measured on the Sun ZX](docs/hardware.md): device timings behind those choices.
+- [Profiling details](docs/profile.md): reading `xgl_profile` reports.
+- [Build details](docs/build.md) and [testing](docs/test.md).
+- [Game data and display setup](docs/setup.md).
