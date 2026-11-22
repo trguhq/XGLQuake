@@ -17,8 +17,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
 /* The GL model loader's indexed skins and pose command lists remain CPU
- * data. XGL receives sampled RGB triangles and world-space normals, never
- * texture objects. Native lighting supplies moving-light illumination. */
+ * data. XGL receives sampled RGB triangles, never texture objects. Models
+ * are shaded here and submitted unlit unless xgl_alias_shade is 0, when
+ * world-space normals are output and the device illuminates them. */
 #include "quakedef.h"
 #include "xgl_local.h"
 #include "xgl_alias.h"
@@ -44,6 +45,7 @@ static cvar_t xgl_alias_subdivide = {"xgl_alias_subdivide", "1", true, false, 0,
 static cvar_t xgl_sprite_cells = {"xgl_sprite_cells", "8", true, false, 0, NULL};
 static cvar_t xgl_entity_triangles = {"xgl_entity_triangles", "512", true, false, 0, NULL};
 static cvar_t xgl_playercolors = {"xgl_playercolors", "1", true, false, 0, NULL};
+static cvar_t xgl_alias_shade = {"xgl_alias_shade", "1", false, false, 0, NULL};
 static byte xgl_player_translation[MAX_SCOREBOARD][256];
 static int xgl_player_color[MAX_SCOREBOARD];
 static int xgl_entity_extra_used;
@@ -71,8 +73,22 @@ typedef struct {
     size_t bytes;
 } xgl_alias_cache_t;
 
+/* How one model's vertices are lit. */
+#define XGL_SHADE_NATIVE 0 /* normals are output and the device illuminates */
+#define XGL_SHADE_FLAT 1   /* sampled colors are final: torches, fullbright */
+#define XGL_SHADE_CPU 2    /* ambient plus directional fill, per vertex, here */
+typedef struct {
+    int mode;
+    float ambient;
+    /* Toward the fill light, in model space, scaled by its strength. */
+    vec3_t fill;
+} xgl_alias_shade_t;
+
 typedef struct {
     xgl_alias_cache_t *cache;
+    /* NULL for sprites. The fallback's normals are in world space, where the
+     * direction toward the fill light is the same along every axis. */
+    const xgl_alias_shade_t *shade;
     int index, building, opaque, count;
     xgl_vertex_t vertices[XGL_ENTITY_BATCH_VERTICES];
 } xgl_alias_draw_t;
@@ -105,7 +121,10 @@ typedef struct {
 } xgl_alias_pose_cache_t;
 
 typedef struct {
-    vec3_t position, normal;
+    vec3_t position;
+    /* The world-space normal for native illumination or, with CPU shading,
+     * the vertex's own light factor. */
+    union { vec3_t normal; float shade; } light;
 } xgl_alias_work_vertex_t;
 
 /* Alias jobs are collected in visible-list order. Only pose bytes belong to
@@ -116,6 +135,7 @@ typedef struct {
 typedef struct {
     int visible_index, lit, triangles, count;
     float light;
+    xgl_alias_shade_t shade;
     vec3_t scale, scale_origin, forward, right, up, origin;
     const trivertx_t *pose;
     const xgl_alias_pose_cache_t *cached_pose;
@@ -605,11 +625,57 @@ static xgl_alias_pose_cache_t *XGL_AliasPose(const aliashdr_t *header,
     return XGL_FindAliasPose(header, pose, colors, 1);
 }
 
+/* The device's former ambient-plus-fill sum for one model-space normal. */
+static float XGL_AliasShade(const xgl_alias_shade_t *shade, const float *normal)
+{
+    float fill;
+    fill = DotProduct(normal, shade->fill);
+    return fill > 0 ? shade->ambient + fill : shade->ambient;
+}
+
+/* A world normal is forward*n0 - right*n1 + up*n2, so the fixed world
+ * direction toward the fill light is turned into model space once for the
+ * model rather than every normal being turned into world space. */
+static void XGL_AliasShadeSetup(xgl_alias_shade_t *shade, int lit, const vec3_t forward,
+                                const vec3_t right, const vec3_t up)
+{
+    float axis;
+    memset(shade, 0, sizeof(*shade));
+    if (!lit) { shade->mode = XGL_SHADE_FLAT; return; }
+    if (!xgl_alias_shade.value) { shade->mode = XGL_SHADE_NATIVE; return; }
+    shade->mode = XGL_SHADE_CPU;
+    shade->ambient = XGL_ALIAS_AMBIENT * XGL_AmbientLight();
+    axis = XGL_ALIAS_FILL * XGL_ALIAS_FILL_AXIS;
+    shade->fill[0] = (forward[0] + forward[1] + forward[2]) * axis;
+    shade->fill[1] = -(right[0] + right[1] + right[2]) * axis;
+    shade->fill[2] = (up[0] + up[1] + up[2]) * axis;
+}
+
+/* Quake adds every dynamic light within reach to a model's own light level.
+ * With CPU shading no native light reaches the models to do that instead. */
+static int XGL_AliasDynamicLight(const entity_t *entity)
+{
+    vec3_t delta;
+    float total, distance;
+    int i;
+    if (!r_dynamic.value) return 0;
+    total = 0;
+    for (i = 0; i < MAX_DLIGHTS; ++i) {
+        if (cl_dlights[i].die < cl.time || cl_dlights[i].radius <= 0) continue;
+        VectorSubtract(entity->origin, cl_dlights[i].origin, delta);
+        distance = DotProduct(delta, delta);
+        if (distance >= cl_dlights[i].radius * cl_dlights[i].radius) continue;
+        total += cl_dlights[i].radius - (float)sqrt(distance);
+    }
+    return (int)total;
+}
+
 static void XGL_PrepareAliasPose(const vec3_t scale, const vec3_t scale_origin,
                                 const trivertx_t *pose,
                                 const xgl_alias_pose_cache_t *cache,
                                 const vec3_t forward, const vec3_t right,
                                 const vec3_t up, const vec3_t origin,
+                                const xgl_alias_shade_t *shade,
                                 xgl_alias_work_vertex_t *work)
 {
     const xgl_alias_topology_t *topology;
@@ -634,6 +700,22 @@ static void XGL_PrepareAliasPose(const vec3_t scale, const vec3_t scale_origin,
                 out->position[j] = (work[a].position[j] +
                                     work[b].position[j]) * .5f;
         }
+        if (shade->mode == XGL_SHADE_FLAT) continue;
+        if (shade->mode == XGL_SHADE_CPU) {
+            /* Vertices with the same normal index share one evaluation. */
+            if (i >= topology->base_count) {
+                out->light.shade = XGL_AliasShade(shade, normal);
+                continue;
+            }
+            normal_index = pose[i].lightnormalindex;
+            if (normal_index >= XGL_VERTEX_NORMALS) normal_index = 0;
+            if (!normals.valid[normal_index]) {
+                normals.normals[normal_index][0] = XGL_AliasShade(shade, normal);
+                normals.valid[normal_index] = 1;
+            }
+            out->light.shade = normals.normals[normal_index][0];
+            continue;
+        }
         if (i < topology->base_count) {
             normal_index = pose[i].lightnormalindex;
             if (normal_index >= XGL_VERTEX_NORMALS) normal_index = 0;
@@ -643,10 +725,10 @@ static void XGL_PrepareAliasPose(const vec3_t scale, const vec3_t scale_origin,
                         right[j] * normal[1] + up[j] * normal[2];
                 normals.valid[normal_index] = 1;
             }
-            VectorCopy(normals.normals[normal_index], out->normal);
+            VectorCopy(normals.normals[normal_index], out->light.normal);
         } else {
             for (j = 0; j < 3; ++j)
-                out->normal[j] = forward[j] * normal[0] -
+                out->light.normal[j] = forward[j] * normal[0] -
                     right[j] * normal[1] + up[j] * normal[2];
         }
     }
@@ -655,7 +737,11 @@ static void XGL_PrepareAliasPose(const vec3_t scale, const vec3_t scale_origin,
 static void XGL_AliasFlush(xgl_alias_draw_t *draw, int lit)
 {
     if (!draw->count) return;
-    XGL_DrawTriangles(draw->vertices, draw->count, lit, 1, 1);
+    /* CPU-shaded colors are final: gamma was applied before the shade. */
+    if (draw->shade && draw->shade->mode == XGL_SHADE_CPU)
+        XGL_DrawTrianglesStrided(draw->vertices, draw->count, sizeof(draw->vertices[0]),
+                                 0, 1, 1, 1);
+    else XGL_DrawTriangles(draw->vertices, draw->count, lit, 1, 1);
     draw->count = 0;
 }
 
@@ -685,9 +771,10 @@ static void XGL_CopyAliasOutput(const xgl_alias_job_t *job, xgl_alias_output_cur
     const xgl_alias_topology_t *topology;
     const xgl_alias_color_t *colors;
     const xgl_alias_work_vertex_t *source;
-    float *rgb;
-    int i, j, k, slot;
+    float *rgb, shade;
+    int i, j, k, slot, mode;
     topology = job->cached_pose->topology;
+    mode = job->shade.mode;
     while (count > 0) {
         i = cursor->triangle++;
         colors = &job->colors->colors[i];
@@ -707,7 +794,16 @@ static void XGL_CopyAliasOutput(const xgl_alias_job_t *job, xgl_alias_output_cur
             }
             source = &job->work[topology->indices[i * 3 + j]];
             VectorCopy(source->position, out->position);
-            VectorCopy(source->normal, out->normal);
+            if (mode == XGL_SHADE_CPU) {
+                /* The device multiplied the prepared color by the same sum.
+                 * The record's normal is not read by unlit drawing. */
+                shade = source->light.shade;
+                out->color.rgb[0] = rgb[0] * shade;
+                out->color.rgb[1] = rgb[1] * shade;
+                out->color.rgb[2] = rgb[2] * shade;
+                continue;
+            }
+            if (mode == XGL_SHADE_NATIVE) { VectorCopy(source->light.normal, out->normal); }
             VectorCopy(rgb, out->color.rgb);
         }
         count -= 3;
@@ -725,6 +821,7 @@ static void XGL_EmitAliasPose(const xgl_alias_pose_cache_t *cache,
     memset(cursor.valid, 0, sizeof(cursor.valid));
     job.work = xgl_alias_work; job.colors = draw->cache; job.cached_pose = cache;
     job.palette = xgl_palette; job.light = light; job.gamma = NULL;
+    job.shade = *draw->shade;
     remaining = draw->cache->visible_triangles * 3;
     while (remaining) {
         count = remaining;
@@ -743,7 +840,7 @@ static void XGL_RunAliasJob(void *argument)
     cursor.triangle = 0;
     memset(cursor.valid, 0, sizeof(cursor.valid));
     XGL_PrepareAliasPose(job->scale, job->scale_origin, job->pose, job->cached_pose,
-                         job->forward, job->right, job->up, job->origin, job->work);
+                         job->forward, job->right, job->up, job->origin, &job->shade, job->work);
     XGL_CopyAliasOutput(job, &cursor, job->output, job->count);
 }
 
@@ -762,6 +859,7 @@ void XGL_EntitiesInit(void)
     Cvar_RegisterVariable(&xgl_sprite_cells);
     Cvar_RegisterVariable(&xgl_entity_triangles);
     Cvar_RegisterVariable(&xgl_playercolors);
+    Cvar_RegisterVariable(&xgl_alias_shade);
     for (i = 0; i < MAX_SCOREBOARD; ++i) xgl_player_color[i] = -1;
 }
 
@@ -825,7 +923,8 @@ static void XGL_EntityTriangleCached(const xgl_entity_vertex_t *a,
     xgl_entity_vertex_t ab, bc, ca;
     xgl_vertex_t *vertices;
     xgl_alias_color_t sampled, *colors;
-    int i, j, center, index;
+    float shade;
+    int i, j, center, index, shaded;
     if (depth > 0) {
         XGL_EntityMidpoint(a, b, &ab);
         XGL_EntityMidpoint(b, c, &bc);
@@ -864,11 +963,20 @@ static void XGL_EntityTriangleCached(const xgl_entity_vertex_t *a,
     }
     if (!colors->visible) return;
     vertices = &draw->vertices[draw->count];
+    shaded = draw->shade && draw->shade->mode == XGL_SHADE_CPU;
     for (i = 0; i < 3; ++i) {
         VectorCopy(source[i]->position, vertices[i].position);
         VectorCopy(source[i]->normal, vertices[i].normal);
         XGL_AliasRawColor(xgl_palette, colors->index[i], vertices[i].color);
         for (j = 0; j < 3; ++j) vertices[i].color[j] *= light;
+        if (shaded) {
+            /* The same order as the cached path: gamma, then the shade. */
+            XGL_PrepareColor(vertices[i].color);
+            shade = (source[i]->normal[0] + source[i]->normal[1] + source[i]->normal[2]) *
+                (XGL_ALIAS_FILL * XGL_ALIAS_FILL_AXIS);
+            shade = shade > 0 ? draw->shade->ambient + shade : draw->shade->ambient;
+            for (j = 0; j < 3; ++j) vertices[i].color[j] *= shade;
+        }
     }
     draw->count += 3;
     if (draw->count == XGL_ENTITY_BATCH_VERTICES) XGL_AliasFlush(draw, lit);
@@ -934,7 +1042,8 @@ static void XGL_AliasVertex(const trivertx_t *pose, const aliashdr_t *header,
 static void XGL_SubmitAliasJob(int visible_index, const entity_t *entity, const aliashdr_t *header,
                                const trivertx_t *pose, const xgl_alias_pose_cache_t *cached_pose,
                                const xgl_alias_cache_t *colors, const vec3_t forward,
-                               const vec3_t right, const vec3_t up, float light, int lit)
+                               const vec3_t right, const vec3_t up, float light, int lit,
+                               const xgl_alias_shade_t *shade)
 {
     xgl_alias_job_t *job;
     int corners;
@@ -942,6 +1051,7 @@ static void XGL_SubmitAliasJob(int visible_index, const entity_t *entity, const 
     job->visible_index = visible_index;
     job->triangles = header->numtris;
     job->light = light; job->lit = lit;
+    job->shade = *shade;
     VectorCopy(header->scale, job->scale);
     VectorCopy(header->scale_origin, job->scale_origin);
     VectorCopy(entity->origin, job->origin);
@@ -1006,6 +1116,7 @@ static int XGL_ProcessAlias(entity_t *entity, int visible_index, int planned)
     xgl_alias_draw_t draw;
     xgl_alias_pose_cache_t *cached_pose = NULL;
     xgl_alias_normals_t normals;
+    xgl_alias_shade_t shade;
     xgl_profile_draw_scope_t output_scope;
     vec3_t angles, forward, right, up;
     float light, shrink;
@@ -1068,6 +1179,7 @@ static int XGL_ProcessAlias(entity_t *entity, int visible_index, int planned)
     if (lit) {
         light_start = XGL_ProfileDetailNow();
         light_value = R_LightPoint(entity->origin);
+        if (xgl_alias_shade.value) light_value += XGL_AliasDynamicLight(entity);
         XGL_ProfileAdd(entity == &cl.viewent ? XGL_PROFILE_WEAPON_LIGHT :
                        XGL_PROFILE_ALIAS_LIGHT, light_start);
         light = light_value / 128.0f;
@@ -1081,15 +1193,19 @@ static int XGL_ProcessAlias(entity_t *entity, int visible_index, int planned)
      * convention. Negating only this local copy preserves entity state. */
     angles[PITCH] = -angles[PITCH];
     AngleVectors(angles, forward, right, up);
+    XGL_AliasShadeSetup(&shade, lit, forward, right, up);
+    /* Only natively lit models are submitted illuminated. */
+    if (shade.mode != XGL_SHADE_NATIVE) lit = 0;
     if (visible_index >= 0) {
         XGL_SubmitAliasJob(visible_index, entity, header, pose, cached_pose, draw.cache,
-                           forward, right, up, light, lit);
+                           forward, right, up, light, lit, &shade);
         XGL_AudioUnlock();
         return 1;
     }
     prepare_start = cache_start = XGL_ProfileDetailNow();
     /* Avoid clearing the large output buffer; count guards every access. */
     draw.count = draw.index = 0;
+    draw.shade = &shade;
     memset(normals.valid, 0, sizeof(normals.valid));
     draw.cache = XGL_AliasColors(header, material, depth, translation);
     draw.building = draw.cache && !draw.cache->ready;
@@ -1099,7 +1215,7 @@ static int XGL_ProcessAlias(entity_t *entity, int visible_index, int planned)
     if (cached_pose) {
         transform_start = XGL_ProfileDetailNow();
         XGL_PrepareAliasPose(header->scale, header->scale_origin, pose, cached_pose,
-                             forward, right, up, entity->origin, xgl_alias_work);
+                             forward, right, up, entity->origin, &shade, xgl_alias_work);
         if (shrink != 1)
             for (i = 0; i < cached_pose->topology->vertex_count; ++i)
                 for (j = 0; j < 3; ++j)
@@ -1214,6 +1330,11 @@ void XGL_AliasPrepareFrame(void)
         if (!xgl_alias_frame) return;
         xgl_alias_frame->pending = xgl_alias_frame->job_count = 0;
         xgl_alias_frame->pose_count = xgl_alias_frame->corner_count = 0;
+        /* CPU-shaded jobs never write an output normal; unlit drawing does
+         * not read one. Give every record a valid one, once. */
+        memset(xgl_alias_frame->output, 0, sizeof(xgl_alias_frame->output));
+        for (i = 0; i < XGL_ALIAS_FRAME_CORNERS; ++i)
+            xgl_alias_frame->output[i].normal[2] = 1;
     }
     /* A repeated call cannot reuse output still borrowed by native batches. */
     if (xgl_alias_frame->job_count) return;
@@ -1326,7 +1447,7 @@ static void XGL_DrawSprite(entity_t *entity)
     cells = XGL_EntitySetting(xgl_sprite_cells.value, 2, 16);
     /* Reuse the bounded fallback batch while keeping per-triangle cutout
      * sampling. No sampled colors or geometry survive this sprite draw. */
-    draw.cache = NULL;
+    draw.cache = NULL; draw.shade = NULL;
     draw.count = draw.index = draw.building = draw.opaque = 0;
     for (y = 0; y < cells; ++y) {
         t0 = (float)y / cells; t1 = (float)(y + 1) / cells;
@@ -1345,7 +1466,10 @@ static void XGL_DrawSprite(entity_t *entity)
     XGL_AliasFlush(&draw, 0);
 }
 
-void XGL_DrawBrushEntities(void)
+/* Brush entities that a dynamic light reaches are drawn illuminated, with
+ * the walls it reaches; the others with the unlit walls. Each entity is
+ * drawn by exactly one of the two calls a frame makes. */
+void XGL_DrawBrushEntities(int lit)
 {
     xgl_profile_draw_scope_t profile;
     int i;
@@ -1354,6 +1478,7 @@ void XGL_DrawBrushEntities(void)
         currententity = cl_visedicts[i];
         if (!currententity || !currententity->model ||
             currententity->model->type != mod_brush) continue;
+        if ((XGL_BrushEntityLights(currententity) != 0) != (lit != 0)) continue;
         XGL_ProfileDrawBegin(&profile);
         XGL_DrawBrushModel(currententity);
         XGL_ProfileDrawEnd(&profile, XGL_PROFILE_DRAW_BRUSH);

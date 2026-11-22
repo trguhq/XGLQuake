@@ -123,6 +123,10 @@ static void test_detail_levels(void)
     XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_SLOT_EVICTIONS, 2);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_BYTE_EVICTIONS, 4);
     XGL_ProfileCount(XGL_PROFILE_WORLD_EVICTIONS, 5);
+    XGL_ProfileCount(XGL_PROFILE_WORLD_DETAIL_SURFACES, 7);
+    XGL_ProfileCount(XGL_PROFILE_WORLD_DETAIL_TRIANGLES, 300);
+    XGL_ProfileCount(XGL_PROFILE_POINT_LIGHTS, 3);
+    XGL_ProfileCount(XGL_PROFILE_WORLD_LIT_SURFACES, 9);
     XGL_ProfileCount(XGL_PROFILE_SMP_HELPED, 1);
     clock_time = 101.31; start = XGL_ProfileDetailNow();
     clock_time = 101.33; XGL_ProfileAdd(XGL_PROFILE_WORLD_SKY, start);
@@ -159,6 +163,8 @@ static void test_detail_levels(void)
     assert(strstr(output, "SMP alias preparation: 1.5 jobs/frame; main prepass 2.00 worker 7.00 main wait 1.00 ms/frame"));
     assert(strstr(output, "0.5 more jobs/frame run by main while joining\n"));
     assert(strstr(output, "vertices built 51.0 recolored 0.0 animated 0.0; detail meshes evicted 2.5\n"));
+    assert(strstr(output, "  world detail per frame: faces 3.5 triangles 150.0; "
+                          "dynamic lights in use 1.50, faces illuminated 4.5\n"));
     assert(!XGL_ProfileDetailEnabled());
     calls = clock_calls;
     assert(XGL_ProfileDetailNow() == 0);

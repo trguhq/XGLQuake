@@ -17,6 +17,7 @@ static xgl_alias_cache_t cache;
 static xgl_alias_topology_t topology;
 static xgl_alias_pose_cache_t pose;
 static xgl_alias_draw_t draw;
+static const xgl_alias_shade_t native_shade = {XGL_SHADE_NATIVE, 0, {0, 0, 0}};
 static xgl_vertex_t actual[TEST_VERTICES], expected[TEST_VERTICES];
 static xgl_native_vertex_t reserved[RESERVE_VERTICES];
 static int actual_count, expected_count, reserved_count;
@@ -49,6 +50,15 @@ void XGL_PrepareColor(float rgb[3])
     int i;
     ++prepare_calls;
     for (i = 0; i < 3; ++i) rgb[i] = backend_color(rgb[i]);
+}
+
+/* Only CPU-shaded fallback triangles take this path; none are drawn here. */
+void XGL_DrawTrianglesStrided(const xgl_vertex_t *vertices, int count, size_t stride,
+                              int lit, float opacity, int zwrite, int prepared_color)
+{
+    (void)vertices; (void)count; (void)stride; (void)lit;
+    (void)opacity; (void)zwrite; (void)prepared_color;
+    abort();
 }
 
 void XGL_DrawTriangles(const xgl_vertex_t *vertices, int count, int lit,
@@ -117,6 +127,9 @@ static void setup_fixture(int triangles, int material, const byte *translation)
     topology.indices = indices;
     pose.topology = &topology;
     draw.cache = &cache;
+    /* Native illumination: the sampled, lit and gamma-prepared colors are
+     * submitted as they are, with the vertex normals. */
+    draw.shade = &native_shade;
     draw.building = 1;
     draw.opaque = XGL_TextureRevision(material) != 0 && !XGL_TextureHasAlpha(material);
     test_material = material;
@@ -132,7 +145,7 @@ static void setup_fixture(int triangles, int material, const byte *translation)
             input[i][j].t = .25f;
             indices[index] = index;
             VectorCopy(input[i][j].position, xgl_alias_work[index].position);
-            VectorCopy(input[i][j].normal, xgl_alias_work[index].normal);
+            VectorCopy(input[i][j].normal, xgl_alias_work[index].light.normal);
         }
     }
 }

@@ -50,7 +50,8 @@ times and per-frame counts:
   those waits.
 - `swap`: the buffer switch, which waits for retrace.
 - `state`: time in the attribute calls that change between illuminated and
-  unlit drawing or change blending; `state changes` counts them. The device
+  unlit drawing, select lights or change blending; `state changes` counts
+  them. The device
   may defer part of a change's cost to the next submission.
 - `triangles` includes alias subdivision and particles; `glyphs` and
   `polygon calls` include the UI.
@@ -95,6 +96,10 @@ Detailed counts are per-frame averages.
   hit rate. Color reuse and updates count mesh checks; a streamed face is
   checked once per triangle. `detail meshes evicted` counts detailed meshes
   released because the world cache was full.
+- **world detail per frame**: faces drawn from their detailed mesh and the
+  triangles in them; then the dynamic lights enabled for illuminated
+  geometry and the faces drawn illuminated. Both are zero in a frame with
+  no dynamic light.
 - **alias cache per frame**: color and pose (normal/topology) cache hits,
   misses and evictions, and fallback draws, show cache pressure. Compare text
   calls with glyphs to see how well the installed font allows runs.

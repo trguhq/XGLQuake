@@ -26,16 +26,29 @@ multiply the vertex color, still show on them. This intentionally
 approximates Quake's additive dynamic lighting.
 
 Dynamic lights are XGL point lights: the `xgl_maxlights` lights nearest the
-viewer, at most four. Their strength at distance d is 1/(1 + d/radius): half
-at the light's radius and a fifth at four radii, never reaching zero as
-Quake's does.
+viewer, at most four. XGL attenuates a light by 1/(C1 + C2·d) and offers
+nothing steeper, so a light's strength at distance d is
+1/(1 + `xgl_lightfalloff`·d/radius). With the default of 8 that is a third at
+a quarter of the light's radius, a ninth at its radius and a seventeenth at
+two radii. Quake's own lights end at their radius; these never quite do.
 
-Walls and brush entities are submitted with native illumination only while it
-can change the image, that is, while a dynamic light is active or
-`xgl_ambient` is below 1. Otherwise they are submitted unlit with identical
-colors, which the device draws considerably faster. Alias models are always
-illuminated, by ambient light and a fixed directional fill plus any dynamic
-lights; the two torch flame models are unlit. Sky and water are never
+Only geometry a light can reach is illuminated: walls that face a light and
+lie within `xgl_lightrange` radii of it, and brush entities whose bounds do.
+Every other wall, and every wall while no dynamic light is active, is
+submitted unlit with identical colors, which the device draws considerably
+faster. A light that reaches nothing visible is switched off. At the default
+range the light that is cut off adds about 6% to a surface facing it
+directly. `xgl_lightfalloff 1` with `xgl_lightrange 0` restores the earlier
+behavior: a slow falloff applied to every wall facing a light. `xgl_ambient`
+below 1 keeps every wall illuminated.
+
+Animated models are shaded on the CPU and submitted unlit. Each vertex color
+is multiplied by ambient light plus a fixed directional fill from above,
+which is the sum the device used to compute. A dynamic light within reach
+raises the whole model's light level by its radius less its distance, as
+Quake does, instead of lighting the side that faces it. `xgl_alias_shade 0`
+returns models to native illumination by the fill and every dynamic light.
+The two torch flame models are drawn as sampled. Sky and water are never
 illuminated.
 
 Translucent water and screen color effects use native blending; palette
@@ -78,13 +91,14 @@ samples with integer arithmetic; the texture is not sampled again.
 Changing between illuminated and unlit drawing is expensive on the Sun ZX,
 so a frame is drawn in order of native state rather than kind:
 
-1. walls, then brush entities;
-2. sky and opaque water, sprites and particles (all unlit);
-3. torch flames (unlit), then the illuminated models and the view weapon;
-4. translucent water.
+1. the walls and brush entities a dynamic light reaches, illuminated;
+2. everything else, unlit: the other walls and brush entities, sky and
+   opaque water, sprites, particles, models and the view weapon;
+3. translucent water.
 
 Depth testing makes the order of opaque geometry irrelevant to the image.
-With no dynamic light active the first two groups share one state.
+Most frames have no dynamic light and so no first group and no change of
+illumination at all.
 
 ### View weapon
 
@@ -118,7 +132,7 @@ means none on a single-processor machine. Use `0` to select the serial path
 or `1` to request the worker explicitly.
 
 While the main thread draws the world, the worker transforms cached model
-positions and normals and prepares shaded, gamma-adjusted colors. When the
+positions, evaluates each vertex's shade and prepares gamma-adjusted colors. When the
 main thread reaches the models it runs any jobs the worker has not started,
 waits for the one in progress, and submits the results to XGL in drawing
 order. Models with cold caches and the view weapon use the serial path. If
@@ -160,8 +174,11 @@ per digit, so they sit closer together than the original 24-pixel spacing.
 | `xgl_entity_triangles` | 512 | Additional alias subdivision triangles per frame; original model triangles remain. |
 | `xgl_sprite_cells` | 8 | Sample grid per sprite dimension, clamped to 2–16. |
 | `xgl_playercolors` | 1 | Apply original player shirt/pants palette translations to sampled skins. |
-| `xgl_ambient` | 1 | Native ambient contribution, clamped to 0–1; below 1 keeps the world illuminated. |
+| `xgl_ambient` | 1 | Ambient contribution, clamped to 0–1; below 1 keeps the world illuminated. |
 | `xgl_maxlights` | 4 | Maximum native point lights, clamped to 0–4. |
+| `xgl_lightfalloff` | 8 | How fast a dynamic light fades with distance, clamped to 1–64; 1 is the slowest. |
+| `xgl_lightrange` | 2 | Distance, in light radii, beyond which geometry is not illuminated by a dynamic light; 0 removes the limit. |
+| `xgl_alias_shade` | 1 | Shade models on the CPU and submit them unlit; 0 uses native illumination. |
 | `xgl_smp` | -1 | Worker thread for model preparation: -1 automatic, 0 off, 1 on. |
 | `xgl_profile` | 0 | 1 reports graphics timings and native call counts; 2 adds preparation and cache detail. Output goes to the terminal once per second. |
 | `_snd_mixahead` | 0.3 | Audio lookahead in seconds for XGL; an existing archived value overrides this default. |

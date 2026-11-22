@@ -44,6 +44,8 @@ static int recorded_quads, quad_batches[1024], quad_batch_count;
 static char native_events[16384];
 static int native_event_count;
 static Xgl_pt_d3d light_position[6];
+static double light_falloff[6];
+static int switch_sets, ambient_sets;
 static Xgl_pt_f2d recorded_position[4096];
 static Xgl_pt_f2d recorded_glyph_position[8192];
 static char recorded_glyph[8192];
@@ -118,19 +120,24 @@ void xgl_object_set(Xgl_object object, ...)
             break;
         case XGL_3D_CTX_Z_BUFFER_WRITE_MASK: write_mask = va_arg(args, Xgl_usgn32); break;
         case XGL_3D_CTX_LIGHT_SWITCHES:
-            memcpy(switches, va_arg(args, Xgl_boolean *), sizeof(switches)); break;
+            memcpy(switches, va_arg(args, Xgl_boolean *), sizeof(switches));
+            ++switch_sets; break;
         case XGL_LIGHT_COLOR:
             color = va_arg(args, Xgl_color *);
-            if (object == xb.lights[0]) current_ambient = color->rgb.r;
+            if (object == xb.lights[0]) { current_ambient = color->rgb.r; ++ambient_sets; }
             break;
         case XGL_CTX_STEXT_COLOR:
             text_color = *va_arg(args, Xgl_color *); ++text_color_sets; break;
         case XGL_CTX_STEXT_CHAR_HEIGHT: text_height = (float)va_arg(args, double); break;
         case XGL_CTX_STEXT_CHAR_SPACING: current_spacing = (float)va_arg(args, double); break;
         case XGL_3D_CTX_SURF_FRONT_TRANSP:
-        case XGL_3D_CTX_SURF_BACK_TRANSP:
-        case XGL_LIGHT_ATTENUATION_1:
-        case XGL_LIGHT_ATTENUATION_2: (void)va_arg(args, double); break;
+        case XGL_3D_CTX_SURF_BACK_TRANSP: (void)va_arg(args, double); break;
+        case XGL_LIGHT_ATTENUATION_1: assert(va_arg(args, double) == 1.0); break;
+        case XGL_LIGHT_ATTENUATION_2:
+            for (light = 1; light < 5 && object != xb.lights[light]; ++light) {}
+            assert(light < 5);
+            light_falloff[light] = va_arg(args, double);
+            break;
         case XGL_LIGHT_POSITION:
             for (light = 1; light < 5 && object != xb.lights[light]; ++light) {}
             assert(light < 5);
@@ -389,8 +396,11 @@ static void reset_backend(void)
     xb.width = vid.width = 640; xb.height = vid.height = 480;
     xb.maximum_z = 16777215;
     xb.frame = 1; xb.current_text_height = xb.current_text_spacing = -1;
-    xb.applied_lit = xb.applied_zwrite = -1; xb.applied_opacity = -1;
+    xb.applied_lit = xb.applied_zwrite = xb.applied_mask = -1; xb.applied_opacity = -1;
     xgl_ambient.value = 1; xgl_maxlights.value = 4; r_dynamic.value = 1;
+    xgl_lightfalloff.value = 8; xgl_lightrange.value = 2;
+    switch_sets = ambient_sets = 0;
+    memset(switches, 0, sizeof(switches));
     for (i = 0; i < 95; ++i) xb.glyphs[i][0] = (char)(i + 32);
     for (i = 0; i < 256; ++i) gammatable[i] = (byte)i;
     for (i = 0; i < XGL_BATCH_TRIANGLES; ++i) {
@@ -684,10 +694,14 @@ static void test_clear_and_lighting(void)
     XGL_DrawTriangles(vertices, 3, 1, 1, 1);
     XGL_Flush();
     assert(!switches[5] && fabs(current_ambient - 1) < .0001);
+    assert(switch_sets == 2 && ambient_sets == 2);
     XGL_DrawTriangles(vertices, 3, 0, .5f, 0);
     XGL_Flush();
     assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR && write_mask == 0);
     assert(clear_calls == 1);
+    /* Unlit drawing ignores the lights: neither they nor the ambient level
+     * are touched on the way out of illumination. */
+    assert(switch_sets == 2 && ambient_sets == 2);
     /* Three batches in three different states; an unchanged state is free. */
     assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 3);
     assert(profile_sections[XGL_PROFILE_STATE] == 3);
@@ -1103,8 +1117,12 @@ static void test_completion_and_attribute_reuse(void)
 static void test_point_light_selection(void)
 {
     static const float distances[7] = {0, 0, 100, 5, 10, 20, 1};
+    const xgl_point_light_t *lights;
+    xgl_vertex_t vertices[3];
     int i;
     reset_backend();
+    memset(vertices, 0, sizeof(vertices));
+    vertices[0].normal[2] = vertices[1].normal[2] = vertices[2].normal[2] = 1;
     cl.time = 10;
     for (i = 0; i < 7; ++i) {
         cl_dlights[i].die = i == 0 ? 9 : 20;
@@ -1113,27 +1131,90 @@ static void test_point_light_selection(void)
         cl_dlights[i].origin[1] = r_origin[1];
         cl_dlights[i].origin[2] = r_origin[2];
     }
-    assert(!XGL_LightsActive());
-    update_lights();
-    assert(XGL_LightsActive());
+    assert(XGL_PointLights(&lights) == 0);
+    XGL_BeginFrame();
+    XGL_BeginScene();
+    /* The four nearest live lights, nearest first, each with its range. */
+    assert(XGL_PointLights(&lights) == 4 && XGL_PointLights(NULL) == 4);
+    assert(light_position[1].x == r_origin[0] + 1 && lights[0].origin[0] == r_origin[0] + 1);
+    assert(light_position[2].x == r_origin[0] + 5 && lights[1].origin[0] == r_origin[0] + 5);
+    assert(light_position[3].x == r_origin[0] + 10);
+    assert(light_position[4].x == r_origin[0] + 20 && lights[3].origin[0] == r_origin[0] + 20);
+    assert(lights[0].radius == 100 && lights[0].range == 200);
+    /* Strength is 1 / (1 + 8 d / radius). */
+    for (i = 1; i < 5; ++i) assert(fabs(light_falloff[i] - .08) < 1e-9);
+    /* No switch is set until illuminated geometry is drawn: most frames
+     * have none, and unlit drawing ignores the lights. */
+    assert(!switch_sets);
+    XGL_DrawTriangles(vertices, 3, 0, 1, 1);
+    XGL_Flush();
+    assert(!switch_sets && !ambient_sets);
+    XGL_DrawTriangles(vertices, 3, 1, 1, 1);
+    XGL_Flush();
+    assert(switch_sets == 1 && ambient_sets == 1);
     assert(switches[0] && switches[1] && switches[2] && switches[3] && switches[4]);
     assert(!switches[5]);
-    assert(light_position[1].x == r_origin[0] + 1);
-    assert(light_position[2].x == r_origin[0] + 5);
-    assert(light_position[3].x == r_origin[0] + 10);
-    assert(light_position[4].x == r_origin[0] + 20);
-    xgl_maxlights.value = 2;
-    update_lights();
-    assert(switches[1] && switches[2] && !switches[3] && !switches[4]);
-    r_dynamic.value = 0;
-    update_lights();
+    /* The world names the lights its illuminated geometry is in reach of;
+     * the others would cost time on every such triangle for nothing. */
+    XGL_DrawTriangles(vertices, 3, 1, 1, 1);
+    assert(xb.count == 3);
+    XGL_UsePointLights(5);
+    assert(xb.count == 0); /* The pending batch used the earlier selection. */
+    XGL_DrawTriangles(vertices, 3, 1, 1, 1);
+    XGL_Flush();
+    assert(switch_sets == 2 && ambient_sets == 1);
+    assert(switches[0] && switches[1] && !switches[2] && switches[3] && !switches[4]);
+    XGL_UsePointLights(5); /* Unchanged: nothing is flushed or set. */
+    XGL_DrawTriangles(vertices, 3, 1, 1, 1);
+    XGL_Flush();
+    assert(switch_sets == 2);
+    /* Natively illuminated models use every light, with the fill. */
+    XGL_DrawTriangles(vertices, 3, 2, 1, 1);
+    XGL_Flush();
+    assert(switches[1] && switches[2] && switches[3] && switches[4] && switches[5]);
+    XGL_DrawTriangles(vertices, 3, 1, 1, 1);
+    XGL_Flush();
+    assert(switches[1] && !switches[2] && switches[3] && !switches[4] && !switches[5]);
+    XGL_UsePointLights(0);
+    XGL_DrawTriangles(vertices, 3, 1, 1, 1);
+    XGL_Flush();
     for (i = 1; i < 6; ++i) assert(!switches[i]);
     assert(switches[0]);
-    /* No point light and full ambient: lit and unlit output are identical.
-     * Reduced ambient light still needs the illuminated path. */
-    assert(!XGL_LightsActive());
+    XGL_EndScene();
+
+    xgl_maxlights.value = 2;
+    xgl_lightfalloff.value = 1; xgl_lightrange.value = 0;
+    XGL_BeginScene();
+    assert(XGL_PointLights(&lights) == 2);
+    /* A falloff of 1 is the original 1 / (1 + d / radius); range 0: no limit. */
+    assert(fabs(light_falloff[1] - .01) < 1e-9 && lights[0].range == 0);
+    /* Each scene starts with every chosen light selected. */
+    XGL_DrawTriangles(vertices, 3, 1, 1, 1);
+    XGL_Flush();
+    assert(switches[1] && switches[2] && !switches[3] && !switches[4]);
+    XGL_UsePointLights(15); /* Bits beyond the chosen lights are ignored. */
+    assert(xb.light_mask == 3);
+    XGL_EndScene();
+    xgl_lightfalloff.value = 1000; xgl_lightrange.value = -3;
+    XGL_BeginScene();
+    assert(fabs(light_falloff[1] - .64) < 1e-9 && lights[0].range == 0);
+    XGL_EndScene();
+    r_dynamic.value = 0;
+    XGL_BeginScene();
+    assert(XGL_PointLights(&lights) == 0);
+    XGL_DrawTriangles(vertices, 3, 1, 1, 1);
+    XGL_Flush();
+    for (i = 1; i < 6; ++i) assert(!switches[i]);
+    assert(switches[0]);
+    XGL_EndScene();
+    /* Reduced ambient light still needs the illuminated path. */
+    assert(XGL_AmbientLight() == 1);
     xgl_ambient.value = .5f;
-    assert(XGL_LightsActive());
+    assert(XGL_AmbientLight() == .5f);
+    xgl_ambient.value = 7;
+    assert(XGL_AmbientLight() == 1);
+    xgl_ambient.value = -1;
+    assert(XGL_AmbientLight() == 0);
 }
 
 static void test_error_diagnostics(void)

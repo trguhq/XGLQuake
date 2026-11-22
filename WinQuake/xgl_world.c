@@ -52,8 +52,9 @@ typedef struct {
     int coarse_attempted, detail_attempted, detail_retry;
     vec3_t center;
     /* detail_frame: frame in which the world pass selected the detail mesh.
-     * detail_used: last frame the detail mesh was built or drawn. */
-    int center_valid, detail_frame, detail_used, bucket;
+     * detail_used: last frame the detail mesh was built or drawn.
+     * light_frame: frame in which a dynamic light reached this wall. */
+    int center_valid, detail_frame, detail_used, bucket, light_frame;
     float area, radius;
 } xgl_surface_cache_t;
 
@@ -93,6 +94,12 @@ static size_t xgl_prebuild_bytes = XGL_WORLD_CACHE_BYTES / 8 * 5;
 /* The backend's gamma table, copied when its revision changes. */
 static float xgl_gamma[256];
 static unsigned int xgl_gamma_revision;
+/* The scene's dynamic lights, fetched once per frame by XGL_DrawWorld.
+ * xgl_light_all: reduced ambient light makes every wall illuminated.
+ * xgl_light_split: some visible walls are illuminated and others are not, so
+ * they are drawn in two passes. xgl_entity_lit: the brush entity in hand. */
+static const xgl_point_light_t *xgl_lights;
+static int xgl_light_count, xgl_light_all, xgl_light_split, xgl_entity_lit;
 /* The rotation of the brush entity drawn last. Its faces arrive together. */
 static struct {
     vec3_t angles, forward, right, up;
@@ -157,6 +164,7 @@ void XGL_WorldShutdown (void)
     xgl_pvs_world = NULL;
     xgl_pvs_leaf = NULL;
     xgl_basis.valid = 0;
+    xgl_light_count = xgl_light_all = xgl_light_split = xgl_entity_lit = 0;
 }
 
 static void XGL_SurfacePoint (model_t *model, msurface_t *surface, int index, vec3_t point)
@@ -736,6 +744,102 @@ static void XGL_SurfaceBounds(model_t *model, msurface_t *surface, xgl_surface_c
     cache->center_valid = 1;
 }
 
+/* The scene lights that reach a sphere. For a face, a light behind its plane
+ * is left out: it adds nothing to any of the face's vertices. */
+static int XGL_LightsReaching (const float *center, float radius, const msurface_t *surface)
+{
+    const xgl_point_light_t *light;
+    vec3_t delta;
+    float height, reach;
+    int i, mask;
+    mask = 0;
+    for (i = 0, light = xgl_lights; i < xgl_light_count; ++i, ++light) {
+        if (surface) {
+            height = DotProduct(light->origin, surface->plane->normal) - surface->plane->dist;
+            if (surface->flags & SURF_PLANEBACK) height = -height;
+            if (height <= 0 || (light->range > 0 && height >= light->range)) continue;
+        }
+        if (light->range > 0) {
+            VectorSubtract(light->origin, center, delta);
+            reach = light->range + radius;
+            if (DotProduct(delta, delta) >= reach * reach) continue;
+        }
+        mask |= 1 << i;
+    }
+    return mask;
+}
+
+int XGL_BrushEntityLights (entity_t *entity)
+{
+    model_t *model;
+    vec3_t center;
+    float radius, half;
+    int i, mask;
+    if (r_fullbright.value) return 0;
+    mask = xgl_light_all ? XGL_LIT_AMBIENT : 0;
+    if (!xgl_light_count) return mask;
+    model = entity->model;
+    if (entity->angles[0] || entity->angles[1] || entity->angles[2]) {
+        /* A rotated entity is bounded by a sphere about its origin. */
+        VectorCopy(entity->origin, center);
+        radius = model->radius;
+    } else {
+        radius = 0;
+        for (i = 0; i < 3; ++i) {
+            center[i] = entity->origin[i] + (model->mins[i] + model->maxs[i]) * .5f;
+            half = (model->maxs[i] - model->mins[i]) * .5f;
+            radius += half * half;
+        }
+        radius = (float)sqrt(radius);
+    }
+    return mask | XGL_LightsReaching(center, radius, NULL);
+}
+
+/* Decide which visible walls are drawn illuminated, and tell the backend
+ * which lights that geometry needs: each enabled light costs time on every
+ * illuminated triangle, whether or not it reaches it. */
+static void XGL_MarkLitSurfaces (void)
+{
+    xgl_surface_cache_t *cache;
+    msurface_t *surface;
+    entity_t *entity;
+    int i, index, mask, reached, walls, lit, lights;
+    xgl_light_count = r_fullbright.value ? 0 : XGL_PointLights(&xgl_lights);
+    xgl_light_all = !r_fullbright.value && XGL_AmbientLight() < 1;
+    xgl_light_split = 0;
+    mask = walls = lit = 0;
+    if (xgl_light_count && !xgl_world_order) {
+        /* Without the cache index the traversal has already drawn the walls,
+         * all of them illuminated. */
+        mask = (1 << xgl_light_count) - 1;
+    } else if ((xgl_light_count || xgl_light_all) && xgl_world_order) {
+        for (i = 0; i < xgl_world_count; ++i) {
+            index = xgl_world_order[i];
+            surface = cl.worldmodel->surfaces + index;
+            if (surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB)) continue;
+            ++walls;
+            if (!xgl_light_count) continue;
+            cache = xgl_surfaces + index;
+            XGL_SurfaceBounds(cl.worldmodel, surface, cache);
+            reached = XGL_LightsReaching(cache->center, cache->radius, surface);
+            if (!reached) continue;
+            cache->light_frame = r_framecount;
+            mask |= reached; ++lit;
+        }
+        if (xgl_light_count && r_drawentities.value)
+            for (i = 0; i < cl_numvisedicts; ++i) {
+                entity = cl_visedicts[i];
+                if (entity && entity->model && entity->model->type == mod_brush)
+                    mask |= XGL_BrushEntityLights(entity) & ((1 << XGL_MAX_POINT_LIGHTS) - 1);
+            }
+        xgl_light_split = !xgl_light_all && lit > 0 && lit < walls;
+    }
+    XGL_UsePointLights(mask);
+    for (lights = 0; mask; mask >>= 1) lights += mask & 1;
+    XGL_ProfileCount(XGL_PROFILE_POINT_LIGHTS, (unsigned long)lights);
+    XGL_ProfileCount(XGL_PROFILE_WORLD_LIT_SURFACES, (unsigned long)(xgl_light_all ? walls : lit));
+}
+
 /* Build every coarse mesh and sample its materials while the map loads. */
 static void XGL_PrebuildWorld (void)
 {
@@ -913,15 +1017,18 @@ static void XGL_DrawSurface (model_t *model, msurface_t *surface, entity_t *enti
     int index, i, axis, lit, detail;
     texture = XGL_SurfaceTexture(surface->texinfo->texture, entity);
     if (!texture || !texture->width || !texture->height) return;
-    /* Baked light is already in the vertex colors. Native illumination is
-     * only worth its cost while a dynamic light can change the result. */
-    lit = !r_fullbright.value && !(surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB)) &&
-          XGL_LightsActive();
     cache = NULL; mesh = NULL;
     if (xgl_surfaces && model->surfaces == xgl_cached_world->surfaces) {
         index = (int)(surface - xgl_cached_world->surfaces);
         if (index >= 0 && index < xgl_surface_count) cache = &xgl_surfaces[index];
     } else cache = XGL_BrushModelFace(model, surface);
+    /* Baked light is already in the vertex colors. Native illumination is
+     * only worth its cost where a dynamic light can change the result: on
+     * the walls XGL_MarkLitSurfaces chose and the brush entities in reach. */
+    if (r_fullbright.value || (surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB))) lit = 0;
+    else if (entity && entity != &r_worldentity) lit = xgl_entity_lit;
+    else lit = xgl_light_all || (xgl_light_count &&
+        (!xgl_world_order || !cache || cache->light_frame == r_framecount));
     if (cache) {
         if (!cache->coarse_attempted) {
             cache->coarse_attempted = 1;
@@ -950,7 +1057,11 @@ static void XGL_DrawSurface (model_t *model, msurface_t *surface, entity_t *enti
                 xgl_detail_used += mesh->count / 3;
             }
         }
-        if (mesh == &cache->detail) cache->detail_used = r_framecount;
+        if (mesh == &cache->detail) {
+            cache->detail_used = r_framecount;
+            XGL_ProfileCount(XGL_PROFILE_WORLD_DETAIL_SURFACES, 1);
+            XGL_ProfileCount(XGL_PROFILE_WORLD_DETAIL_TRIANGLES, (unsigned long)(mesh->count / 3));
+        }
         if (mesh->vertices) {
             XGL_ProfileCount(XGL_PROFILE_WORLD_CACHED_SURFACES, 1);
             XGL_UpdateSurfaceMesh(mesh, surface, texture, entity);
@@ -1092,8 +1203,10 @@ static void XGL_WorldNode (mnode_t *node, int clipflags)
     XGL_WorldNode(node->children[!side], clipflags);
 }
 
-/* Draws the walls. Sky and water wait for XGL_DrawWorldSpecial, so that the
- * frame can keep geometry of one native state together. */
+/* Finds the visible faces and draws walls. While a dynamic light reaches
+ * only some of them, those are drawn here, illuminated, and the rest by
+ * XGL_DrawWorldUnlit, so that each native state is entered once. Sky and
+ * water wait for XGL_DrawWorldSpecial. */
 void XGL_DrawWorld (void)
 {
     msurface_t *surface;
@@ -1121,11 +1234,31 @@ void XGL_DrawWorld (void)
         start = XGL_ProfileDetailNow();
         XGL_SelectWorldDetail();
         XGL_ProfileAdd(XGL_PROFILE_WORLD_DETAIL_SELECT, start);
+    }
+    XGL_MarkLitSurfaces();
+    if (xgl_world_order) {
         for (i = 0; i < xgl_world_count; ++i) {
             surface = cl.worldmodel->surfaces + xgl_world_order[i];
-            if (!(surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB)))
-                XGL_QueueSurface(cl.worldmodel, surface, &r_worldentity);
+            if (surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB)) continue;
+            if (xgl_light_split && xgl_surfaces[xgl_world_order[i]].light_frame != r_framecount)
+                continue;
+            XGL_QueueSurface(cl.worldmodel, surface, &r_worldentity);
         }
+    }
+}
+
+/* The walls no dynamic light reaches, when XGL_DrawWorld drew only the others. */
+void XGL_DrawWorldUnlit (void)
+{
+    msurface_t *surface;
+    int i;
+    if (!xgl_light_split || !xgl_world_order) return;
+    currententity = &r_worldentity;
+    for (i = 0; i < xgl_world_count; ++i) {
+        surface = cl.worldmodel->surfaces + xgl_world_order[i];
+        if (surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB)) continue;
+        if (xgl_surfaces[xgl_world_order[i]].light_frame == r_framecount) continue;
+        XGL_QueueSurface(cl.worldmodel, surface, &r_worldentity);
     }
 }
 
@@ -1154,6 +1287,7 @@ void XGL_DrawBrushModel (entity_t *entity)
     int i, rotated;
     model = entity->model;
     currententity = entity;
+    xgl_entity_lit = XGL_BrushEntityLights(entity) != 0;
     rotated = entity->angles[0] || entity->angles[1] || entity->angles[2];
     for (i = 0; i < 3; ++i) {
         mins[i] = entity->origin[i] + (rotated ? -model->radius : model->mins[i]);

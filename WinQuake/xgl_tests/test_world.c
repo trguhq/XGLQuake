@@ -39,7 +39,9 @@ entity_t r_worldentity, *currententity;
 vec3_t r_origin, vpn;
 mleaf_t *r_viewleaf;
 int r_framecount, r_visframecount, c_brush_polys;
-cvar_t r_fullbright, r_wateralpha, r_novis;
+cvar_t r_fullbright, r_wateralpha, r_novis, r_drawentities;
+entity_t *cl_visedicts[MAX_VISEDICTS];
+int cl_numvisedicts;
 mplane_t frustum[4];
 double realtime;
 byte xgl_palette[768];
@@ -59,7 +61,10 @@ static byte test_samples[81];
 static efrag_t test_efrag;
 static byte test_vis;
 static int pvs_calls, sample_calls, efrag_calls, reject_box;
-static int smp_active, alias_prepasses, lights_active, gamma_copies;
+static int smp_active, alias_prepasses, gamma_copies;
+static xgl_point_light_t test_lights[XGL_MAX_POINT_LIGHTS];
+static int test_light_count, used_lights, use_calls;
+static float test_ambient;
 static xgl_native_vertex_t captured[1024];
 static const xgl_native_vertex_t *queued[1024];
 static xgl_native_vertex_t queued_copy[1024];
@@ -96,7 +101,13 @@ void XGL_AliasPrepareFrame(void)
 void XGL_AudioUpdate(void) {}
 unsigned int XGL_TextureRevision(int id) { assert(id == 1 || id == 2); return texture_revision; }
 unsigned int XGL_ColorRevision(void) { return color_revision; }
-int XGL_LightsActive(void) { return lights_active; }
+int XGL_PointLights(const xgl_point_light_t **lights)
+{
+    if (lights) *lights = test_lights;
+    return test_light_count;
+}
+void XGL_UsePointLights(int mask) { used_lights = mask; ++use_calls; }
+float XGL_AmbientLight(void) { return test_ambient; }
 /* The backend's 256-entry gamma output table. World colors index it with an
  * integer level; the volatile store keeps fast math from reassociating. */
 void XGL_CopyGammaOutput(float output[256])
@@ -240,6 +251,7 @@ static void begin_frame(void)
     memset(profile_sections, 0, sizeof(profile_sections));
     set_frustum(reject_box);
     XGL_DrawWorld();
+    XGL_DrawWorldUnlit();
     XGL_DrawWorldSpecial(); /* Sky and water follow the walls in a frame. */
 }
 
@@ -330,7 +342,14 @@ static void setup_world(void)
      * map-load building and the limit have tests of their own. */
     xgl_world_prebuild = 0;
     xgl_detailbuild.value = 0;
-    lights_active = 1;
+    /* One dynamic light above the test face, well within its range. */
+    memset(test_lights, 0, sizeof(test_lights));
+    test_lights[0].origin[0] = test_lights[0].origin[1] = 64;
+    test_lights[0].origin[2] = 32;
+    test_lights[0].radius = 100; test_lights[0].range = 200;
+    test_light_count = 1; test_ambient = 1;
+    used_lights = use_calls = 0;
+    cl_numvisedicts = 0; r_drawentities.value = 1;
     xgl_gamma_revision = 0;
     for (i = 0; i < 256; ++i) d_lightstylevalue[i] = 256;
     pvs_calls = sample_calls = efrag_calls = reject_box = captured_count = 0;
@@ -837,27 +856,147 @@ static void test_unlit_without_dynamic_light(void)
     /* Baked light is in the vertex colors. With no dynamic light and full
      * ambient, illumination would return those colors unchanged, so walls
      * and brush entities are submitted unlit, with exactly the same colors. */
-    lights_active = 0;
+    test_light_count = 0;
     begin_frame();
     assert(captured_count == 6 && captured_lit == 0 && captured_zwrite == 1);
     assert(captured[0].color.rgb[0] == lit_color);
     assert(profile_counts[XGL_PROFILE_WORLD_COLOR_HITS] == 1);
+    assert(!used_lights && !profile_counts[XGL_PROFILE_WORLD_LIT_SURFACES]);
     memset(&entity, 0, sizeof(entity));
     entity.model = &test_model;
     captured_count = 0;
     XGL_DrawBrushModel(&entity);
     assert(captured_count == 6 && captured_lit == 0);
-    lights_active = 1;
+    test_light_count = 1;
+    begin_frame();
     captured_count = 0;
     XGL_DrawBrushModel(&entity);
     assert(captured_count == 6 && captured_lit == 1);
     /* The streamed fallback follows the same rule. */
     setup_world();
     xgl_cache_bytes = XGL_WORLD_CACHE_BYTES;
-    lights_active = 0;
+    test_light_count = 0;
     begin_frame();
     assert(captured_count == 6 && captured_lit == 0);
     assert(profile_counts[XGL_PROFILE_WORLD_FALLBACK_SURFACES] == 1);
+    test_light_count = 1;
+    begin_frame();
+    assert(captured_count == 6 && captured_lit == 1);
+}
+
+/* Walls and brush entities are illuminated only where a dynamic light can
+ * reach them; everything else stays on the cheaper unlit path. */
+static void test_dynamic_light_range(void)
+{
+    static model_t box;
+    entity_t entity;
+    int frame;
+    /* Two walls 1024 units apart, with the light above the first. */
+    setup_pair(0, 128, 1024, 128);
+    xgl_detailtris.value = 0;
+    for (frame = 0; frame < 2; ++frame) {
+        XGL_Flush(); ++r_framecount; captured_count = captured_calls = 0;
+        memset(profile_counts, 0, sizeof(profile_counts));
+        set_frustum(0);
+        XGL_DrawWorld();
+        /* The wall in reach is drawn first, illuminated... */
+        assert(captured_count == 6 && captured_lit == 1 && captured[0].position[0] == 0);
+        assert(used_lights == 1 && xgl_light_split);
+        assert(profile_counts[XGL_PROFILE_WORLD_LIT_SURFACES] == 1);
+        assert(profile_counts[XGL_PROFILE_POINT_LIGHTS] == 1);
+        /* ...and the other one afterwards, unlit: one state change. */
+        XGL_DrawWorldUnlit();
+        assert(captured_count == 12 && captured_lit == 0 && captured[6].position[0] == 1024);
+        /* A second light that reaches nothing visible is switched off. */
+        test_light_count = 2;
+        test_lights[1] = test_lights[0];
+        test_lights[1].origin[1] = 5000;
+    }
+    /* Carry the first light to the far wall: the walls swap passes. */
+    test_lights[0].origin[0] = 1088;
+    begin_frame();
+    assert(captured_count == 12 && captured[0].position[0] == 1024 && captured[6].position[0] == 0);
+    assert(used_lights == 1);
+    /* Between the walls it reaches both: one illuminated pass. */
+    test_lights[0].origin[0] = 576; test_lights[0].range = 520;
+    XGL_Flush(); ++r_framecount; captured_count = 0; set_frustum(0);
+    XGL_DrawWorld();
+    assert(captured_count == 12 && captured_lit == 1 && !xgl_light_split);
+    XGL_DrawWorldUnlit();
+    assert(captured_count == 12);
+    /* A light behind a wall's plane adds nothing to it. */
+    test_lights[0].origin[2] = -32;
+    XGL_Flush(); ++r_framecount; captured_count = 0;
+    memset(profile_counts, 0, sizeof(profile_counts));
+    XGL_DrawWorld();
+    assert(captured_count == 12 && captured_lit == 0 && !used_lights && !xgl_light_split);
+    assert(!profile_counts[XGL_PROFILE_WORLD_LIT_SURFACES]);
+    /* Nor does one whose range ends above the plane. */
+    test_lights[0].origin[2] = 521;
+    begin_frame();
+    assert(captured_count == 12 && captured_lit == 0 && !used_lights);
+    test_lights[0].origin[2] = 519; test_lights[0].origin[0] = 64;
+    begin_frame();
+    assert(captured_count == 12 && used_lights == 1 && captured[0].position[0] == 0);
+    assert(xgl_light_split);
+    /* A range of zero is no limit: every wall facing a light is lit. */
+    test_lights[0].range = 0; test_lights[0].origin[2] = 4000;
+    begin_frame();
+    assert(captured_count == 12 && captured_lit == 1 && !xgl_light_split && used_lights == 1);
+    /* Reduced ambient light illuminates every wall, with or without lights. */
+    test_light_count = 0; test_ambient = .5f;
+    memset(profile_counts, 0, sizeof(profile_counts));
+    begin_frame();
+    assert(captured_count == 12 && captured_lit == 1 && !used_lights && !xgl_light_split);
+    assert(profile_counts[XGL_PROFILE_WORLD_LIT_SURFACES] == 2);
+    assert(!profile_counts[XGL_PROFILE_POINT_LIGHTS]);
+    r_fullbright.value = 1;
+    begin_frame();
+    assert(captured_count == 12 && captured_lit == 0);
+    r_fullbright.value = 0; test_ambient = 1;
+
+    /* A brush entity is illuminated as a whole when its bounds are in reach
+     * of a light, and its light counts toward those the frame enables. */
+    box = test_model;
+    box.mins[0] = box.mins[1] = 0; box.maxs[0] = box.maxs[1] = 128;
+    memset(&entity, 0, sizeof(entity));
+    entity.model = &box;
+    entity.origin[1] = 4936; /* Centered under the second light only. */
+    test_light_count = 2;
+    test_lights[0].origin[0] = 64; test_lights[0].origin[2] = 32; test_lights[0].range = 200;
+    test_lights[1].origin[0] = 64; test_lights[1].range = 200;
+    cl_visedicts[0] = &entity; cl_numvisedicts = 1;
+    box.type = mod_brush;
+    begin_frame();
+    assert(used_lights == 3 && XGL_BrushEntityLights(&entity) == 2);
+    captured_count = 0;
+    XGL_DrawBrushModel(&entity);
+    assert(captured_count == 12 && captured_lit == 1);
+    entity.origin[1] = 2000;
+    begin_frame();
+    assert(used_lights == 1 && !XGL_BrushEntityLights(&entity));
+    captured_count = 0;
+    XGL_DrawBrushModel(&entity);
+    assert(captured_count == 12 && captured_lit == 0);
+    /* A rotated entity is bounded by its radius about its origin. */
+    entity.angles[1] = 45; box.radius = 64;
+    entity.origin[0] = 64; entity.origin[2] = 32;
+    entity.origin[1] = 5000 + 263;
+    assert(XGL_BrushEntityLights(&entity) == 2);
+    entity.origin[1] = 5000 + 265;
+    assert(!XGL_BrushEntityLights(&entity));
+    r_drawentities.value = 0; entity.origin[1] = 5000;
+    begin_frame();
+    assert(used_lights == 1); /* Hidden entities need no light. */
+    r_drawentities.value = 1;
+    test_ambient = .5f;
+    begin_frame();
+    assert(XGL_BrushEntityLights(&entity) == (XGL_LIT_AMBIENT | 2));
+    r_fullbright.value = 1;
+    assert(!XGL_BrushEntityLights(&entity));
+    r_fullbright.value = 0; test_ambient = 1;
+    cl_numvisedicts = 0;
+    XGL_WorldShutdown();
 }
 
 static void test_map_load_prebuild(void)
@@ -1176,6 +1315,7 @@ int main(void)
     test_brush_water_and_point_light();
     test_animated_water_and_sky();
     test_unlit_without_dynamic_light();
+    test_dynamic_light_range();
     test_map_load_prebuild();
     test_detail_build_limit();
     test_detail_hysteresis();

@@ -43,8 +43,9 @@ frames of different lengths.
 Illumination costs about 40% more than unlit submission even when no light
 can change the result, and each point light adds about 1.8 µs to every lit
 triangle. The number of lights merely allocated and switched off does not
-matter. The renderer therefore submits walls and brush entities unlit whenever
-no dynamic light is active.
+matter. The renderer therefore illuminates only the walls and brush entities
+a dynamic light reaches, enables only the lights that reach something, and
+shades models on the CPU.
 
 At this size the device is limited by triangle count, not pixels: the same
 triangles at 640x480, four times the area, take the same time. Triangles of

@@ -162,17 +162,24 @@ void R_RenderView (void)
     XGL_BeginScene();
     /* Every change between lit and unlit drawing costs about half a
      * millisecond on the Sun ZX, so the frame is ordered by native state,
-     * not by kind: walls and brush entities; then the unlit sky, water,
-     * sprites and particles; then torches (unlit) and the illuminated models
-     * with the view weapon; blended water last. Depth testing makes the
-     * order of opaque geometry irrelevant to the image. */
+     * not by kind: first the walls and brush entities a dynamic light
+     * reaches, illuminated; then everything else, unlit: the other walls
+     * and brush entities, sky, water, sprites, particles and the models,
+     * which are shaded on the CPU; blended water last. Depth testing makes
+     * the order of opaque geometry irrelevant to the image. */
     section_start = XGL_ProfileNow();
     XGL_DrawWorld();
     XGL_ProfileAdd(XGL_PROFILE_WORLD, section_start);
     /* Like GLQuake, service the original sound mixer during long frames. */
     XGL_AudioUpdate();
     section_start = XGL_ProfileNow();
-    XGL_DrawBrushEntities();
+    XGL_DrawBrushEntities(1);
+    XGL_ProfileAdd(XGL_PROFILE_ENTITIES, section_start);
+    section_start = XGL_ProfileNow();
+    XGL_DrawWorldUnlit();
+    XGL_ProfileAdd(XGL_PROFILE_WORLD, section_start);
+    section_start = XGL_ProfileNow();
+    XGL_DrawBrushEntities(0);
     XGL_ProfileAdd(XGL_PROFILE_ENTITIES, section_start);
     section_start = XGL_ProfileNow();
     XGL_DrawWorldSpecial();

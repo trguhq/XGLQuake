@@ -20,13 +20,16 @@ viddef_t vid;
 entity_t *currententity;
 vec3_t r_origin, vpn, vright, vup;
 int c_alias_polys;
-cvar_t r_fullbright, r_drawentities, r_drawviewmodel, chase_active;
+cvar_t r_fullbright, r_drawentities, r_drawviewmodel, chase_active, r_dynamic;
+dlight_t cl_dlights[MAX_DLIGHTS];
 byte xgl_palette[768];
 
 static xgl_vertex_t captured[4096];
 static int captured_count, native_lit, material_seen, coverage_mode;
 static int sample_calls, test_light, draw_calls, normalizations;
 static int draw_log_lit[64], draw_log_count[64];
+static int prepared_draws, brush_lights, brush_draws;
+static float test_ambient;
 static byte material_pixels[16 * 16];
 static xgl_native_vertex_t reserved_vertices[XGL_ENTITY_BATCH_VERTICES];
 static int reserved_count, reserved_lit, reserve_calls, prepare_calls;
@@ -190,12 +193,16 @@ int R_LightPoint(vec3_t point)
 }
 unsigned int XGL_TextureRevision(int material) { return material > 0 ? material_revision : 0; }
 qboolean XGL_TextureHasAlpha(int material) { (void)material; return coverage_mode != 0; }
-void XGL_DrawBrushModel(entity_t *entity) { (void)entity; }
+void XGL_DrawBrushModel(entity_t *entity) { (void)entity; ++brush_draws; }
+float XGL_AmbientLight(void) { return test_ambient; }
+int XGL_BrushEntityLights(entity_t *entity) { (void)entity; return brush_lights; }
 
-/* The frame's entity order: brush models, sprites, then alias models. */
+/* The frame's entity order: brush models in reach of a dynamic light, the
+ * other brush models, sprites, then alias models. */
 static void draw_entities(void)
 {
-    XGL_DrawBrushEntities();
+    XGL_DrawBrushEntities(1);
+    XGL_DrawBrushEntities(0);
     XGL_DrawSprites();
     XGL_DrawAliasEntities();
 }
@@ -217,6 +224,14 @@ void XGL_DrawTriangles(const xgl_vertex_t *vertices, int count, int lit,
         assert(fabs(DotProduct(vertices[i].normal, vertices[i].normal) - 1) < .0001);
         captured[captured_count++] = vertices[i];
     }
+}
+/* CPU-shaded fallback triangles carry final colors and are always unlit. */
+void XGL_DrawTrianglesStrided(const xgl_vertex_t *vertices, int count, size_t stride,
+                              int lit, float opacity, int zwrite, int prepared_color)
+{
+    assert(stride == sizeof(*vertices) && prepared_color == 1 && lit == 0);
+    ++prepared_draws;
+    XGL_DrawTriangles(vertices, count, lit, opacity, zwrite);
 }
 static void capture_reserved(void)
 {
@@ -317,6 +332,17 @@ static void reset_test(void)
     xgl_sprite_cells.value = 2;
     xgl_entity_triangles.value = 2048;
     xgl_playercolors.value = 1;
+    /* Most contracts were written against native illumination, which also
+     * outputs the world normals they check. CPU shading has its own test. */
+    xgl_alias_shade.value = 0;
+    test_ambient = 1; r_dynamic.value = 1;
+    memset(cl_dlights, 0, sizeof(cl_dlights));
+    prepared_draws = brush_lights = brush_draws = 0;
+    /* The backend starts every batch record with a valid normal. */
+    for (i = 0; i < XGL_ENTITY_BATCH_VERTICES; ++i) {
+        reserved_vertices[i].normal[0] = reserved_vertices[i].normal[1] = 0;
+        reserved_vertices[i].normal[2] = 1;
+    }
     xgl_entity_extra_used = 0;
     captured_count = native_lit = material_seen = coverage_mode = 0;
     sample_calls = draw_calls = normalizations = 0; test_light = 128; material_revision = 1;
@@ -1408,6 +1434,160 @@ static void test_alias_state_order(void)
     XGL_EntitiesShutdown();
 }
 
+/* With xgl_alias_shade the CPU computes what the device used to: the
+ * prepared color times (ambient/2 + max(0, N.L)/2), from the same normals,
+ * and every model is submitted unlit. */
+static void test_alias_cpu_shading(void)
+{
+    static model_t flame_model;
+    xgl_vertex_t native[192], shaded[192];
+    aliashdr_t *header;
+    trivertx_t *pose;
+    entity_t *entity;
+    float dot, shade, dim;
+    int i, j, depth, count, stage, lit_corners;
+    for (depth = 0; depth <= 1; ++depth) {
+        reset_test();
+        header = make_alias(6);
+        header->frames[0].numposes = 1;
+        header->scale[0] = .3f; header->scale[1] = 2; header->scale[2] = -.75f;
+        pose = (trivertx_t *)((byte *)header + header->posedata);
+        for (i = 0; i < header->poseverts; ++i) {
+            pose[i].v[0] = (byte)(i * 4 + 3);
+            pose[i].v[1] = (byte)(i * 2 + 1);
+            pose[i].v[2] = (byte)(i * 3 + 1);
+            pose[i].lightnormalindex = (byte)(i * 31);
+        }
+        strcpy(alias_model.name, "progs/soldier.mdl");
+        entity = &cl_entities[1];
+        entity->angles[0] = 23; entity->angles[1] = 19; entity->angles[2] = 137;
+        entity->origin[0] = 31; entity->origin[1] = -17; entity->origin[2] = 64;
+        xgl_alias_subdivide.value = (float)depth;
+        test_light = 96;
+        test_ambient = depth ? .5f : 1;
+        /* A gamma curve shows that the shade is applied after gamma, as the
+         * device applied its illumination to the prepared color. */
+        test_gamma = 1;
+        for (i = 0; i < 256; ++i) gamma_output[i] = (float)sqrt(i / 255.0);
+        for (stage = 0; stage < 3; ++stage) {
+            captured_count = 0; xgl_entity_extra_used = 0;
+            XGL_DrawAlias(entity);
+        }
+        count = captured_count;
+        assert(count == 12 * (1 << (2 * depth)) && native_lit == 2 && !prepared_draws);
+        memcpy(native, captured, (size_t)count * sizeof(*native));
+        XGL_EntitiesShutdown();
+        xgl_alias_shade.value = 1;
+        /* Cold fallback, cache build, then the cached pose: all the same. */
+        for (stage = 0; stage < 3; ++stage) {
+            captured_count = 0; xgl_entity_extra_used = 0; normalizations = 0;
+            XGL_DrawAlias(entity);
+            assert(captured_count == count && native_lit == 0);
+            /* Only the cold draw streams; the next builds and uses the cache. */
+            assert(prepared_draws == 1);
+            if (stage == 2) assert(!normalizations);
+            lit_corners = 0;
+            for (i = 0; i < count; ++i) {
+                dot = (native[i].normal[0] + native[i].normal[1] + native[i].normal[2]) * .577350269f;
+                shade = .5f * test_ambient + (dot > 0 ? .5f * dot : 0);
+                if (dot > 0) ++lit_corners;
+                for (j = 0; j < 3; ++j) {
+                    assert(fabs(captured[i].position[j] - native[i].position[j]) < .0001);
+                    assert(fabs(captured[i].color[j] - native[i].color[j] * shade) < .0001);
+                }
+                /* The cached path leaves each record's normal as the last
+                 * (here native) draw wrote it: valid, and never read. */
+                if (stage) assert(VectorCompare(captured[i].normal, native[i].normal));
+            }
+            assert(lit_corners > 0 && lit_corners < count);
+        }
+        memcpy(shaded, captured, (size_t)count * sizeof(*shaded));
+        /* A worker prepares the same colors and writes no normals. */
+        cl_visedicts[0] = entity; cl_numvisedicts = 1;
+        smp_active = 1;
+        captured_count = executed_jobs = 0; xgl_entity_extra_used = 0;
+        XGL_AliasPrepareFrame();
+        assert(pending_jobs == 1 && xgl_alias_frame->jobs[0].lit == 0);
+        draw_entities();
+        assert(executed_jobs == 1 && captured_count == count && native_lit == 0);
+        for (i = 0; i < count; ++i) {
+            assert(captured[i].normal[0] == 0 && captured[i].normal[2] == 1);
+            for (j = 0; j < 3; ++j) {
+                assert(captured[i].position[j] == shaded[i].position[j]);
+                assert(captured[i].color[j] == shaded[i].color[j]);
+            }
+        }
+        XGL_AliasFinishFrame();
+        smp_active = 0; cl_numvisedicts = 0;
+
+        /* Quake adds each dynamic light within reach to the model's light.
+         * Native illumination leaves that to the device's point lights. */
+        test_gamma = 0; test_light = 16;
+        captured_count = 0; xgl_entity_extra_used = 0;
+        XGL_DrawAlias(entity);
+        dim = captured[0].color[1];
+        assert(dim > 0);
+        VectorCopy(entity->origin, cl_dlights[3].origin);
+        cl_dlights[3].origin[2] += 60;
+        cl_dlights[3].radius = 100; cl_dlights[3].die = 1;
+        captured_count = 0; xgl_entity_extra_used = 0;
+        XGL_DrawAlias(entity);
+        assert(fabs(captured[0].color[1] - dim * (16 + 40) / 16) < .0001);
+        cl_dlights[3].radius = 60; /* out of reach */
+        captured_count = 0; xgl_entity_extra_used = 0;
+        XGL_DrawAlias(entity);
+        assert(captured[0].color[1] == dim);
+        cl_dlights[3].radius = 100; r_dynamic.value = 0;
+        captured_count = 0; xgl_entity_extra_used = 0;
+        XGL_DrawAlias(entity);
+        assert(captured[0].color[1] == dim);
+        r_dynamic.value = 1; cl.time = 2; /* expired */
+        captured_count = 0; xgl_entity_extra_used = 0;
+        XGL_DrawAlias(entity);
+        assert(captured[0].color[1] == dim);
+        cl.time = 0;
+        xgl_alias_shade.value = 0;
+        captured_count = 0; xgl_entity_extra_used = 0;
+        XGL_DrawAlias(entity);
+        assert(native_lit == 2 && fabs(captured[0].color[1] * .5f * test_ambient - dim) < .0001 * 2);
+
+        /* Torches are final as sampled in either mode: no shade, no light. */
+        flame_model = alias_model;
+        strcpy(flame_model.name, "progs/flame.mdl");
+        entity->model = &flame_model;
+        for (stage = 0; stage < 2; ++stage) {
+            xgl_alias_shade.value = (float)stage;
+            captured_count = 0; xgl_entity_extra_used = 0;
+            XGL_DrawAlias(entity);
+            assert(captured_count == count && native_lit == 0);
+            if (stage) for (i = 0; i < count; ++i)
+                for (j = 0; j < 3; ++j) assert(captured[i].color[j] == shaded[i].color[j]);
+            memcpy(shaded, captured, (size_t)count * sizeof(*shaded));
+        }
+        XGL_EntitiesShutdown();
+    }
+}
+
+static void test_brush_entity_passes(void)
+{
+    static model_t brush;
+    reset_test();
+    brush.type = mod_brush;
+    cl_entities[1].model = &brush;
+    cl_visedicts[0] = &cl_entities[1]; cl_numvisedicts = 1;
+    /* Each brush entity is drawn by exactly one of a frame's two calls. */
+    XGL_DrawBrushEntities(1);
+    assert(!brush_draws);
+    XGL_DrawBrushEntities(0);
+    assert(brush_draws == 1 && profile_draw_calls[XGL_PROFILE_DRAW_BRUSH] == 1);
+    brush_lights = XGL_LIT_AMBIENT;
+    XGL_DrawBrushEntities(0);
+    assert(brush_draws == 1);
+    XGL_DrawBrushEntities(1);
+    assert(brush_draws == 2 && profile_draw_calls[XGL_PROFILE_DRAW_BRUSH] == 2);
+    cl_numvisedicts = 0;
+}
+
 static void test_smp_alias_frame(void)
 {
     static union { double alignment; byte bytes[sizeof(alias_storage)]; } relocated;
@@ -1519,6 +1699,8 @@ int main(void)
     test_alias_pose_canceling_normals();
     test_alias_pose_cache_batching_and_limits();
     test_alias_pose_cache_allocation_failure();
+    test_alias_cpu_shading();
+    test_brush_entity_passes();
     puts("XGL entity contracts passed (CPU geometry; no native rendering)");
     return 0;
 }
