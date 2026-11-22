@@ -20,6 +20,11 @@ typedef char xgl_native_vertex_layout[
     offsetof(xgl_native_vertex_t, color) == offsetof(Xgl_pt_color_normal_f3d, color) &&
     offsetof(xgl_native_vertex_t, normal) == offsetof(Xgl_pt_color_normal_f3d, normal)
     ? 1 : -1];
+typedef char xgl_color_vertex_layout[
+    sizeof(xgl_color_vertex_t) == sizeof(Xgl_pt_color_f3d) &&
+    offsetof(xgl_color_vertex_t, position) == offsetof(Xgl_pt_color_f3d, x) &&
+    offsetof(xgl_color_vertex_t, color) == offsetof(Xgl_pt_color_f3d, color)
+    ? 1 : -1];
 
 #define XGL_BATCH_TRIANGLES 256
 #define XGL_FONT_CACHE 128
@@ -45,6 +50,10 @@ typedef struct {
     Xgl_boolean light_switches[6];
     Xgl_usgn32 buffers;
     xgl_native_vertex_t points[XGL_BATCH_TRIANGLES * 3];
+    /* The owned batch for points without normals; a batch is all of one
+     * kind, and `format` says which the pending one is. */
+    xgl_color_vertex_t color_points[XGL_BATCH_TRIANGLES * 3];
+    int format;
     Xgl_pt_list lists[XGL_BATCH_TRIANGLES];
     xgl_font_size_t fonts[XGL_FONT_CACHE];
     Xgl_pt_f2d ui_positions[XGL_UI_GLYPHS];
@@ -351,7 +360,9 @@ void XGL_Flush(void)
     XGL_AudioUpdate();
 }
 
-static int triangle_state(int count, int lit, float opacity, int zwrite)
+/* format: 0 for points with normals, 1 for points without. Illumination
+ * needs normals, so points without are always unlit. */
+static int triangle_state(int count, int lit, float opacity, int zwrite, int format)
 {
     if (!xb.frame || !xb.scene_active || count <= 0) return 0;
     if (count % 3) Sys_Error("XGL_DrawTriangles: vertex count is not a multiple of three");
@@ -359,47 +370,95 @@ static int triangle_state(int count, int lit, float opacity, int zwrite)
     if (opacity <= 0) return 0;
     lit = lit < 0 ? 0 : (lit > 2 ? 2 : lit);
     zwrite = zwrite != 0;
-    if (xb.count && (xb.count == XGL_BATCH_TRIANGLES * 3 ||
+    if (xb.count && (xb.count == XGL_BATCH_TRIANGLES * 3 || xb.format != format ||
         xb.lit != lit || xb.opacity != opacity || xb.zwrite != zwrite)) XGL_Flush();
-    xb.lit = lit; xb.opacity = opacity; xb.zwrite = zwrite;
+    xb.lit = lit; xb.opacity = opacity; xb.zwrite = zwrite; xb.format = format;
     return 1;
+}
+
+/* Point the batch's next triangles at `count` vertices of the given format. */
+static void batch_triangles(const void *vertices, int count, int format)
+{
+    Xgl_pt_list *list;
+    int i;
+    list = &xb.lists[xb.count / 3];
+    if (format) {
+        for (i = 0; i < count; i += 3, ++list) {
+            list->pt_type = XGL_PT_COLOR_F3D;
+            list->pts.color_f3d = (Xgl_pt_color_f3d *)((const xgl_color_vertex_t *)vertices + i);
+        }
+    } else {
+        for (i = 0; i < count; i += 3, ++list) {
+            list->pt_type = XGL_PT_COLOR_NORMAL_F3D;
+            list->pts.color_normal_f3d =
+                (Xgl_pt_color_normal_f3d *)((const xgl_native_vertex_t *)vertices + i);
+        }
+    }
+    xb.count += count;
 }
 
 xgl_native_vertex_t *XGL_ReserveTriangles(int *count, int lit,
                                          float opacity, int zwrite)
 {
     xgl_native_vertex_t *vertices;
-    int available, i;
+    int available;
     if (!count) return NULL;
-    if (!triangle_state(*count, lit, opacity, zwrite)) {
+    if (!triangle_state(*count, lit, opacity, zwrite, 0)) {
         *count = 0;
         return NULL;
     }
     available = XGL_BATCH_TRIANGLES * 3 - xb.count;
     if (*count > available) *count = available;
     vertices = xb.points + xb.count;
-    for (i = 0; i < *count; i += 3)
-        xb.lists[(xb.count + i) / 3].pts.color_normal_f3d =
-            (Xgl_pt_color_normal_f3d *)(vertices + i);
-    xb.count += *count;
+    batch_triangles(vertices, *count, 0);
     XGL_ProfileCount(XGL_PROFILE_NATIVE_DIRECT_VERTICES, (unsigned long)*count);
     /* The caller fills the reserved records before another backend call.
      * In particular, do not submit a full batch until it has been filled. */
     return vertices;
 }
 
-void XGL_DrawNativeTriangles(const xgl_native_vertex_t *vertices, int count,
-                            int lit, float opacity, int zwrite)
+xgl_color_vertex_t *XGL_ReserveColorTriangles(int *count, float opacity, int zwrite)
 {
-    int available, take, i;
-    if (!vertices || !triangle_state(count, lit, opacity, zwrite)) return;
+    xgl_color_vertex_t *vertices;
+    int available;
+    if (!count) return NULL;
+    if (!triangle_state(*count, 0, opacity, zwrite, 1)) {
+        *count = 0;
+        return NULL;
+    }
+    available = XGL_BATCH_TRIANGLES * 3 - xb.count;
+    if (*count > available) *count = available;
+    vertices = xb.color_points + xb.count;
+    batch_triangles(vertices, *count, 1);
+    XGL_ProfileCount(XGL_PROFILE_NATIVE_DIRECT_VERTICES, (unsigned long)*count);
+    return vertices;
+}
+
+void XGL_DrawColorTriangles(const xgl_color_vertex_t *vertices, int count,
+                           float opacity, int zwrite)
+{
+    int available, take;
+    if (!vertices || !triangle_state(count, 0, opacity, zwrite, 1)) return;
     while (count) {
         available = XGL_BATCH_TRIANGLES * 3 - xb.count;
         take = count < available ? count : available;
-        for (i = 0; i < take; i += 3)
-            xb.lists[(xb.count + i) / 3].pts.color_normal_f3d =
-                (Xgl_pt_color_normal_f3d *)(vertices + i);
-        xb.count += take;
+        batch_triangles(vertices, take, 1);
+        XGL_ProfileCount(XGL_PROFILE_NATIVE_CACHED_VERTICES, (unsigned long)take);
+        vertices += take;
+        count -= take;
+        if (xb.count == XGL_BATCH_TRIANGLES * 3) XGL_Flush();
+    }
+}
+
+void XGL_DrawNativeTriangles(const xgl_native_vertex_t *vertices, int count,
+                            int lit, float opacity, int zwrite)
+{
+    int available, take;
+    if (!vertices || !triangle_state(count, lit, opacity, zwrite, 0)) return;
+    while (count) {
+        available = XGL_BATCH_TRIANGLES * 3 - xb.count;
+        take = count < available ? count : available;
+        batch_triangles(vertices, take, 0);
         XGL_ProfileCount(XGL_PROFILE_NATIVE_CACHED_VERTICES, (unsigned long)take);
         vertices += take;
         count -= take;
@@ -412,43 +471,54 @@ void XGL_DrawTrianglesStrided(const xgl_vertex_t *vertices, int count,
                              int zwrite, int prepared_color)
 {
     xgl_native_vertex_t *out;
+    xgl_color_vertex_t *plain;
     const byte *source;
     const xgl_vertex_t *vertex;
+    float *rgb;
     double packing_start;
-    int i, available, take;
-    if (!vertices || !triangle_state(count, lit, opacity, zwrite)) return;
+    int i, available, take, format;
+    /* Unlit triangles are packed without their normals. */
+    format = lit <= 0;
+    if (!vertices || !triangle_state(count, lit, opacity, zwrite, format)) return;
     if (stride < sizeof(*vertices)) Sys_Error("XGL_DrawTriangles: invalid vertex stride");
     source = (const byte *)vertices;
     while (count) {
         available = XGL_BATCH_TRIANGLES * 3 - xb.count;
         take = count < available ? count : available;
         packing_start = XGL_ProfileDetailNow();
-        for (i = 0; i < take; i += 3)
-            xb.lists[(xb.count + i) / 3].pts.color_normal_f3d =
-                (Xgl_pt_color_normal_f3d *)(xb.points + xb.count + i);
+        out = xb.points + xb.count;
+        plain = xb.color_points + xb.count;
         for (i = 0; i < take; ++i) {
             vertex = (const xgl_vertex_t *)source;
-            out = &xb.points[xb.count + i];
-            out->position[0] = vertex->position[0];
-            out->position[1] = vertex->position[1];
-            out->position[2] = vertex->position[2];
-            out->normal[0] = vertex->normal[0];
-            out->normal[1] = vertex->normal[1];
-            out->normal[2] = vertex->normal[2];
-            if (prepared_color) {
-                out->color.rgb[0] = vertex->color[0];
-                out->color.rgb[1] = vertex->color[1];
-                out->color.rgb[2] = vertex->color[2];
+            if (format) {
+                plain[i].position[0] = vertex->position[0];
+                plain[i].position[1] = vertex->position[1];
+                plain[i].position[2] = vertex->position[2];
+                rgb = plain[i].color.rgb;
             } else {
-                out->color.rgb[0] = gamma_color(vertex->color[0]);
-                out->color.rgb[1] = gamma_color(vertex->color[1]);
-                out->color.rgb[2] = gamma_color(vertex->color[2]);
+                out[i].position[0] = vertex->position[0];
+                out[i].position[1] = vertex->position[1];
+                out[i].position[2] = vertex->position[2];
+                out[i].normal[0] = vertex->normal[0];
+                out[i].normal[1] = vertex->normal[1];
+                out[i].normal[2] = vertex->normal[2];
+                rgb = out[i].color.rgb;
+            }
+            if (prepared_color) {
+                rgb[0] = vertex->color[0];
+                rgb[1] = vertex->color[1];
+                rgb[2] = vertex->color[2];
+            } else {
+                rgb[0] = gamma_color(vertex->color[0]);
+                rgb[1] = gamma_color(vertex->color[1]);
+                rgb[2] = gamma_color(vertex->color[2]);
             }
             source += stride;
         }
+        if (format) batch_triangles(plain, take, 1);
+        else batch_triangles(out, take, 0);
         XGL_ProfileAdd(XGL_PROFILE_VERTEX_PACK, packing_start);
         XGL_ProfileCount(XGL_PROFILE_VERTEX_PACKED, (unsigned long)take);
-        xb.count += take;
         count -= take;
         if (xb.count == XGL_BATCH_TRIANGLES * 3) XGL_Flush();
     }

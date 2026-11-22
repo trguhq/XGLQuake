@@ -65,14 +65,25 @@ static int smp_active, alias_prepasses, gamma_copies;
 static xgl_point_light_t test_lights[XGL_MAX_POINT_LIGHTS];
 static int test_light_count, used_lights, use_calls;
 static float test_ambient;
-static xgl_native_vertex_t captured[4096];
-static const xgl_native_vertex_t *queued[4096];
+/* Everything submitted, as records with normals. One that was submitted
+ * without a normal has a zero normal here and is flagged in captured_plain.
+ * A caller fills reserved records only after the mock has returned, so
+ * those without normals are copied in when the capture is next looked at. */
+static xgl_native_vertex_t captured_store[4096];
+static xgl_color_vertex_t reserved_plain[12];
+static byte captured_plain[4096];
+static int pending_first, pending_count;
+static xgl_native_vertex_t *settle_captured(void);
+#define captured (settle_captured())
+static const void *queued[4096];
+static size_t queued_size[4096];
 static xgl_native_vertex_t queued_copy[4096];
 static int queued_count, flush_calls, palette_calls, failed_sample;
 static int captured_count, captured_lit, captured_zwrite;
 static int captured_calls, varying_material, prepare_calls, filter_calls;
 /* 1: a dark disc in the middle of every texture repeat. 2: a dark left half.
- * 3: sixteen-texel blocks of unrelated shades. */
+ * 3: sixteen-texel blocks of unrelated shades. 4: one small dark square,
+ * away from every corner, edge middle and center of the test face. */
 static int pattern_material, box_calls;
 static unsigned int color_revision, texture_revision;
 static float gamma_scale;
@@ -141,7 +152,7 @@ void XGL_Flush(void)
     int i;
     ++flush_calls;
     for (i = 0; i < queued_count; ++i)
-        assert(!memcmp(queued[i], &queued_copy[i], sizeof(*queued[i])));
+        assert(!memcmp(queued[i], &queued_copy[i], queued_size[i]));
     queued_count = 0;
 }
 void Sys_Error(char *format, ...)
@@ -221,6 +232,8 @@ qboolean XGL_SampleTextureBox(int texture, float s, float t, float footprint, by
     x = s / 128 - (float)floor(s / 128) - .5f; y = t / 128 - (float)floor(t / 128) - .5f;
     if (pattern_material == 1) value = x * x + y * y < .1f ? .2f : .8f;
     else if (pattern_material == 2) value = x < 0 ? .2f : .8f;
+    else if (pattern_material == 4)
+        value = x >= -.375f && x < -.25f && y >= -.375f && y < -.25f ? .2f : .8f;
     else {
         i = ((int)floor(s / 16) * 73856093) ^ ((int)floor(t / 16) * 19349663);
         value = (float)((i >> 3) & 255) / 255;
@@ -229,33 +242,95 @@ qboolean XGL_SampleTextureBox(int texture, float s, float t, float footprint, by
     return true;
 }
 
+static xgl_native_vertex_t *settle_captured(void)
+{
+    xgl_native_vertex_t *out;
+    int i;
+    for (i = 0; i < pending_count; ++i) {
+        out = &captured_store[pending_first + i];
+        memset(out, 0, sizeof(*out));
+        VectorCopy(reserved_plain[i].position, out->position);
+        VectorCopy(reserved_plain[i].color.rgb, out->color.rgb);
+    }
+    pending_count = 0;
+    return captured_store;
+}
+
+/* How many of the captured vertices were submitted without a normal. */
+static int plain_count(void)
+{
+    int i, count;
+    for (i = count = 0; i < captured_count; ++i) count += captured_plain[i];
+    return count;
+}
+
 void XGL_DrawNativeTriangles(const xgl_native_vertex_t *vertices, int count,
                              int lit, float opacity, int zwrite)
 {
+    xgl_native_vertex_t *out;
     int i;
+    out = settle_captured();
     assert(count > 0 && count % 3 == 0 && captured_count + count <= 4096);
     assert(queued_count + count <= 4096);
     for (i = 0; i < count; ++i) {
         assert(fabs(DotProduct(vertices[i].normal, vertices[i].normal) - 1) < .0001);
-        captured[captured_count++] = vertices[i];
+        captured_plain[captured_count] = 0;
+        out[captured_count++] = vertices[i];
         queued[queued_count] = vertices + i;
-        queued_copy[queued_count++] = vertices[i];
+        queued_size[queued_count] = sizeof(vertices[i]);
+        memcpy(&queued_copy[queued_count++], vertices + i, sizeof(vertices[i]));
     }
     captured_lit = lit; captured_opacity = opacity; captured_zwrite = zwrite;
+    ++captured_calls;
+}
+
+void XGL_DrawColorTriangles(const xgl_color_vertex_t *vertices, int count,
+                            float opacity, int zwrite)
+{
+    xgl_native_vertex_t *out;
+    int i;
+    out = settle_captured();
+    assert(count > 0 && count % 3 == 0 && captured_count + count <= 4096);
+    assert(queued_count + count <= 4096);
+    for (i = 0; i < count; ++i) {
+        memset(&out[captured_count], 0, sizeof(out[0]));
+        VectorCopy(vertices[i].position, out[captured_count].position);
+        VectorCopy(vertices[i].color.rgb, out[captured_count].color.rgb);
+        captured_plain[captured_count++] = 1;
+        queued[queued_count] = vertices + i;
+        queued_size[queued_count] = sizeof(vertices[i]);
+        memcpy(&queued_copy[queued_count++], vertices + i, sizeof(vertices[i]));
+    }
+    captured_lit = 0; captured_opacity = opacity; captured_zwrite = zwrite;
     ++captured_calls;
 }
 
 xgl_native_vertex_t *XGL_ReserveTriangles(int *count, int lit, float opacity, int zwrite)
 {
     xgl_native_vertex_t *vertices;
+    vertices = settle_captured() + captured_count;
     assert(*count > 0 && *count % 3 == 0);
     if (*count > 12) *count = 12; /* Exercise callers handling partial space. */
     assert(captured_count + *count <= 4096);
-    vertices = captured + captured_count;
+    memset(captured_plain + captured_count, 0, (size_t)*count);
     captured_count += *count;
     captured_lit = lit; captured_opacity = opacity; captured_zwrite = zwrite;
     ++captured_calls;
     return vertices;
+}
+
+xgl_color_vertex_t *XGL_ReserveColorTriangles(int *count, float opacity, int zwrite)
+{
+    settle_captured();
+    assert(*count > 0 && *count % 3 == 0);
+    if (*count > 12) *count = 12;
+    assert(captured_count + *count <= 4096);
+    memset(captured_plain + captured_count, 1, (size_t)*count);
+    pending_first = captured_count; pending_count = *count;
+    captured_count += *count;
+    captured_lit = 0; captured_opacity = opacity; captured_zwrite = zwrite;
+    ++captured_calls;
+    return reserved_plain;
 }
 
 /* Four planes that either contain every box or exclude every box. */
@@ -369,6 +444,9 @@ static void setup_world(void)
     xgl_detailerror.value = 16;
     xgl_detailface.value = 192;
     xgl_detailedge.value = 16;
+    /* Most contracts give every face the same limit; sharing by apparent
+     * size has a test of its own. */
+    xgl_detaildensity.value = 0;
     pattern_material = box_calls = 0;
     /* Most contracts exercise on-demand building without a per-frame limit;
      * map-load building and the limit have tests of their own. */
@@ -843,7 +921,7 @@ static void test_adaptive_detail(void)
     }
     fine = mesh->count / 3;
     /* A larger tolerated error means fewer triangles; the cache is rebuilt. */
-    xgl_detailerror.value = 60;
+    xgl_detailerror.value = 100;
     begin_frame();
     mesh = &xgl_surfaces[0].detail;
     assert(mesh->vertices && mesh->count / 3 < fine);
@@ -901,6 +979,183 @@ static void test_adaptive_detail(void)
     assert(box_calls == i && xgl_surfaces[0].detail.count == fine);
     assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 0);
     memset(test_samples, 64, sizeof(test_samples));
+    XGL_WorldShutdown();
+}
+
+/* The same texture must be found on every wall, bright or dim, wherever its
+ * features fall between the wall's corners. */
+static void test_uniform_detail(void)
+{
+    xgl_surface_mesh_t *mesh;
+    int i, bright, dark, x, y;
+    float dx, dy;
+    /* A dark disc under even light, bright and then dim. Measured in final
+     * color the dim wall's contrast is a quarter of the bright one's; judged
+     * against its own light it is the same, and so is the mesh. */
+    setup_world();
+    xgl_subdivide.value = 256;
+    pattern_material = 1;
+    memset(test_samples, 128, sizeof(test_samples));
+    begin_frame();
+    mesh = &xgl_surfaces[0].detail;
+    assert(mesh->vertices);
+    bright = mesh->count;
+    setup_world();
+    xgl_subdivide.value = 256;
+    pattern_material = 1;
+    memset(test_samples, 32, sizeof(test_samples));
+    begin_frame();
+    mesh = &xgl_surfaces[0].detail;
+    assert(mesh->vertices && mesh->count == bright);
+    check_mesh(mesh, 0, 128, 128);
+    /* Even near black it is still found: differences are never judged
+     * against less than a quarter of full light. */
+    setup_world();
+    xgl_subdivide.value = 256;
+    pattern_material = 1;
+    memset(test_samples, 6, sizeof(test_samples));
+    begin_frame();
+    assert(xgl_surfaces[0].detail.vertices);
+    /* Under a hard shadow, both the lit and the shadowed half show it. */
+    setup_world();
+    xgl_subdivide.value = 256;
+    pattern_material = 1;
+    for (y = 0; y < 9; ++y) for (x = 0; x < 9; ++x) test_samples[y * 9 + x] = y < 4 ? 20 : 128;
+    begin_frame();
+    mesh = &xgl_surfaces[0].detail;
+    assert(mesh->vertices);
+    check_mesh(mesh, 0, 128, 128);
+    bright = dark = 0;
+    for (i = 0; i < mesh->count; i += 3) {
+        dx = (mesh->vertices[i].position[0] + mesh->vertices[i+1].position[0] +
+              mesh->vertices[i+2].position[0]) / 3 - 64;
+        dy = (mesh->vertices[i].position[1] + mesh->vertices[i+1].position[1] +
+              mesh->vertices[i+2].position[1]) / 3 - 64;
+        if (dx * dx + dy * dy > 30 * 30 && dx * dx + dy * dy < 52 * 52) {
+            if (dy < -10) ++dark;
+            if (dy > 10) ++bright;
+        }
+    }
+    assert(dark >= 6 && bright >= 6 && dark * 2 > bright && bright * 2 > dark);
+    memset(test_samples, 64, sizeof(test_samples));
+
+    /* One small dark square that lies on no corner, edge middle, quarter
+     * point or center of the face. Walking the edges and the insides of the
+     * large triangles finds it, and further splits close in on it. */
+    setup_world();
+    xgl_subdivide.value = 256;
+    pattern_material = 4;
+    begin_frame();
+    mesh = &xgl_surfaces[0].detail;
+    assert(mesh->vertices);
+    check_mesh(mesh, 0, 128, 128);
+    assert(fabs(mesh_area(mesh) - 128 * 128) < .01);
+    dark = bright = 0;
+    for (i = 0; i < mesh->count; ++i) {
+        dx = mesh->vertices[i].position[0]; dy = mesh->vertices[i].position[1];
+        /* The square covers 16..32 in both directions. */
+        if (dx > 16 && dx < 32 && dy > 16 && dy < 32) {
+            assert(mesh->vertices[i].color.rgb[0] < .2f);
+            ++dark;
+        }
+        if (dx > 64 || dy > 64) {
+            assert(mesh->vertices[i].color.rgb[0] > .35f);
+            ++bright;
+        }
+    }
+    assert(dark > 0 && bright > 0);
+    /* The far half of the face has nothing to show and stays coarse. */
+    dark = bright = 0;
+    for (i = 0; i < mesh->count; i += 3) {
+        dx = (mesh->vertices[i].position[0] + mesh->vertices[i+1].position[0] +
+              mesh->vertices[i+2].position[0]) / 3;
+        dy = (mesh->vertices[i].position[1] + mesh->vertices[i+1].position[1] +
+              mesh->vertices[i+2].position[1]) / 3;
+        if (dx < 56 && dy < 56) ++dark; else ++bright;
+    }
+    assert(dark > bright);
+    XGL_WorldShutdown();
+}
+
+/* With a density, a face may have triangles in proportion to its apparent
+ * size, so that the frame's allowance reaches every wall in range. */
+static void test_detail_by_apparent_size(void)
+{
+    const xgl_color_vertex_t *first;
+    int count, builds;
+    setup_world();
+    xgl_subdivide.value = 256;
+    xgl_detaildistance.value = 2000;
+    xgl_detaildensity.value = 160;
+    pattern_material = 3; /* Busy enough to use any number of triangles. */
+    XGL_WorldNewMap();
+    /* 400 units above the middle of the 128-unit face: 16 triangles' worth,
+     * built with half as many again in hand. */
+    r_origin[2] = 400;
+    begin_frame();
+    assert(XGL_DetailWant(xgl_surfaces[0].area, 400.0f * 400) == 16);
+    assert(xgl_surfaces[0].detail.vertices && xgl_surfaces[0].detail_limit == 24);
+    count = xgl_surfaces[0].detail.count / 3;
+    assert(count > 16 && count <= 24 && captured_count == count * 3);
+    check_mesh(&xgl_surfaces[0].detail, 0, 128, 128);
+    first = xgl_surfaces[0].detail.vertices;
+    /* A little closer: the mesh it has will do. */
+    r_origin[2] = 300;
+    begin_frame();
+    assert(xgl_surfaces[0].detail.vertices == first);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 0);
+    /* Close enough to double it: built again, larger, in one go. */
+    r_origin[2] = 200;
+    begin_frame();
+    assert(XGL_DetailWant(xgl_surfaces[0].area, 200.0f * 200) == 65);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 1);
+    assert(xgl_surfaces[0].detail_limit == 97);
+    assert(xgl_surfaces[0].detail.count / 3 > count * 2 && xgl_surfaces[0].detail.count / 3 <= 97);
+    assert(captured_count == xgl_surfaces[0].detail.count);
+    check_mesh(&xgl_surfaces[0].detail, 0, 128, 128);
+    /* Next to it: the most one face may have. */
+    r_origin[2] = 40;
+    begin_frame();
+    assert(XGL_DetailWant(xgl_surfaces[0].area, 40.0f * 40) == 192);
+    assert(xgl_surfaces[0].detail.count / 3 > 97 && xgl_surfaces[0].detail.count / 3 <= 192);
+    builds = xgl_surfaces[0].detail.count;
+    first = xgl_surfaces[0].detail.vertices;
+    /* Walking away again keeps the finer mesh; nothing is rebuilt. */
+    r_origin[2] = 400;
+    begin_frame();
+    assert(xgl_surfaces[0].detail.vertices == first && captured_count == builds);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 0);
+    /* Too small on screen to be worth any detail: the coarse mesh, and no
+     * build is attempted. */
+    setup_world();
+    xgl_subdivide.value = 256;
+    xgl_detaildistance.value = 2000;
+    xgl_detaildensity.value = 160;
+    pattern_material = 3;
+    XGL_WorldNewMap();
+    r_origin[2] = 700;
+    begin_frame();
+    assert(XGL_DetailWant(xgl_surfaces[0].area, 700.0f * 700) < XGL_DETAIL_WANT_MIN);
+    assert(captured_count == 6 && !xgl_surfaces[0].detail_attempted);
+    /* A face that shows all it has within its limit is complete and is not
+     * built again however close the viewer comes. */
+    setup_world();
+    xgl_subdivide.value = 256;
+    xgl_detaildistance.value = 2000;
+    xgl_detaildensity.value = 160;
+    pattern_material = 4; /* One small square. */
+    XGL_WorldNewMap();
+    r_origin[2] = 110;
+    begin_frame();
+    assert(xgl_surfaces[0].detail.vertices && !xgl_surfaces[0].detail_limit);
+    first = xgl_surfaces[0].detail.vertices;
+    r_origin[2] = 30;
+    begin_frame();
+    assert(xgl_surfaces[0].detail.vertices == first);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 0);
+    /* No density: every face may have the per-face limit at any distance. */
+    xgl_detaildensity.value = 0;
+    assert(XGL_DetailWant(100, 1e9f) == 192);
     XGL_WorldShutdown();
 }
 
@@ -1230,22 +1485,25 @@ static void test_unlit_without_dynamic_light(void)
     entity.model = &test_model;
     captured_count = 0;
     XGL_DrawBrushModel(&entity);
-    assert(captured_count == 6 && captured_lit == 0);
+    /* Unlit geometry carries no normals, whichever way it is submitted. */
+    assert(captured_count == 6 && captured_lit == 0 && plain_count() == 6);
     test_light_count = 1;
     begin_frame();
     captured_count = 0;
     XGL_DrawBrushModel(&entity);
-    assert(captured_count == 6 && captured_lit == 1);
+    assert(captured_count == 6 && captured_lit == 1 && plain_count() == 0);
+    assert(captured[0].normal[2] == 1);
     /* The streamed fallback follows the same rule. */
     setup_world();
     xgl_cache_bytes = XGL_WORLD_CACHE_BYTES;
     test_light_count = 0;
     begin_frame();
-    assert(captured_count == 6 && captured_lit == 0);
+    assert(captured_count == 6 && captured_lit == 0 && plain_count() == 6);
     assert(profile_counts[XGL_PROFILE_WORLD_FALLBACK_SURFACES] == 1);
     test_light_count = 1;
     begin_frame();
-    assert(captured_count == 6 && captured_lit == 1);
+    assert(captured_count == 6 && captured_lit == 1 && plain_count() == 0);
+    assert(captured[0].normal[2] == 1);
 }
 
 /* Walls and brush entities are illuminated only where a dynamic light can
@@ -1450,9 +1708,12 @@ static void test_detail_build_limit(void)
     assert(profile_counts[XGL_PROFILE_WORLD_MESH_FAILURES] == 0);
     assert(xgl_surfaces[0].detail_attempted + xgl_surfaces[1].detail_attempted == 1);
     assert(!xgl_surfaces[0].detail.vertices && !xgl_surfaces[1].detail.vertices);
-    coarse_bytes = (6 * (sizeof(xgl_native_vertex_t) + sizeof(unsigned short)) +
+    coarse_bytes = (6 * (sizeof(xgl_color_vertex_t) + sizeof(unsigned short)) +
                     4 * sizeof(xgl_cached_vertex_t) + 7) & ~(size_t)7;
-    assert(xgl_cache_bytes == 2 * (sizeof(*xgl_surfaces) + 3 * sizeof(int)) + 2 * coarse_bytes);
+    /* The test's light reaches both faces: each has an illuminated copy. */
+    assert(xgl_surfaces[0].coarse.lit && xgl_surfaces[1].coarse.lit);
+    assert(xgl_cache_bytes == 2 * (sizeof(*xgl_surfaces) + 3 * sizeof(int)) + 2 * coarse_bytes +
+                              2 * 6 * sizeof(xgl_native_vertex_t));
     begin_frame();
     assert(xgl_surfaces[0].detail_attempted && xgl_surfaces[1].detail_attempted);
     begin_frame();
@@ -1513,14 +1774,16 @@ static void test_detail_hysteresis(void)
 static void test_detail_eviction(void)
 {
     size_t detail_bytes, full;
-    detail_bytes = (192 * (sizeof(xgl_native_vertex_t) + sizeof(unsigned short)) +
+    detail_bytes = (192 * (sizeof(xgl_color_vertex_t) + sizeof(unsigned short)) +
                     41 * sizeof(xgl_cached_vertex_t) + 7) & ~(size_t)7;
     setup_pair(0, 128, 1024, 128);
+    test_light_count = 0; /* Illuminated copies have a test of their own. */
     xgl_detaildistance.value = 200; /* Only the face near the viewer. */
     r_origin[0] = 64;
     begin_frame();
     assert(xgl_surfaces[0].detail.vertices && !xgl_surfaces[1].detail.vertices);
     assert(xgl_surfaces[0].detail.bytes == detail_bytes);
+    assert(!xgl_surfaces[0].detail.lit && plain_count() == captured_count);
     /* Pretend the rest of the 8 MiB is in use, then walk to the other face.
      * In the next frame the first detail mesh is still too recent to free:
      * the new build is refused and counted, and the face stays coarse. */
@@ -1594,6 +1857,128 @@ static void test_state_order_and_clip_flags(void)
     box_tests = 0;
     XGL_DrawWorld();
     assert(captured_count == 0 && box_tests <= 4);
+}
+
+/* Walls are stored and drawn without normals. One that a dynamic light
+ * reaches is drawn from a second copy that has them, made when first
+ * needed and given up again when memory is short and no light has come. */
+static void test_illuminated_copies(void)
+{
+    xgl_surface_mesh_t *mesh;
+    size_t before, lit_bytes, full, detail_bytes;
+    float color;
+    int i, retry;
+    setup_world();
+    xgl_detailtris.value = 0; /* The two-triangle coarse mesh. */
+    test_light_count = 0;
+    begin_frame();
+    mesh = &xgl_surfaces[0].coarse;
+    /* No light: the stored vertices themselves are lent, without normals. */
+    assert(captured_count == 6 && captured_lit == 0 && plain_count() == 6);
+    assert(queued_count == 6 && queued[0] == (const void *)mesh->vertices);
+    assert(queued_size[0] == sizeof(xgl_color_vertex_t));
+    assert(!mesh->lit && !mesh->lit_bytes);
+    before = xgl_cache_bytes;
+    /* A light arrives: a copy with the face's normal is made and lent. */
+    test_light_count = 1;
+    begin_frame();
+    lit_bytes = 6 * sizeof(xgl_native_vertex_t);
+    assert(captured_count == 6 && captured_lit == 1 && plain_count() == 0);
+    assert(mesh->lit && mesh->lit_bytes == lit_bytes && xgl_cache_bytes == before + lit_bytes);
+    assert(queued_count == 6 && queued[0] == (const void *)mesh->lit);
+    assert(queued_size[0] == sizeof(xgl_native_vertex_t));
+    for (i = 0; i < 6; ++i) {
+        assert(captured[i].normal[0] == 0 && captured[i].normal[1] == 0 && captured[i].normal[2] == 1);
+        assert(!memcmp(captured[i].position, mesh->vertices[i].position, sizeof(vec3_t)));
+        assert(!memcmp(captured[i].color.rgb, mesh->vertices[i].color.rgb, sizeof(vec3_t)));
+    }
+    color = captured[0].color.rgb[0];
+    /* It is kept from frame to frame... */
+    begin_frame();
+    assert(xgl_cache_bytes == before + lit_bytes && queued[0] == (const void *)mesh->lit);
+    /* ...and follows the wall's colors. Here a light style dims while the
+     * light is away; the copy is brought up to date when the light returns. */
+    test_light_count = 0;
+    d_lightstylevalue[0] = 128;
+    begin_frame();
+    assert(plain_count() == 6 && fabs(captured[0].color.rgb[0] - color * .5f) < .0001);
+    assert(mesh->lit && !mesh->lit_current);
+    test_light_count = 1;
+    begin_frame();
+    assert(plain_count() == 0 && mesh->lit_current);
+    assert(fabs(captured[0].color.rgb[0] - color * .5f) < .0001);
+    /* While the wall is illuminated a style change reaches both. */
+    d_lightstylevalue[0] = 256;
+    begin_frame();
+    assert(plain_count() == 0 && fabs(captured[0].color.rgb[0] - color) < .0001);
+    assert(fabs(mesh->vertices[0].color.rgb[0] - color) < .0001);
+    /* A copy drawn in this frame is still lent out: nothing may free it. */
+    full = xgl_cache_bytes;
+    xgl_cache_bytes = XGL_WORLD_CACHE_BYTES;
+    XGL_EvictDetail(1 << 20);
+    assert(mesh->lit && xgl_cache_bytes == XGL_WORLD_CACHE_BYTES);
+    /* Long after the light has gone, the copy is the first thing to go. */
+    test_light_count = 0;
+    begin_frame();
+    r_framecount += 120;
+    XGL_EvictDetail(16);
+    assert(!mesh->lit && !mesh->lit_bytes);
+    assert(xgl_cache_bytes == XGL_WORLD_CACHE_BYTES - lit_bytes);
+    xgl_cache_bytes = full - lit_bytes;
+    XGL_WorldShutdown();
+    assert(!xgl_cache_bytes);
+
+    /* A face seen from behind its plane is lit on that side. */
+    setup_world();
+    xgl_detailtris.value = 0;
+    test_surface.flags = SURF_PLANEBACK;
+    /* Such a face belongs to the leaf on that side; so do the viewer and
+     * the light. */
+    test_leaves[1].nummarksurfaces = 0;
+    test_leaves[2].firstmarksurface = test_marks;
+    test_leaves[2].nummarksurfaces = 1;
+    r_viewleaf = &test_leaves[2];
+    test_vis = 3;
+    r_origin[2] = -32; test_lights[0].origin[2] = -32;
+    begin_frame();
+    assert(captured_count == 6 && captured_lit == 1 && plain_count() == 0);
+    for (i = 0; i < 6; ++i) assert(captured[i].normal[2] == -1);
+    XGL_WorldShutdown();
+
+    /* Without room for a copy the wall is illuminated all the same: its
+     * vertices are copied out with the normal, frame by frame, and the full
+     * cache is not searched for room again until some time has passed. */
+    setup_world();
+    test_light_count = 0;
+    begin_frame(); /* Builds the detail mesh; the coarse one is idle. */
+    assert(xgl_surfaces[0].detail.vertices && captured_count == 192);
+    detail_bytes = xgl_surfaces[0].detail.bytes;
+    xgl_detailtris.value = 0; /* From here on the coarse mesh is drawn. */
+    mesh = &xgl_surfaces[0].coarse;
+    full = xgl_cache_bytes;
+    xgl_cache_bytes = XGL_WORLD_CACHE_BYTES;
+    test_light_count = 1;
+    begin_frame();
+    /* The idle detail mesh is too recent to give up. */
+    assert(captured_count == 6 && captured_lit == 1 && plain_count() == 0 && !queued_count);
+    for (i = 0; i < 6; ++i) assert(captured[i].normal[2] == 1);
+    assert(!mesh->lit && xgl_surfaces[0].detail.vertices);
+    assert(profile_counts[XGL_PROFILE_WORLD_EVICTIONS] == 0);
+    retry = xgl_lit_retry;
+    assert(retry == r_framecount + XGL_DETAIL_RETRY_FRAMES);
+    r_framecount += 8;
+    begin_frame(); /* It is old enough now, but it is not yet time to look. */
+    assert(!mesh->lit && xgl_surfaces[0].detail.vertices && !queued_count);
+    assert(xgl_lit_retry == retry && captured_lit == 1);
+    r_framecount = retry - 1;
+    begin_frame();
+    assert(profile_counts[XGL_PROFILE_WORLD_EVICTIONS] == 1);
+    assert(mesh->lit && !xgl_surfaces[0].detail.vertices && queued_count == 6);
+    assert(xgl_cache_bytes == XGL_WORLD_CACHE_BYTES - detail_bytes + 6 * sizeof(xgl_native_vertex_t));
+    xgl_cache_bytes = full - detail_bytes + 6 * sizeof(xgl_native_vertex_t);
+    /* With room, no search is needed and none is waited for. */
+    XGL_WorldShutdown();
+    assert(!xgl_cache_bytes);
 }
 
 static void test_brush_entity_basis_and_external_cache(void)
@@ -1685,6 +2070,8 @@ int main(void)
 {
     test_adaptive_detail();
     test_zigzag_base();
+    test_uniform_detail();
+    test_detail_by_apparent_size();
     test_refinement_stress();
     test_grid_meshes_and_ripples();
     test_borrowed_mesh_lifetime();
@@ -1696,6 +2083,7 @@ int main(void)
     test_animated_water_and_sky();
     test_unlit_without_dynamic_light();
     test_dynamic_light_range();
+    test_illuminated_copies();
     test_map_load_prebuild();
     test_detail_build_limit();
     test_detail_hysteresis();

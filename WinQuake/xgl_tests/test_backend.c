@@ -34,6 +34,8 @@ static Xgl_color text_color, polygon_color;
 static Xgl_pt_color_normal_f3d submitted_vertex;
 static Xgl_pt_color_normal_f3d submitted_vertices[8192];
 static const void *submitted_sources[8192 / 3];
+/* Points submitted without normals are recorded with a zero normal. */
+static byte submitted_plain[8192];
 static int submitted_count;
 static Xgl_color recorded_quad_colors[1024];
 static Xgl_pt_f2d recorded_quad_points[1024][4];
@@ -231,7 +233,29 @@ void xgl_multi_simple_polygon(Xgl_ctx context, Xgl_facet_flags flags,
     assert(!box && count > 0);
     assert(context == xb.scene || context == xb.ui);
     ++polygon_calls;
-    if (lists[0].pt_type == XGL_PT_COLOR_NORMAL_F3D) {
+    if (lists[0].pt_type == XGL_PT_COLOR_F3D) {
+        Xgl_pt_color_f3d point;
+        assert(lists[0].num_pts == 3 && !facets);
+        /* Illumination needs normals: these are only ever drawn unlit. */
+        assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+        native_event('G');
+        for (i = 0; i < count; ++i) {
+            /* One call holds points of one kind. */
+            assert(lists[i].pt_type == XGL_PT_COLOR_F3D && lists[i].num_pts == 3);
+            assert(submitted_count + 3 <= (int)(sizeof(submitted_vertices) / sizeof(submitted_vertices[0])));
+            submitted_sources[submitted_count / 3] = lists[i].pts.color_f3d;
+            for (j = 0; j < 3; ++j) {
+                memcpy(&point, (const byte *)lists[i].pts.color_f3d + j * sizeof(point), sizeof(point));
+                memset(&submitted_vertices[submitted_count], 0, sizeof(submitted_vertices[0]));
+                submitted_vertices[submitted_count].x = point.x;
+                submitted_vertices[submitted_count].y = point.y;
+                submitted_vertices[submitted_count].z = point.z;
+                submitted_vertices[submitted_count].color = point.color;
+                if (!i && !j) submitted_vertex = submitted_vertices[submitted_count];
+                submitted_plain[submitted_count++] = 1;
+            }
+        }
+    } else if (lists[0].pt_type == XGL_PT_COLOR_NORMAL_F3D) {
         assert(lists[0].num_pts == 3 && !facets);
         native_event('G');
         /* The renderer owns an SDK-layout-compatible record. Read its bytes
@@ -246,7 +270,7 @@ void xgl_multi_simple_polygon(Xgl_ctx context, Xgl_facet_flags flags,
                 memcpy(&submitted_vertices[submitted_count],
                        (const byte *)lists[i].pts.color_normal_f3d + j * sizeof(submitted_vertex),
                        sizeof(submitted_vertex));
-                ++submitted_count;
+                submitted_plain[submitted_count++] = 0;
             }
         }
     } else {
@@ -893,6 +917,128 @@ static void test_native_batches(void)
     assert(!xb.count && polygon_calls == 2);
 }
 
+static void fill_color_vertices(xgl_color_vertex_t *vertices, int count, int first)
+{
+    int i;
+    for (i = 0; i < count; ++i) {
+        vertices[i].position[0] = (float)(first + i);
+        vertices[i].position[1] = .25f;
+        vertices[i].position[2] = .5f;
+        vertices[i].color.rgb[0] = .2f;
+        vertices[i].color.rgb[1] = .4f;
+        vertices[i].color.rgb[2] = .6f;
+    }
+}
+
+/* Unlit geometry is submitted as points without normals. A polygon call
+ * holds points of one kind, so the two kinds never share a batch. */
+static void test_color_batches(void)
+{
+    static xgl_color_vertex_t cached[XGL_BATCH_TRIANGLES * 3 + 3];
+    xgl_color_vertex_t *reserved;
+    xgl_native_vertex_t normals[3], *lit;
+    xgl_vertex_t raw[3];
+    unsigned long changes;
+    int i, count, total;
+    reset_backend();
+    /* Without a scene nothing is lent, reserved or drawn. */
+    fill_color_vertices(cached, XGL_BATCH_TRIANGLES * 3 + 3, 0);
+    count = 3;
+    assert(!XGL_ReserveColorTriangles(&count, 1, 1) && count == 0);
+    XGL_DrawColorTriangles(cached, 3, 1, 1);
+    assert(!xb.count);
+    XGL_BeginScene();
+    XGL_DrawColorTriangles(cached, 6, 1, 1);
+    assert(xb.count == 6 && !polygon_calls);
+    assert(xb.lists[0].pt_type == XGL_PT_COLOR_F3D && xb.lists[0].num_pts == 3);
+    assert((const void *)xb.lists[0].pts.color_f3d == cached);
+    assert((const void *)xb.lists[1].pts.color_f3d == cached + 3);
+    /* Borrowed and reserved records of the same kind share a batch. */
+    count = XGL_BATCH_TRIANGLES * 3;
+    reserved = XGL_ReserveColorTriangles(&count, 1, 1);
+    assert(reserved == xb.color_points + 6 && count == XGL_BATCH_TRIANGLES * 3 - 6);
+    fill_color_vertices(reserved, count, 6);
+    assert(!polygon_calls);
+    XGL_Flush();
+    assert(submitted_count == XGL_BATCH_TRIANGLES * 3 && polygon_calls == 1);
+    assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+    assert(submitted_sources[0] == cached && submitted_sources[2] == xb.color_points + 6);
+    for (i = 0; i < submitted_count; ++i) {
+        assert(submitted_plain[i] && submitted_vertices[i].x == (float)i);
+        assert(submitted_vertices[i].y == .25f && submitted_vertices[i].z == .5f);
+        assert(submitted_vertices[i].color.rgb.r == .2f && submitted_vertices[i].color.rgb.g == .4f);
+        assert(submitted_vertices[i].color.rgb.b == .6f);
+    }
+    assert(profile_counts[XGL_PROFILE_NATIVE_CACHED_VERTICES] == 6);
+    assert(profile_counts[XGL_PROFILE_NATIVE_DIRECT_VERTICES] == (unsigned long)count);
+
+    /* More than a batch is split; the remainder waits for the next flush. */
+    reset_backend(); XGL_BeginScene();
+    XGL_DrawColorTriangles(cached, XGL_BATCH_TRIANGLES * 3 + 3, 1, 1);
+    assert(polygon_calls == 1 && xb.count == 3);
+    /* Unlit triangles through the general entry points are packed the same
+     * way and join that batch. */
+    memset(raw, 0, sizeof(raw));
+    for (i = 0; i < 3; ++i) {
+        raw[i].position[0] = 771.0f + i; raw[i].normal[2] = 1; raw[i].color[0] = 1;
+    }
+    XGL_DrawTriangles(raw, 3, 0, 1, 1);
+    assert(xb.count == 6 && polygon_calls == 1);
+    assert((const void *)xb.lists[1].pts.color_f3d == xb.color_points + 3);
+    XGL_Flush();
+    total = XGL_BATCH_TRIANGLES * 3 + 6;
+    assert(submitted_count == total && polygon_calls == 2);
+    for (i = 0; i < total; ++i) assert(submitted_plain[i] && submitted_vertices[i].x == (float)i);
+    assert(profile_counts[XGL_PROFILE_VERTEX_PACKED] == 3);
+
+    /* A change of kind ends the batch even when the drawing state is the
+     * same, and is not a state change. */
+    reset_backend(); XGL_BeginScene();
+    XGL_DrawColorTriangles(cached, 3, 1, 1);
+    XGL_Flush();
+    changes = profile_counts[XGL_PROFILE_STATE_CHANGES];
+    XGL_DrawColorTriangles(cached, 3, 1, 1);
+    count = 3;
+    lit = XGL_ReserveTriangles(&count, 0, 1, 1);
+    assert(lit == xb.points && count == 3 && polygon_calls == 2 && xb.count == 3);
+    assert(xb.lists[0].pt_type == XGL_PT_COLOR_NORMAL_F3D);
+    fill_native_vertices(lit, 3, 3);
+    XGL_DrawColorTriangles(cached + 6, 3, 1, 1);
+    assert(polygon_calls == 3 && xb.count == 3 && xb.lists[0].pt_type == XGL_PT_COLOR_F3D);
+    XGL_Flush();
+    assert(polygon_calls == 4 && submitted_count == 12);
+    assert(submitted_plain[0] && submitted_plain[3] && !submitted_plain[6] && submitted_plain[9]);
+    assert(submitted_vertices[6].normal.z == 1 && submitted_vertices[9].x == 6);
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == changes);
+
+    /* Illuminated triangles keep their normals; the unlit ones that follow
+     * drop them, with the one state change between. */
+    reset_backend(); XGL_BeginScene();
+    fill_native_vertices(normals, 3, 0);
+    XGL_DrawNativeTriangles(normals, 3, 1, 1, 1);
+    XGL_DrawTrianglesStrided(raw, 3, sizeof(raw[0]), 1, 1, 1, 1);
+    assert(!polygon_calls && xb.count == 6);
+    XGL_DrawColorTriangles(cached, 3, 1, 1);
+    assert(polygon_calls == 1 && submitted_count == 6 && illumination == XGL_ILLUM_PER_VERTEX);
+    assert(!submitted_plain[0] && !submitted_plain[3]);
+    XGL_DrawTrianglesStrided(raw, 3, sizeof(raw[0]), 0, 1, 1, 1);
+    XGL_Flush();
+    assert(polygon_calls == 2 && submitted_count == 12);
+    assert(submitted_plain[6] && submitted_plain[9]);
+    assert(submitted_vertices[9].x == 771 && submitted_vertices[9].color.rgb.r == 1);
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 2);
+
+    /* Blended, depth-preserving use (water) and invisible geometry. */
+    reset_backend(); XGL_BeginScene();
+    XGL_DrawColorTriangles(cached, 3, .5f, 0);
+    XGL_Flush();
+    assert(polygon_calls == 1 && transparency == XGL_TRANSP_BLENDED && freeze_z && !write_mask);
+    XGL_DrawColorTriangles(cached, 3, 0, 1);
+    count = 3;
+    assert(!XGL_ReserveColorTriangles(&count, 0, 1) && !count);
+    assert(!xb.count && polygon_calls == 1);
+}
+
 static void test_prepared_palette(void)
 {
     float expected[3], actual[3];
@@ -1306,6 +1452,7 @@ int main(void)
     test_text_runs();
     test_strided_prepared_colors();
     test_native_batches();
+    test_color_batches();
     test_prepared_palette();
     test_ui_batch_order_and_capacity();
     test_completion_and_attribute_reuse();

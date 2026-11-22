@@ -9,9 +9,10 @@ float v_blend[4];
 refdef_t r_refdef;
 
 #define TEST_BATCH_VERTICES 6
-static xgl_native_vertex_t batch[TEST_BATCH_VERTICES + 2];
-static xgl_native_vertex_t expected[TEST_BATCH_VERTICES];
-static byte guard[sizeof(xgl_native_vertex_t)];
+/* Particles are unlit: their records carry a position and a color only. */
+static xgl_color_vertex_t batch[TEST_BATCH_VERTICES + 2];
+static xgl_color_vertex_t expected[TEST_BATCH_VERTICES];
+static byte guard[sizeof(xgl_color_vertex_t)];
 static int used, active, reserve_calls, palette_calls, flush_calls, emitted;
 
 static void close_float(float actual, float wanted)
@@ -28,18 +29,16 @@ static void check_batch(void)
     for (i = 0; i < used; ++i) {
         for (j = 0; j < 3; ++j) {
             close_float(batch[i + 1].position[j], expected[i].position[j]);
-            close_float(batch[i + 1].normal[j], expected[i].normal[j]);
             close_float(batch[i + 1].color.rgb[j], expected[i].color.rgb[j]);
         }
     }
 }
 
-xgl_native_vertex_t *XGL_ReserveTriangles(int *count, int lit,
-                                         float opacity, int zwrite)
+xgl_color_vertex_t *XGL_ReserveColorTriangles(int *count, float opacity, int zwrite)
 {
-    xgl_native_vertex_t *result;
+    xgl_color_vertex_t *result;
     ++reserve_calls;
-    assert(*count == 3 && lit == 0 && opacity == 1 && zwrite == 1);
+    assert(*count == 3 && opacity == 1 && zwrite == 1);
     check_batch(); /* Previous reservations must already contain final data. */
     if (!active) {
         *count = 0;
@@ -76,7 +75,7 @@ void XGL_UIFillRGB(float x, float y, float width, float height,
 /* Reference the previous generic triangle plus backend gamma conversion.
  * Compute it before drawing, then compare the reserved native records. */
 static void reference_particle(const particle_t *particle,
-                                xgl_native_vertex_t vertices[3])
+                                xgl_color_vertex_t vertices[3])
 {
     float distance, scale, raw;
     int i, j, color, index;
@@ -88,7 +87,6 @@ static void reference_particle(const particle_t *particle,
     for (i = 0; i < 3; ++i) {
         for (j = 0; j < 3; ++j) {
             vertices[i].position[j] = particle->org[j];
-            vertices[i].normal[j] = vpn[j];
             raw = xgl_palette[color * 3 + j] / 255.0f;
             index = (int)(raw * 255.0f + .5f);
             vertices[i].color.rgb[j] = gammatable[index] / 255.0f;
@@ -102,7 +100,7 @@ static void reference_particle(const particle_t *particle,
 
 static void draw_and_check(particle_t *particle)
 {
-    xgl_native_vertex_t reference[3];
+    xgl_color_vertex_t reference[3];
     particle_t before;
     int slot, palettes, reserves;
     before = *particle;
@@ -119,7 +117,7 @@ static void draw_and_check(particle_t *particle)
 int main(void)
 {
     particle_t particle;
-    xgl_native_vertex_t snapshot[TEST_BATCH_VERTICES + 2];
+    xgl_color_vertex_t snapshot[TEST_BATCH_VERTICES + 2];
     float distances[5] = {4, 10, 19, 20, 200};
     float hidden[3] = {-10, 0, 3.99f};
     int i, palettes, draws, reserves;
@@ -179,6 +177,6 @@ int main(void)
     XGL_DrawParticle(&particle);
     assert(palette_calls == palettes && !memcmp(snapshot, batch, sizeof(batch)));
     check_batch();
-    puts("XGL particle contracts passed (native output, palette/gamma, batching and input preservation)");
+    puts("XGL particle contracts passed (color-only output, palette/gamma, batching and input preservation)");
     return 0;
 }

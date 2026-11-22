@@ -103,6 +103,21 @@ xgl_native_vertex_t *XGL_ReserveTriangles(int *count, int lit,
     return reserved;
 }
 
+/* These contracts use native illumination, which keeps its normals; the
+ * records without them are covered by the entity tests. */
+xgl_color_vertex_t *XGL_ReserveColorTriangles(int *count, float opacity, int zwrite)
+{
+    (void)count; (void)opacity; (void)zwrite;
+    abort();
+}
+
+void XGL_DrawColorTriangles(const xgl_color_vertex_t *vertices, int count,
+                            float opacity, int zwrite)
+{
+    (void)vertices; (void)count; (void)opacity; (void)zwrite;
+    abort();
+}
+
 static void reset_output(void)
 {
     assert(!reserved_count);

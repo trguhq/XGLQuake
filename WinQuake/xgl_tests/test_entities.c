@@ -33,6 +33,11 @@ static float test_ambient;
 static byte material_pixels[16 * 16];
 static xgl_native_vertex_t reserved_vertices[XGL_ENTITY_BATCH_VERTICES];
 static int reserved_count, reserved_lit, reserve_calls, prepare_calls;
+/* Records submitted without normals are captured with a zero normal and
+ * flagged; plain_capture marks the capture in progress as such. */
+static xgl_color_vertex_t reserved_plain[XGL_ENTITY_BATCH_VERTICES];
+static byte captured_plain[4096];
+static int reserved_plain_count, plain_capture, plain_submissions;
 static int reserve_limit = XGL_ENTITY_BATCH_VERTICES;
 static void capture_reserved(void);
 static unsigned long profile_counts[XGL_PROFILE_COUNTER_COUNT];
@@ -221,7 +226,9 @@ void XGL_DrawTriangles(const xgl_vertex_t *vertices, int count, int lit,
     }
     ++draw_calls;
     for (i = 0; i < count; ++i) {
-        assert(fabs(DotProduct(vertices[i].normal, vertices[i].normal) - 1) < .0001);
+        if (plain_capture) assert(!lit && !DotProduct(vertices[i].normal, vertices[i].normal));
+        else assert(fabs(DotProduct(vertices[i].normal, vertices[i].normal) - 1) < .0001);
+        captured_plain[captured_count] = (byte)plain_capture;
         captured[captured_count++] = vertices[i];
     }
 }
@@ -237,6 +244,20 @@ static void capture_reserved(void)
 {
     xgl_vertex_t vertices[XGL_ENTITY_BATCH_VERTICES];
     int i, count;
+    count = reserved_plain_count;
+    if (count) {
+        assert(!reserved_count);
+        reserved_plain_count = 0;
+        memset(vertices, 0, sizeof(vertices));
+        for (i = 0; i < count; ++i) {
+            VectorCopy(reserved_plain[i].position, vertices[i].position);
+            VectorCopy(reserved_plain[i].color.rgb, vertices[i].color);
+        }
+        plain_capture = 1;
+        XGL_DrawTriangles(vertices, count, 0, 1, 1);
+        plain_capture = 0;
+        return;
+    }
     count = reserved_count;
     if (!count) return;
     reserved_count = 0;
@@ -246,6 +267,17 @@ static void capture_reserved(void)
         VectorCopy(reserved_vertices[i].color.rgb, vertices[i].color);
     }
     XGL_DrawTriangles(vertices, count, reserved_lit, 1, 1);
+}
+
+xgl_color_vertex_t *XGL_ReserveColorTriangles(int *count, float opacity, int zwrite)
+{
+    capture_reserved();
+    assert(*count > 0 && *count % 3 == 0 && opacity == 1 && zwrite == 1);
+    if (expect_alias_lock) assert(audio_lock_depth > 0);
+    if (*count > reserve_limit) *count = reserve_limit;
+    reserved_plain_count = *count;
+    ++reserve_calls;
+    return reserved_plain;
 }
 
 xgl_native_vertex_t *XGL_ReserveTriangles(int *count, int lit, float opacity, int zwrite)
@@ -307,6 +339,24 @@ void XGL_DrawNativeTriangles(const xgl_native_vertex_t *vertices, int count,
     ++native_submissions;
 }
 
+void XGL_DrawColorTriangles(const xgl_color_vertex_t *vertices, int count,
+                            float opacity, int zwrite)
+{
+    int i;
+    assert(!worker_running && count > 0 && count % 3 == 0);
+    assert(opacity == 1 && zwrite == 1);
+    capture_reserved();
+    assert(captured_count + count <= 4096);
+    for (i = 0; i < count; ++i) {
+        memset(&captured[captured_count], 0, sizeof(captured[0]));
+        VectorCopy(vertices[i].position, captured[captured_count].position);
+        VectorCopy(vertices[i].color.rgb, captured[captured_count].color);
+        captured_plain[captured_count++] = 1;
+    }
+    native_lit = 0;
+    ++native_submissions; ++plain_submissions;
+}
+
 static void reset_test(void)
 {
     int i;
@@ -346,8 +396,8 @@ static void reset_test(void)
     xgl_entity_extra_used = 0;
     captured_count = native_lit = material_seen = coverage_mode = 0;
     sample_calls = draw_calls = normalizations = 0; test_light = 128; material_revision = 1;
-    assert(!reserved_count);
-    reserved_lit = reserve_calls = prepare_calls = 0;
+    assert(!reserved_count && !reserved_plain_count);
+    reserved_lit = reserve_calls = prepare_calls = plain_submissions = 0;
     reserve_limit = XGL_ENTITY_BATCH_VERTICES;
     memset(profile_counts, 0, sizeof(profile_counts));
     assert(!profile_draw_active && !profile_draw_depth);
@@ -1495,14 +1545,14 @@ static void test_alias_cpu_shading(void)
                     assert(fabs(captured[i].position[j] - native[i].position[j]) < .0001);
                     assert(fabs(captured[i].color[j] - native[i].color[j] * shade) < .0001);
                 }
-                /* The cached path leaves each record's normal as the last
-                 * (here native) draw wrote it: valid, and never read. */
-                if (stage) assert(VectorCompare(captured[i].normal, native[i].normal));
+                /* Only the cold draw, which streams the model's own
+                 * records, still passes normals; they are not read. */
+                assert(captured_plain[i] == (stage != 0));
             }
             assert(lit_corners > 0 && lit_corners < count);
         }
         memcpy(shaded, captured, (size_t)count * sizeof(*shaded));
-        /* A worker prepares the same colors and writes no normals. */
+        /* A worker prepares the same colors, in records without normals. */
         cl_visedicts[0] = entity; cl_numvisedicts = 1;
         smp_active = 1;
         captured_count = executed_jobs = 0; xgl_entity_extra_used = 0;
@@ -1510,8 +1560,9 @@ static void test_alias_cpu_shading(void)
         assert(pending_jobs == 1 && xgl_alias_frame->jobs[0].lit == 0);
         draw_entities();
         assert(executed_jobs == 1 && captured_count == count && native_lit == 0);
+        assert(plain_submissions == 1);
         for (i = 0; i < count; ++i) {
-            assert(captured[i].normal[0] == 0 && captured[i].normal[2] == 1);
+            assert(captured_plain[i]);
             for (j = 0; j < 3; ++j) {
                 assert(captured[i].position[j] == shaded[i].position[j]);
                 assert(captured[i].color[j] == shaded[i].color[j]);
@@ -1550,6 +1601,7 @@ static void test_alias_cpu_shading(void)
         captured_count = 0; xgl_entity_extra_used = 0;
         XGL_DrawAlias(entity);
         assert(native_lit == 2 && fabs(captured[0].color[1] * .5f * test_ambient - dim) < .0001 * 2);
+        assert(!captured_plain[0] && !captured_plain[count - 1]);
 
         /* Torches are final as sampled in either mode: no shade, no light. */
         flame_model = alias_model;
@@ -1560,6 +1612,7 @@ static void test_alias_cpu_shading(void)
             captured_count = 0; xgl_entity_extra_used = 0;
             XGL_DrawAlias(entity);
             assert(captured_count == count && native_lit == 0);
+            assert(captured_plain[0] && captured_plain[count - 1]);
             if (stage) for (i = 0; i < count; ++i)
                 for (j = 0; j < 3; ++j) assert(captured[i].color[j] == shaded[i].color[j]);
             memcpy(shaded, captured, (size_t)count * sizeof(*shaded));

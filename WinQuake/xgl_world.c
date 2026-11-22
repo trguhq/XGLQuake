@@ -33,11 +33,19 @@
 #define XGL_MESH_POLYGON 64
 /* Detail refinement. A vertex's texture sample is filtered over this
  * fraction of the spacing of the vertices around it. A build that finds
- * nothing to add still spends some of the frame's allowance. */
+ * nothing to add still spends some of the frame's allowance. Differences are
+ * judged relative to the local light, but never to less than the floor. An
+ * edge that seems to need no vertex is probed at up to this many points. */
 #define XGL_DETAIL_LEVELS 8
 #define XGL_DETAIL_FILTER .75f
+#define XGL_DETAIL_LIGHT_FLOOR .25f
+#define XGL_DETAIL_PROBES 16
 #define XGL_DETAIL_FORCED 1000000.0f
 #define XGL_DETAIL_ATTEMPT 32
+/* A face whose apparent size earns it fewer triangles than this keeps its
+ * coarse mesh. One built for some apparent size is built again, larger,
+ * when the viewer has come close enough to double what it may have. */
+#define XGL_DETAIL_WANT_MIN 8
 /* Sky and water are cut on regular world grids; water has a finer one for
  * faces near the viewer. Each 128-texel sky layer is reduced to cells. */
 #define XGL_SKY_GRID 128.0f
@@ -66,21 +74,30 @@ typedef struct {
 
 /* One allocation holds three native vertices per triangle, which the backend
  * borrows, then one record per distinct vertex, then each corner's distinct
- * vertex. Colors are computed once per distinct vertex and copied out. */
+ * vertex. Colors are computed once per distinct vertex and copied out.
+ * Walls are nearly always drawn unlit, so their vertices carry no normals.
+ * `lit` is a second copy that does, made the first time a dynamic light
+ * reaches the face and dropped again when none has for a while.
+ * lit_current: its colors match; lit_frame: when it was last drawn. */
 typedef struct {
-    xgl_native_vertex_t *vertices;
+    xgl_color_vertex_t *vertices;
     xgl_cached_vertex_t *data;
     unsigned short *corner;
-    size_t bytes;
+    xgl_native_vertex_t *lit;
+    size_t bytes, lit_bytes;
     int count, unique, texture, style[MAXLIGHTMAPS], fullbright, queued_frame;
+    int lit_current, lit_frame;
     unsigned int texture_revision, color_revision;
 } xgl_surface_mesh_t;
 
 typedef struct {
     xgl_surface_mesh_t coarse, detail;
     /* detail_retry: frame at which a build that found no memory may be tried
-     * again; zero when the last failure was permanent or there was none. */
-    int coarse_attempted, detail_attempted, detail_retry;
+     * again; zero when the last failure was permanent or there was none.
+     * detail_limit: the triangle limit of the last detail build if that
+     * limit, rather than the face, ended it; else zero.
+     * detail_want: the limit this frame's apparent size allows. */
+    int coarse_attempted, detail_attempted, detail_retry, detail_limit, detail_want;
     vec3_t center;
     /* detail_frame: frame in which the world pass selected the detail mesh.
      * detail_used: last frame the detail mesh was built or drawn.
@@ -124,12 +141,15 @@ static xgl_surface_cache_t *xgl_surfaces;
 static model_t *xgl_cached_world;
 static size_t xgl_cache_bytes;
 static int xgl_surface_count, xgl_detail_used, xgl_detail_built, xgl_evict_hand;
+/* Frame before which a full cache is not searched again for room for an
+ * illuminated copy: the search visits every face. */
+static int xgl_lit_retry;
 static int *xgl_world_order, *xgl_detail_order, *xgl_detail_sorted, xgl_world_count;
 static model_t *xgl_pvs_world;
 static mleaf_t *xgl_pvs_leaf;
 static int xgl_pvs_novis;
 /* The settings the cached meshes were built with. */
-static float xgl_cache_step, xgl_cache_error, xgl_cache_face, xgl_cache_edge;
+static float xgl_cache_step, xgl_cache_error, xgl_cache_face, xgl_cache_edge, xgl_cache_density;
 static xgl_water_surface_t xgl_water[XGL_WATER_QUEUE];
 static int xgl_water_count;
 static xgl_brush_cache_t xgl_brush_cache[XGL_BRUSH_CACHE_MODELS];
@@ -167,6 +187,7 @@ cvar_t xgl_detailbuild = {"xgl_detailbuild", "128", false, false, 0, NULL};
 cvar_t xgl_detailerror = {"xgl_detailerror", "16", false, false, 0, NULL};
 cvar_t xgl_detailface = {"xgl_detailface", "192", false, false, 0, NULL};
 cvar_t xgl_detailedge = {"xgl_detailedge", "16", false, false, 0, NULL};
+cvar_t xgl_detaildensity = {"xgl_detaildensity", "160", false, false, 0, NULL};
 
 void XGL_SurfaceLightSamples(msurface_t *, const float *, byte[MAXLIGHTMAPS]);
 void XGL_LightSamplesAt(msurface_t *, float, float, byte[MAXLIGHTMAPS]);
@@ -181,8 +202,21 @@ void XGL_SubdivideSurface (msurface_t *surface)
 static void XGL_FreeSurfaceMesh (xgl_surface_mesh_t *mesh)
 {
     free(mesh->vertices);
-    xgl_cache_bytes -= mesh->bytes;
+    free(mesh->lit);
+    xgl_cache_bytes -= mesh->bytes + mesh->lit_bytes;
     memset(mesh, 0, sizeof(*mesh));
+}
+
+/* Release a mesh's illuminated copy if no light has reached the face for
+ * `age` frames. One drawn in this frame may still be borrowed by a batch. */
+static void XGL_DropLitCopy (xgl_surface_mesh_t *mesh, int age)
+{
+    if (!mesh->lit || r_framecount - mesh->lit_frame < age) return;
+    free(mesh->lit);
+    xgl_cache_bytes -= mesh->lit_bytes;
+    mesh->lit = NULL;
+    mesh->lit_bytes = 0;
+    mesh->lit_current = 0;
 }
 
 static void XGL_FreeBrushCache (xgl_brush_cache_t *entry)
@@ -218,6 +252,7 @@ void XGL_WorldShutdown (void)
     xgl_cache_bytes = 0;
     xgl_water_count = 0;
     xgl_evict_hand = 0;
+    xgl_lit_retry = 0;
     xgl_pvs_world = NULL;
     xgl_pvs_leaf = NULL;
     xgl_basis.valid = 0;
@@ -293,9 +328,11 @@ static void XGL_EvictDetailFrom (xgl_surface_cache_t *cache, int age)
     /* A mesh drawn in this frame may still be borrowed by a native batch,
      * and one drawn in the previous frame is probably wanted again: when
      * everything is that recent the build fails instead and is retried. */
+    XGL_DropLitCopy(&cache->coarse, age);
+    XGL_DropLitCopy(&cache->detail, age);
     if (!cache->detail.vertices || r_framecount - cache->detail_used < age) return;
     XGL_FreeSurfaceMesh(&cache->detail);
-    cache->detail_attempted = cache->detail_retry = 0;
+    cache->detail_attempted = cache->detail_retry = cache->detail_limit = 0;
     XGL_ProfileCount(XGL_PROFILE_WORLD_EVICTIONS, 1);
 }
 
@@ -338,8 +375,9 @@ typedef struct {
     vec3_t position;
     float st[2];
     /* spacing: the texels the texture sample is filtered over. color: what
-     * the vertex would show, 0..255: material times baked light. */
-    float spacing, color[3];
+     * the vertex would show, 0..255: material times baked light. light:
+     * that baked light alone, 0..1. */
+    float spacing, color[3], light;
     byte samples[MAXLIGHTMAPS];
 } xgl_build_vertex_t;
 
@@ -347,10 +385,11 @@ typedef struct {
     unsigned int key;
     unsigned short a, b;
     /* uses: triangles of the current level that have this edge. vertex: its
-     * midpoint once it has been split. tested: evaluated; if splittable,
-     * mid then holds the sample a midpoint vertex would have. */
+     * midpoint once it has been split. tested: its middle was evaluated; if
+     * splittable, mid then holds the sample a midpoint vertex would have.
+     * probed: it passed that and was walked along its length as well. */
     short uses, vertex;
-    byte tested, splittable;
+    byte tested, splittable, probed;
     float length, error;
     xgl_build_vertex_t mid;
 } xgl_build_edge_t;
@@ -365,6 +404,8 @@ static struct {
     unsigned short slots[XGL_MESH_SLOTS];
     unsigned short order[XGL_MESH_EDGES];
     int vertex_count, triangle_count, edge_count, current;
+    /* capped: the triangle limit, not the face, ended the refinement. */
+    int capped;
     /* Edges no longer than this, in texels, are never split. */
     float minimum;
 } xgl_build;
@@ -411,6 +452,7 @@ static void XGL_BuildSample (msurface_t *surface, texture_t *texture,
         XGL_SampleTextureBox(texture->gl_texturenum, vertex->st[0], vertex->st[1],
                              spacing * XGL_DETAIL_FILTER, rgb);
     light = XGL_StaticLight(surface, vertex->samples) * (1.0f / 255);
+    vertex->light = light;
     for (i = 0; i < 3; ++i) vertex->color[i] = rgb[i] * light;
 }
 
@@ -514,25 +556,40 @@ static int XGL_BuildEdge (int a, int b)
     edge->key = key;
     edge->a = (unsigned short)a; edge->b = (unsigned short)b;
     edge->uses = 0; edge->vertex = -1;
-    edge->tested = edge->splittable = 0;
+    edge->tested = edge->splittable = edge->probed = 0;
     edge->length = edge->error = 0;
     xgl_build.slots[slot] = (unsigned short)++xgl_build.edge_count;
     return xgl_build.edge_count - 1;
 }
 
-/* The largest channel difference between a sample and the color found
- * `weight` of the way from a to b by interpolation. */
-static float XGL_BuildError (const float *color, const float *a, const float *b, float weight)
+/* How far a sample is from the color the mesh would interpolate at the same
+ * point: the largest channel difference, relative to the brighter of the two
+ * light levels. The eye judges contrast against its surroundings, so a
+ * texture in shadow has to count as much as the same texture in full light;
+ * measured in final color alone, dim walls would rarely earn a triangle. */
+static float XGL_BuildError (const xgl_build_vertex_t *sample, const float *color, float light)
 {
     float error, difference;
     int i;
     error = 0;
     for (i = 0; i < 3; ++i) {
-        difference = color[i] - (a[i] + (b[i] - a[i]) * weight);
+        difference = sample->color[i] - color[i];
         if (difference < 0) difference = -difference;
         if (difference > error) error = difference;
     }
-    return error;
+    if (sample->light > light) light = sample->light;
+    if (light < XGL_DETAIL_LIGHT_FLOOR) light = XGL_DETAIL_LIGHT_FLOOR;
+    return error / light;
+}
+
+/* The same, against the point `weight` of the way from a to b. */
+static float XGL_BuildEdgeError (const xgl_build_vertex_t *sample, const xgl_build_vertex_t *a,
+                                 const xgl_build_vertex_t *b, float weight)
+{
+    float color[3];
+    int i;
+    for (i = 0; i < 3; ++i) color[i] = a->color[i] + (b->color[i] - a->color[i]) * weight;
+    return XGL_BuildError(sample, color, a->light + (b->light - a->light) * weight);
 }
 
 /* Decide whether a vertex at the middle of an edge would show something
@@ -542,10 +599,8 @@ static void XGL_BuildTestEdge (msurface_t *surface, texture_t *texture,
                                xgl_build_edge_t *edge, float step, float threshold)
 {
     const xgl_build_vertex_t *a, *b;
-    xgl_build_vertex_t quarter;
-    float ds, dt, error, other, weight;
-    int i, k;
-    memset(&quarter, 0, sizeof(quarter));
+    float ds, dt, error;
+    int i;
     a = &xgl_build.vertices[edge->a]; b = &xgl_build.vertices[edge->b];
     ds = a->st[0] - b->st[0]; dt = a->st[1] - b->st[1];
     edge->length = (float)sqrt(ds * ds + dt * dt);
@@ -562,20 +617,39 @@ static void XGL_BuildTestEdge (msurface_t *surface, texture_t *texture,
         edge->error = XGL_DETAIL_FORCED + edge->length;
         return;
     }
-    error = XGL_BuildError(edge->mid.color, a->color, b->color, .5f);
-    /* The middle can agree by chance where the quarters do not. Look there
-     * only when the halves could be split again to show it. */
-    if (error <= threshold && edge->length > 2 * xgl_build.minimum) {
-        for (k = 0; k < 2; ++k) {
-            weight = k ? .75f : .25f;
-            quarter.st[0] = a->st[0] + (b->st[0] - a->st[0]) * weight;
-            quarter.st[1] = a->st[1] + (b->st[1] - a->st[1]) * weight;
-            XGL_BuildSample(surface, texture, &quarter, edge->length * .25f);
-            other = XGL_BuildError(quarter.color, a->color, b->color, weight);
-            if (other > error) error = other;
+    error = XGL_BuildEdgeError(&edge->mid, a, b, .5f);
+    if (error > threshold) edge->error = error;
+}
+
+/* The middle of an edge can agree by chance while something lies to either
+ * side of it. Before a long edge is let pass, it is walked at the finest
+ * spacing a mesh may reach; whatever that finds, further splits close in
+ * on. Otherwise the same texture is caught on one wall and missed on the
+ * next, according to where their corners happen to fall. */
+static void XGL_BuildProbeEdge (msurface_t *surface, texture_t *texture,
+                                xgl_build_edge_t *edge, float threshold)
+{
+    const xgl_build_vertex_t *a, *b;
+    xgl_build_vertex_t probe;
+    float error, weight;
+    int k, steps;
+    edge->probed = 1;
+    memset(&probe, 0, sizeof(probe));
+    a = &xgl_build.vertices[edge->a]; b = &xgl_build.vertices[edge->b];
+    steps = (int)(edge->length / xgl_build.minimum);
+    if (steps > XGL_DETAIL_PROBES) steps = XGL_DETAIL_PROBES;
+    for (k = 1; k < steps; ++k) {
+        if (k * 2 == steps) continue; /* The middle has been looked at. */
+        weight = (float)k / steps;
+        probe.st[0] = a->st[0] + (b->st[0] - a->st[0]) * weight;
+        probe.st[1] = a->st[1] + (b->st[1] - a->st[1]) * weight;
+        XGL_BuildSample(surface, texture, &probe, edge->length / steps);
+        error = XGL_BuildEdgeError(&probe, a, b, weight);
+        if (error > threshold) {
+            edge->error = error;
+            return;
         }
     }
-    if (error > threshold) edge->error = error;
 }
 
 static int XGL_BuildEdgeCompare (const void *left, const void *right)
@@ -612,11 +686,15 @@ static int XGL_BuildRefine (msurface_t *surface, texture_t *texture,
     unsigned short (*list)[3], (*next)[3];
     byte *tested, *next_tested;
     vec3_t first, second;
-    float error, worst, difference;
-    int i, j, index, count, marked, applied, total, longest, a, b, c, ab, bc, ca, swap, n;
+    float error, worst, difference, share[3], expected[3];
+    int i, j, k, index, count, marked, applied, total, longest, a, b, c, ab, bc, ca, swap, n;
+    int probes, room, wanted;
     list = xgl_build.triangles[xgl_build.current];
     tested = xgl_build.tested[xgl_build.current];
     count = xgl_build.triangle_count;
+    /* A full mesh needs no further looking at. */
+    room = limit - count;
+    if (room <= 0) { xgl_build.capped = 1; return 0; }
     for (i = 0; i < xgl_build.edge_count; ++i) xgl_build.edges[i].uses = 0;
     for (i = 0; i < count; ++i)
         for (j = 0; j < 3; ++j) {
@@ -625,10 +703,23 @@ static int XGL_BuildRefine (msurface_t *surface, texture_t *texture,
             xgl_build.triangle_edges[i][j] = (unsigned short)index;
             ++xgl_build.edges[index].uses;
         }
+    /* wanted: the triangles the edges marked so far would add. Once that
+     * exceeds the room left, the costlier second looks cannot add a split
+     * that would be made, and are skipped. */
+    wanted = 0;
     for (i = 0; i < xgl_build.edge_count; ++i) {
         edge = &xgl_build.edges[i];
         if ((i & 15) == 0) XGL_AudioUpdate();
-        if (edge->uses && !edge->tested) XGL_BuildTestEdge(surface, texture, edge, step, threshold);
+        if (!edge->uses) continue;
+        if (!edge->tested) XGL_BuildTestEdge(surface, texture, edge, step, threshold);
+        if (edge->error > 0 && edge->vertex < 0) wanted += edge->uses;
+    }
+    for (i = 0; i < xgl_build.edge_count && wanted <= room; ++i) {
+        edge = &xgl_build.edges[i];
+        if (!edge->uses || edge->probed || edge->error > 0 || !edge->splittable) continue;
+        if ((i & 7) == 0) XGL_AudioUpdate();
+        XGL_BuildProbeEdge(surface, texture, edge, threshold);
+        if (edge->error > 0) wanted += edge->uses;
     }
     for (i = 0; i < count; ++i) {
         worst = 0; longest = 0;
@@ -638,27 +729,41 @@ static int XGL_BuildRefine (msurface_t *surface, texture_t *texture,
             if (sides[j]->length > sides[longest]->length) longest = j;
         }
         /* Something inside a large triangle may touch none of the points
-         * its edges were tested at. */
-        if (worst <= 0 && !tested[i] && sides[longest]->length > 2 * xgl_build.minimum) {
+         * its edges were tested at. Look at its middle and, if it is large
+         * enough to be split twice, at the middles of the corner triangles
+         * a split would make. */
+        if (worst <= 0 && !tested[i] && wanted <= room &&
+            sides[longest]->length > 2 * xgl_build.minimum) {
             if ((i & 15) == 0) XGL_AudioUpdate();
             for (j = 0; j < 3; ++j) corner[j] = &xgl_build.vertices[list[i][j]];
-            for (j = 0; j < 2; ++j)
-                centroid.st[j] = (corner[0]->st[j] + corner[1]->st[j] + corner[2]->st[j]) * (1.0f / 3);
-            XGL_BuildSample(surface, texture, &centroid, sides[longest]->length * (1.0f / 3));
             error = 0;
-            for (j = 0; j < 3; ++j) {
-                difference = centroid.color[j] - (corner[0]->color[j] + corner[1]->color[j] +
-                                                  corner[2]->color[j]) * (1.0f / 3);
-                if (difference < 0) difference = -difference;
+            probes = sides[longest]->length > 4 * xgl_build.minimum ? 4 : 1;
+            for (k = 0; k < probes && error <= threshold; ++k) {
+                for (j = 0; j < 3; ++j)
+                    share[j] = !k ? 1.0f / 3 : (j == k - 1 ? 2.0f / 3 : 1.0f / 6);
+                for (j = 0; j < 2; ++j)
+                    centroid.st[j] = corner[0]->st[j] * share[0] + corner[1]->st[j] * share[1] +
+                                     corner[2]->st[j] * share[2];
+                XGL_BuildSample(surface, texture, &centroid,
+                                sides[longest]->length * (k ? .25f : 1.0f / 3));
+                for (j = 0; j < 3; ++j)
+                    expected[j] = corner[0]->color[j] * share[0] + corner[1]->color[j] * share[1] +
+                                  corner[2]->color[j] * share[2];
+                difference = XGL_BuildError(&centroid, expected,
+                    corner[0]->light * share[0] + corner[1]->light * share[1] +
+                    corner[2]->light * share[2]);
                 if (difference > error) error = difference;
             }
             if (error > threshold) {
                 worst = error;
                 for (j = 0; j < 3; ++j)
-                    if (sides[j]->splittable && sides[j]->error < error) sides[j]->error = error;
+                    if (sides[j]->splittable && sides[j]->error < error) {
+                        if (sides[j]->error <= 0) wanted += sides[j]->uses;
+                        sides[j]->error = error;
+                    }
             }
+            tested[i] = 1;
         }
-        tested[i] = 1;
         /* Splitting only its shorter edges would leave a sliver. */
         if (worst > 0 && sides[longest]->error <= 0 && sides[longest]->splittable)
             sides[longest]->error = worst;
@@ -674,7 +779,10 @@ static int XGL_BuildRefine (msurface_t *surface, texture_t *texture,
     applied = 0; total = count;
     for (i = 0; i < marked; ++i) {
         edge = &xgl_build.edges[xgl_build.order[i]];
-        if (total + edge->uses > limit || xgl_build.vertex_count == XGL_MESH_VERTICES) continue;
+        if (total + edge->uses > limit || xgl_build.vertex_count == XGL_MESH_VERTICES) {
+            xgl_build.capped = 1;
+            continue;
+        }
         xgl_build.vertices[xgl_build.vertex_count] = edge->mid;
         edge->vertex = (short)xgl_build.vertex_count++;
         total += edge->uses; ++applied;
@@ -836,12 +944,12 @@ static int XGL_BuildGrid (model_t *model, msurface_t *surface, float grid)
 static int XGL_BuildFinish (msurface_t *surface, xgl_surface_mesh_t *mesh)
 {
     const xgl_build_vertex_t *source;
-    xgl_native_vertex_t *draw;
+    xgl_color_vertex_t *draw;
     xgl_cached_vertex_t *data;
     const unsigned short *triangle;
     size_t bytes;
-    float sign;
-    int i, j, k, count, unique;
+    int i, j, count, unique;
+    (void)surface;
     count = xgl_build.triangle_count * 3; unique = xgl_build.vertex_count;
     bytes = (size_t)count * (sizeof(*mesh->vertices) + sizeof(*mesh->corner)) +
             (size_t)unique * sizeof(*mesh->data);
@@ -850,7 +958,7 @@ static int XGL_BuildFinish (msurface_t *surface, xgl_surface_mesh_t *mesh)
         XGL_EvictDetail(bytes);
         if (!XGL_CacheFits(bytes)) return -1;
     }
-    mesh->vertices = (xgl_native_vertex_t *)malloc(bytes);
+    mesh->vertices = (xgl_color_vertex_t *)malloc(bytes);
     if (!mesh->vertices) return -1;
     memset(mesh->vertices, 0, bytes);
     xgl_cache_bytes += bytes;
@@ -863,14 +971,12 @@ static int XGL_BuildFinish (msurface_t *surface, xgl_surface_mesh_t *mesh)
         data->spacing = source->spacing;
         memcpy(data->samples, source->samples, MAXLIGHTMAPS);
     }
-    sign = (surface->flags & SURF_PLANEBACK) ? -1.0f : 1.0f;
     draw = mesh->vertices;
     for (i = 0; i < xgl_build.triangle_count; ++i) {
         triangle = xgl_build.triangles[xgl_build.current][i];
         for (j = 0; j < 3; ++j, ++draw) {
             mesh->corner[i * 3 + j] = triangle[j];
             VectorCopy(xgl_build.vertices[triangle[j]].position, draw->position);
-            for (k = 0; k < 3; ++k) draw->normal[k] = surface->plane->normal[k] * sign;
         }
     }
     mesh->texture = -1;
@@ -887,15 +993,17 @@ static float XGL_Setting (float value, float low, float high)
     return value > high ? high : value;
 }
 
-/* Returns 1 when built, 0 when this face can have no such mesh (a detailed
- * one that would be no finer than the coarse one included), and -1 when the
- * cache had no room even after evicting idle detail. */
+/* detail is zero for the coarse mesh, else the most triangles the detailed
+ * one may have. Returns 1 when built, 0 when this face can have no such mesh
+ * (a detailed one that would be no finer than the coarse one included), and
+ * -1 when the cache had no room even after evicting idle detail. */
 static int XGL_BuildSurfaceMeshData (model_t *model, msurface_t *surface,
                                 xgl_surface_mesh_t *mesh, int detail)
 {
     texture_t *texture;
     float grid, step, threshold;
     int level, base, limit;
+    xgl_build.capped = 0;
     if (surface->numedges < 3) return 0;
     if (surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB)) {
         if (surface->flags & SURF_DRAWSKY) {
@@ -916,9 +1024,10 @@ static int XGL_BuildSurfaceMeshData (model_t *model, msurface_t *surface,
     if (detail) {
         step = XGL_Setting(xgl_subdivide.value, 8, 256);
         threshold = XGL_Setting(xgl_detailerror.value, 1, 255);
-        limit = (int)XGL_Setting(xgl_detailface.value, 4, XGL_MESH_TRIANGLES);
+        limit = detail < 4 ? 4 : (detail > XGL_MESH_TRIANGLES ? XGL_MESH_TRIANGLES : detail);
         xgl_build.minimum = XGL_Setting(xgl_detailedge.value, 4, 64);
         base = xgl_build.triangle_count;
+        xgl_build.capped = 0;
         memset(xgl_build.slots, 0, sizeof(xgl_build.slots));
         for (level = 0; level < XGL_DETAIL_LEVELS; ++level)
             if (!XGL_BuildRefine(surface, texture, step, threshold, limit)) break;
@@ -943,24 +1052,62 @@ static int XGL_BuildSurfaceMesh (model_t *model, msurface_t *surface,
     return built;
 }
 
+/* The most triangles a face may be given at a squared distance: in
+ * proportion to its apparent size, its area over that distance, so that
+ * triangles come out about the same size on screen near and far and the
+ * frame's allowance is spread over every wall in range instead of going to
+ * the first few. Without a density every face may have the per-face limit. */
+static int XGL_DetailWant (float area, float distance_squared)
+{
+    float limit, want;
+    limit = XGL_Setting(xgl_detailface.value, 4, XGL_MESH_TRIANGLES);
+    if (!(xgl_detaildensity.value > 0)) return (int)limit;
+    want = xgl_detaildensity.value * area / (distance_squared + 64);
+    return (int)(want < limit ? want : limit);
+}
+
 /* Build a face's detailed mesh if this frame's build allowance permits.
  * A capped or memory-starved build is simply tried again in a later frame;
  * the face draws its coarse mesh meanwhile. A face that has nothing to show
- * in more detail is examined once and never again. */
-static void XGL_TryBuildDetail (model_t *model, msurface_t *surface, xgl_surface_cache_t *cache)
+ * in more detail is examined once and never again. A mesh that its triangle
+ * limit cut short is built again when `want`, which grows as the viewer
+ * approaches, reaches twice that limit; the old one serves until then. */
+static void XGL_TryBuildDetail (model_t *model, msurface_t *surface,
+                                xgl_surface_cache_t *cache, int want)
 {
-    int built, built_triangles;
-    if (cache->detail.vertices) return;
-    if (cache->detail_attempted &&
+    xgl_surface_mesh_t mesh;
+    int built, built_triangles, limit, most, larger;
+    /* Build somewhat ahead of the present need, to rebuild less often. */
+    most = limit = (int)XGL_Setting(xgl_detailface.value, 4, XGL_MESH_TRIANGLES);
+    if (xgl_detaildensity.value > 0 && want + want / 2 < limit) limit = want + want / 2;
+    /* Worth building again at twice the size, or to reach the most a face
+     * may have from anything up to three quarters of it. */
+    larger = cache->detail_limit && (limit >= cache->detail_limit * 2 ||
+        (limit == most && cache->detail_limit * 4 <= most * 3));
+    if (cache->detail.vertices && !larger) return;
+    if (cache->detail_attempted && !larger &&
         !(cache->detail_retry && r_framecount >= cache->detail_retry)) return;
     if (xgl_detailbuild.value > 0 && xgl_detail_built >= xgl_detailbuild.value) return;
     cache->detail_attempted = 1;
     cache->detail_retry = 0;
-    built = XGL_BuildSurfaceMesh(model, surface, &cache->detail, 1);
-    built_triangles = built > 0 ? cache->detail.count / 3 : 0;
+    memset(&mesh, 0, sizeof(mesh));
+    built = XGL_BuildSurfaceMesh(model, surface, &mesh, limit);
+    built_triangles = built > 0 ? mesh.count / 3 : 0;
     xgl_detail_built += built_triangles > XGL_DETAIL_ATTEMPT ? built_triangles : XGL_DETAIL_ATTEMPT;
-    if (built < 0) cache->detail_retry = r_framecount + XGL_DETAIL_RETRY_FRAMES;
-    if (built > 0) cache->detail_used = r_framecount;
+    if (built < 0) {
+        /* No memory: whatever mesh the face has stays in use. */
+        cache->detail_retry = r_framecount + XGL_DETAIL_RETRY_FRAMES;
+        return;
+    }
+    cache->detail_limit = xgl_build.capped ? limit : 0;
+    if (!built) return;
+    if (cache->detail.vertices) {
+        /* A brush entity may have queued the old mesh in this frame. */
+        if (cache->detail.queued_frame == r_framecount) XGL_Flush();
+        XGL_FreeSurfaceMesh(&cache->detail);
+    }
+    cache->detail = mesh;
+    cache->detail_used = r_framecount;
 }
 
 /* GLQuake's sky projection: the layers repeat every 128 units of s and t. */
@@ -1127,7 +1274,7 @@ static void XGL_UpdateSpecialSurface (xgl_surface_mesh_t *mesh, msurface_t *surf
     static byte done[XGL_MESH_VERTICES];
     const xgl_cached_vertex_t *vertex;
     const xgl_tone_t *tones;
-    xgl_native_vertex_t *draw;
+    xgl_color_vertex_t *draw;
     vec3_t forward, right, up, position, delta;
     float rgb[3], *color, os, ot, slow, fast, long_phase, short_phase, wave, weight, swell;
     float fade, reach, near_squared, far_squared, value;
@@ -1241,7 +1388,7 @@ static void XGL_SampleMeshMaterials (xgl_surface_mesh_t *mesh, texture_t *textur
 static void XGL_ColorMesh (xgl_surface_mesh_t *mesh, msurface_t *surface, int fullbright)
 {
     const xgl_cached_vertex_t *vertex;
-    xgl_native_vertex_t *draw;
+    xgl_color_vertex_t *draw;
     const float *color;
     float *out;
     unsigned int level;
@@ -1312,6 +1459,7 @@ static void XGL_UpdateSurfaceMesh (xgl_surface_mesh_t *mesh, msurface_t *surface
     if (texture_changed) XGL_SampleMeshMaterials(mesh, texture, texture_revision);
     XGL_WorldGamma();
     XGL_ColorMesh(mesh, surface, fullbright);
+    mesh->lit_current = 0;
     mesh->color_revision = color_revision;
     mesh->fullbright = fullbright;
     XGL_ProfileAdd(XGL_PROFILE_WORLD_COLORS, start);
@@ -1319,38 +1467,112 @@ static void XGL_UpdateSurfaceMesh (xgl_surface_mesh_t *mesh, msurface_t *surface
     XGL_ProfileCount(XGL_PROFILE_WORLD_COLOR_VERTICES, (unsigned long)mesh->unique);
 }
 
-static void XGL_EmitSurfaceVertices (xgl_surface_mesh_t *mesh,
+/* A face's normal as illumination wants it: out of its visible side. */
+static void XGL_SurfaceNormal (const msurface_t *surface, vec3_t normal)
+{
+    float sign;
+    sign = (surface->flags & SURF_PLANEBACK) ? -1.0f : 1.0f;
+    normal[0] = surface->plane->normal[0] * sign;
+    normal[1] = surface->plane->normal[1] * sign;
+    normal[2] = surface->plane->normal[2] * sign;
+}
+
+/* Make sure a mesh has its illuminated copy and that the copy's colors are
+ * the mesh's. Returns 0 when the cache has no room for one; the face is
+ * then copied out vertex by vertex instead. */
+static int XGL_LitCopy (xgl_surface_mesh_t *mesh, const msurface_t *surface)
+{
+    xgl_native_vertex_t *lit;
+    const xgl_color_vertex_t *source;
+    vec3_t normal;
+    size_t bytes;
+    int i;
+    if (!mesh->lit) {
+        bytes = (size_t)mesh->count * sizeof(*mesh->lit);
+        if (!XGL_CacheFits(bytes)) {
+            if (r_framecount < xgl_lit_retry) return 0;
+            XGL_EvictDetail(bytes);
+            if (!XGL_CacheFits(bytes)) {
+                xgl_lit_retry = r_framecount + XGL_DETAIL_RETRY_FRAMES;
+                return 0;
+            }
+        }
+        mesh->lit = (xgl_native_vertex_t *)malloc(bytes);
+        if (!mesh->lit) return 0;
+        memset(mesh->lit, 0, bytes);
+        xgl_cache_bytes += bytes;
+        mesh->lit_bytes = bytes;
+        XGL_SurfaceNormal(surface, normal);
+        for (i = 0, lit = mesh->lit, source = mesh->vertices; i < mesh->count; ++i, ++lit, ++source) {
+            VectorCopy(source->position, lit->position);
+            VectorCopy(normal, lit->normal);
+        }
+        mesh->lit_current = 0;
+    }
+    if (!mesh->lit_current) {
+        for (i = 0, lit = mesh->lit, source = mesh->vertices; i < mesh->count; ++i, ++lit, ++source) {
+            lit->color.rgb[0] = source->color.rgb[0];
+            lit->color.rgb[1] = source->color.rgb[1];
+            lit->color.rgb[2] = source->color.rgb[2];
+        }
+        mesh->lit_current = 1;
+    }
+    mesh->lit_frame = r_framecount;
+    return 1;
+}
+
+/* Unlit faces go out as they are stored, without normals. A face that a
+ * dynamic light reaches goes out from its illuminated copy. Brush entities
+ * and streamed faces are copied into the backend's own batch. */
+static void XGL_EmitSurfaceVertices (xgl_surface_mesh_t *mesh, msurface_t *surface,
                                     entity_t *entity, int lit, float opacity,
                                     int persistent)
 {
-    const xgl_native_vertex_t *source;
+    const xgl_color_vertex_t *source;
+    xgl_color_vertex_t *plain;
     xgl_native_vertex_t *vertices;
-    vec3_t forward, right, up;
-    int i, j, n, transformed, rotated, count;
+    vec3_t forward, right, up, normal, turned;
+    float *position;
+    int i, n, transformed, rotated, count;
     source = mesh->vertices; count = mesh->count;
+    VectorCopy(vec3_origin, normal);
     transformed = entity && entity != &r_worldentity;
-    if (!transformed && persistent) {
-        XGL_DrawNativeTriangles(source, count, lit, opacity, opacity >= 1);
+    if (!transformed && persistent && (!lit || XGL_LitCopy(mesh, surface))) {
+        if (lit) XGL_DrawNativeTriangles(mesh->lit, count, lit, opacity, opacity >= 1);
+        else XGL_DrawColorTriangles(source, count, opacity, opacity >= 1);
         mesh->queued_frame = r_framecount;
         c_brush_polys += count / 3;
         return;
     }
     rotated = transformed ? XGL_BrushBasis(entity, forward, right, up) : 0;
+    if (lit) {
+        XGL_SurfaceNormal(surface, normal);
+        if (rotated) {
+            for (i = 0; i < 3; ++i)
+                turned[i] = normal[0] * forward[i] - normal[1] * right[i] + normal[2] * up[i];
+            VectorCopy(turned, normal);
+        }
+    }
+    plain = NULL; vertices = NULL;
     while (count > 0) {
         n = count > XGL_WORLD_BATCH ? XGL_WORLD_BATCH : count;
-        vertices = XGL_ReserveTriangles(&n, lit, opacity, opacity >= 1);
-        if (!vertices) return;
+        if (lit) vertices = XGL_ReserveTriangles(&n, lit, opacity, opacity >= 1);
+        else plain = XGL_ReserveColorTriangles(&n, opacity, opacity >= 1);
+        if (!vertices && !plain) return;
         for (i = 0; i < n; ++i) {
-            vertices[i] = source[i];
-            if (rotated) {
-                XGL_BrushPoint(source[i].position, entity, forward, right, up, vertices[i].position);
-                for (j = 0; j < 3; ++j)
-                    vertices[i].normal[j] = source[i].normal[0] * forward[j] -
-                        source[i].normal[1] * right[j] + source[i].normal[2] * up[j];
-            } else if (transformed) {
-                /* Doors, platforms and item boxes: translation only. */
-                VectorAdd(source[i].position, entity->origin, vertices[i].position);
+            if (lit) {
+                position = vertices[i].position;
+                VectorCopy(source[i].color.rgb, vertices[i].color.rgb);
+                VectorCopy(normal, vertices[i].normal);
+            } else {
+                position = plain[i].position;
+                VectorCopy(source[i].color.rgb, plain[i].color.rgb);
             }
+            if (rotated) XGL_BrushPoint(source[i].position, entity, forward, right, up, position);
+            else if (transformed) {
+                /* Doors, platforms and item boxes: translation only. */
+                VectorAdd(source[i].position, entity->origin, position);
+            } else { VectorCopy(source[i].position, position); }
         }
         c_brush_polys += n / 3;
         source += n; count -= n;
@@ -1513,7 +1735,8 @@ static int XGL_BuildSettingsChanged (void)
     return xgl_cache_step != xgl_subdivide.value ||
            xgl_cache_error != xgl_detailerror.value ||
            xgl_cache_face != xgl_detailface.value ||
-           xgl_cache_edge != xgl_detailedge.value;
+           xgl_cache_edge != xgl_detailedge.value ||
+           xgl_cache_density != xgl_detaildensity.value;
 }
 
 void XGL_WorldNewMap (void)
@@ -1525,6 +1748,7 @@ void XGL_WorldNewMap (void)
     xgl_cache_error = xgl_detailerror.value;
     xgl_cache_face = xgl_detailface.value;
     xgl_cache_edge = xgl_detailedge.value;
+    xgl_cache_density = xgl_detaildensity.value;
     if (!xgl_cached_world || xgl_cached_world->numsurfaces <= 0) return;
     each = sizeof(*xgl_surfaces) + 3 * sizeof(int);
     if ((size_t)xgl_cached_world->numsurfaces > XGL_WORLD_CACHE_BYTES / each) return;
@@ -1599,12 +1823,14 @@ static void XGL_SelectWorldDetail(void)
             /* Water in range always uses its finer grid, outside the wall
              * allowance: the ripple that needs it fades with distance, so
              * the change of grid at the range cannot be seen. */
-            XGL_TryBuildDetail(cl.worldmodel, surface, cache);
+            XGL_TryBuildDetail(cl.worldmodel, surface, cache, 1);
             if (cache->detail.vertices)
                 cache->detail_frame = cache->detail_used = r_framecount;
             continue;
         }
         if (!(xgl_detailtris.value > 0)) continue;
+        cache->detail_want = XGL_DetailWant(cache->area, distance);
+        if (cache->detail_want < XGL_DETAIL_WANT_MIN) continue;
         bucket += XGL_DetailBucket(cache->area / (distance + 64));
         cache->bucket = bucket;
         ++counts[bucket];
@@ -1624,7 +1850,8 @@ static void XGL_SelectWorldDetail(void)
     for (i = 0; i < candidates && xgl_detail_used < xgl_detailtris.value; ++i) {
         if ((i & 63) == 0) XGL_AudioUpdate();
         index = xgl_detail_sorted[i]; cache = xgl_surfaces + index;
-        XGL_TryBuildDetail(cl.worldmodel, cl.worldmodel->surfaces + index, cache);
+        XGL_TryBuildDetail(cl.worldmodel, cl.worldmodel->surfaces + index, cache,
+                           cache->detail_want);
         if (cache->detail.vertices &&
             xgl_detail_used + cache->detail.count / 3 <= xgl_detailtris.value) {
             cache->detail_frame = cache->detail_used = r_framecount;
@@ -1671,13 +1898,11 @@ static xgl_surface_cache_t *XGL_BrushModelFace (model_t *model, msurface_t *surf
     return &oldest->faces[index];
 }
 
-static void XGL_InitCachedVertex (xgl_native_vertex_t *draw, xgl_cached_vertex_t *vertex,
+static void XGL_InitCachedVertex (xgl_color_vertex_t *draw, xgl_cached_vertex_t *vertex,
                                   msurface_t *surface, const float *point)
 {
     int i;
     VectorCopy(point, draw->position);
-    for (i = 0; i < 3; ++i)
-        draw->normal[i] = surface->plane->normal[i] * ((surface->flags & SURF_PLANEBACK) ? -1 : 1);
     for (i = 0; i < 2; ++i)
         vertex->st[i] = DotProduct(point, surface->texinfo->vecs[i]) + surface->texinfo->vecs[i][3];
     XGL_SurfaceLightSamples(surface, point, vertex->samples);
@@ -1689,7 +1914,7 @@ static void XGL_DrawSurface (model_t *model, msurface_t *surface, entity_t *enti
     xgl_surface_cache_t *cache;
     xgl_surface_mesh_t *mesh;
     xgl_surface_mesh_t fallback;
-    xgl_native_vertex_t triangle[3];
+    xgl_color_vertex_t triangle[3];
     xgl_cached_vertex_t triangle_data[3];
     texture_t *texture;
     vec3_t a, b, c, center, forward, right, up, worldcenter, delta;
@@ -1732,8 +1957,12 @@ static void XGL_DrawSurface (model_t *model, msurface_t *surface, entity_t *enti
             VectorSubtract(worldcenter, r_origin, delta);
             distance = DotProduct(delta, delta);
             detail = xgl_detaildistance.value > 0 && distance < xgl_detaildistance.value * xgl_detaildistance.value;
+            if (detail) {
+                cache->detail_want = XGL_DetailWant(cache->area, distance);
+                if (cache->detail_want < XGL_DETAIL_WANT_MIN) detail = 0;
+            }
             if (detail && xgl_detail_used < xgl_detailtris.value)
-                XGL_TryBuildDetail(model, surface, cache);
+                XGL_TryBuildDetail(model, surface, cache, cache->detail_want);
             if (detail && cache->detail.vertices &&
                 xgl_detail_used + cache->detail.count / 3 <= xgl_detailtris.value) {
                 mesh = &cache->detail;
@@ -1748,7 +1977,7 @@ static void XGL_DrawSurface (model_t *model, msurface_t *surface, entity_t *enti
         if (mesh->vertices) {
             XGL_ProfileCount(XGL_PROFILE_WORLD_CACHED_SURFACES, 1);
             XGL_UpdateSurfaceMesh(mesh, surface, texture, entity, mesh == &cache->detail);
-            XGL_EmitSurfaceVertices(mesh, entity, lit, opacity, 1);
+            XGL_EmitSurfaceVertices(mesh, surface, entity, lit, opacity, 1);
             return;
         }
     }
@@ -1779,7 +2008,7 @@ static void XGL_DrawSurface (model_t *model, msurface_t *surface, entity_t *enti
         fallback.texture = -1; fallback.fullbright = -1;
         for (axis = 0; axis < MAXLIGHTMAPS; ++axis) fallback.style[axis] = -1;
         XGL_UpdateSurfaceMesh(&fallback, surface, texture, entity, 0);
-        XGL_EmitSurfaceVertices(&fallback, entity, lit, opacity, 0);
+        XGL_EmitSurfaceVertices(&fallback, surface, entity, lit, opacity, 0);
     }
 }
 

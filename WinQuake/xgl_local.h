@@ -60,6 +60,14 @@ typedef struct {
     float normal[3];
 } xgl_native_vertex_t;
 
+/* Matches XGL's RGB point/color record. Unlit geometry, which is nearly all
+ * of it, is submitted without normals: the device draws such points about
+ * a tenth faster and the cached meshes are a third smaller. */
+typedef struct {
+    float position[3];
+    union { float rgb[3]; unsigned long alignment; } color;
+} xgl_color_vertex_t;
+
 extern byte xgl_palette[768];
 extern entity_t r_worldentity, *currententity;
 extern vec3_t modelorg, r_entorigin;
@@ -95,6 +103,11 @@ void XGL_DrawNativeTriangles(const xgl_native_vertex_t *vertices, int count,
  * Returns NULL and sets *count to zero when no scene is active. */
 xgl_native_vertex_t *XGL_ReserveTriangles(int *count, int lit,
                                          float opacity, int zwrite);
+/* The same two services for unlit geometry without normals. Colors are
+ * prepared; borrowed vertices must stay unchanged until XGL_Flush. */
+void XGL_DrawColorTriangles(const xgl_color_vertex_t *vertices, int count,
+                           float opacity, int zwrite);
+xgl_color_vertex_t *XGL_ReserveColorTriangles(int *count, float opacity, int zwrite);
 unsigned int XGL_ColorRevision(void);
 void XGL_CopyGammaOutput(float output[256]);
 void XGL_PrepareColor(float rgb[3]);

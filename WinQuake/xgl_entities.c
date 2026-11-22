@@ -143,7 +143,8 @@ typedef struct {
     const byte *palette;
     const float *gamma;
     xgl_alias_work_vertex_t *work;
-    xgl_native_vertex_t *output;
+    /* Records without normals unless the device is to illuminate them. */
+    void *output;
 } xgl_alias_job_t;
 
 typedef struct {
@@ -152,6 +153,8 @@ typedef struct {
     byte palette[768];
     float gamma[256];
     trivertx_t poses[XGL_ALIAS_FRAME_CORNERS];
+    /* Sized for the larger record; a job without normals uses less of its
+     * share. */
     xgl_native_vertex_t output[XGL_ALIAS_FRAME_CORNERS];
     /* The FIFO has one worker. Its temporary transforms can be reused after
      * each job; the assembled output is retained separately for each draw. */
@@ -764,22 +767,28 @@ typedef struct {
 } xgl_alias_output_cursor_t;
 
 /* Resume at the next visible triangle when a native batch was split.
- * Providing a gamma snapshot makes this a pure worker operation. */
+ * Providing a gamma snapshot makes this a pure worker operation. Models the
+ * device illuminates are written as points with normals; all others, which
+ * are submitted unlit, as points without. */
 static void XGL_CopyAliasOutput(const xgl_alias_job_t *job, xgl_alias_output_cursor_t *cursor,
-                                xgl_native_vertex_t *out, int count)
+                                void *output, int count)
 {
     const xgl_alias_topology_t *topology;
     const xgl_alias_color_t *colors;
     const xgl_alias_work_vertex_t *source;
+    xgl_native_vertex_t *out;
+    xgl_color_vertex_t *plain;
     float *rgb, shade;
     int i, j, k, slot, mode;
     topology = job->cached_pose->topology;
     mode = job->shade.mode;
+    out = (xgl_native_vertex_t *)output;
+    plain = (xgl_color_vertex_t *)output;
     while (count > 0) {
         i = cursor->triangle++;
         colors = &job->colors->colors[i];
         if (!colors->visible) continue;
-        for (j = 0; j < 3; ++j, ++out) {
+        for (j = 0; j < 3; ++j) {
             slot = colors->index[j] + 1;
             rgb = cursor->prepared[slot];
             if (!cursor->valid[slot]) {
@@ -793,18 +802,22 @@ static void XGL_CopyAliasOutput(const xgl_alias_job_t *job, xgl_alias_output_cur
                 cursor->valid[slot] = 1;
             }
             source = &job->work[topology->indices[i * 3 + j]];
-            VectorCopy(source->position, out->position);
-            if (mode == XGL_SHADE_CPU) {
-                /* The device multiplied the prepared color by the same sum.
-                 * The record's normal is not read by unlit drawing. */
-                shade = source->light.shade;
-                out->color.rgb[0] = rgb[0] * shade;
-                out->color.rgb[1] = rgb[1] * shade;
-                out->color.rgb[2] = rgb[2] * shade;
+            if (mode == XGL_SHADE_NATIVE) {
+                VectorCopy(source->position, out->position);
+                VectorCopy(source->light.normal, out->normal);
+                VectorCopy(rgb, out->color.rgb);
+                ++out;
                 continue;
             }
-            if (mode == XGL_SHADE_NATIVE) { VectorCopy(source->light.normal, out->normal); }
-            VectorCopy(rgb, out->color.rgb);
+            VectorCopy(source->position, plain->position);
+            if (mode == XGL_SHADE_CPU) {
+                /* The device multiplied the prepared color by the same sum. */
+                shade = source->light.shade;
+                plain->color.rgb[0] = rgb[0] * shade;
+                plain->color.rgb[1] = rgb[1] * shade;
+                plain->color.rgb[2] = rgb[2] * shade;
+            } else { VectorCopy(rgb, plain->color.rgb); }
+            ++plain;
         }
         count -= 3;
     }
@@ -815,7 +828,7 @@ static void XGL_EmitAliasPose(const xgl_alias_pose_cache_t *cache,
 {
     xgl_alias_output_cursor_t cursor;
     xgl_alias_job_t job;
-    xgl_native_vertex_t *vertices;
+    void *vertices;
     int count, remaining;
     cursor.triangle = 0;
     memset(cursor.valid, 0, sizeof(cursor.valid));
@@ -825,7 +838,9 @@ static void XGL_EmitAliasPose(const xgl_alias_pose_cache_t *cache,
     remaining = draw->cache->visible_triangles * 3;
     while (remaining) {
         count = remaining;
-        vertices = XGL_ReserveTriangles(&count, lit, 1, 1);
+        if (job.shade.mode == XGL_SHADE_NATIVE)
+            vertices = XGL_ReserveTriangles(&count, lit, 1, 1);
+        else vertices = XGL_ReserveColorTriangles(&count, 1, 1);
         if (!vertices) return;
         XGL_CopyAliasOutput(&job, &cursor, vertices, count);
         remaining -= count;
@@ -1332,11 +1347,9 @@ void XGL_AliasPrepareFrame(void)
         if (!xgl_alias_frame) return;
         xgl_alias_frame->pending = xgl_alias_frame->job_count = 0;
         xgl_alias_frame->pose_count = xgl_alias_frame->corner_count = 0;
-        /* CPU-shaded jobs never write an output normal; unlit drawing does
-         * not read one. Give every record a valid one, once. */
+        /* Every record handed to the device has been written in full; this
+         * only keeps the first frame's untouched tail well defined. */
         memset(xgl_alias_frame->output, 0, sizeof(xgl_alias_frame->output));
-        for (i = 0; i < XGL_ALIAS_FRAME_CORNERS; ++i)
-            xgl_alias_frame->output[i].normal[2] = 1;
     }
     /* A repeated call cannot reuse output still borrowed by native batches. */
     if (xgl_alias_frame->job_count) return;
@@ -1526,7 +1539,11 @@ void XGL_DrawAliasEntities(void)
             job = xgl_alias_frame && next_job < xgl_alias_frame->job_count ?
                 &xgl_alias_frame->jobs[next_job] : NULL;
             if (plan >= 0 && job && job->visible_index == i) {
-                XGL_DrawNativeTriangles(job->output, job->count, job->lit, 1, 1);
+                if (job->shade.mode == XGL_SHADE_NATIVE)
+                    XGL_DrawNativeTriangles((const xgl_native_vertex_t *)job->output,
+                                            job->count, job->lit, 1, 1);
+                else XGL_DrawColorTriangles((const xgl_color_vertex_t *)job->output,
+                                            job->count, 1, 1);
                 c_alias_polys += job->triangles;
                 ++next_job;
             } else if (plan >= 0) XGL_ProcessAlias(currententity, -1, plan & 3);
