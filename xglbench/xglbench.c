@@ -61,7 +61,7 @@ static void usage(FILE *f)
     fprintf(f,
         "  -triangles N       Base count, positive even number <=16384 (default 512)\n"
         "  -csv PATH          Write machine-readable per-trial and summary results\n"
-        "  -test TEXT         Select matching names from the complete case registry\n"
+        "  -test TEXT[,TEXT]  Select names containing any TEXT from the complete registry\n"
         "  -display DISPLAY   X display (default DISPLAY environment variable)\n"
         "  -allow-fallback    Permit non-DGA/software/single-buffer investigation\n");
     fprintf(f,
@@ -439,7 +439,59 @@ static int make_cases(xb_case *cases)
             }
         }
     }
+    /* Target-hardware questions. Every lighting/state case draws the same
+     * depth-1 sampled-material mesh; only native state differs. */
+    c = add_case(cases, &n, "probe/lighting/unlit-color-points");
+    c->depth = 1; c->shade = XB_SMOOTH; c->vertex_material = 1;
+    add_lighting_case(cases, &n, "probe/lighting/unlit-normal-points", 3,
+                      XB_LIGHT_LAMBERT, 1, 0, 0, 0, 1, 0);
+    c = &cases[n - 1]; c->vertex_material = 1; c->probe = XB_PROBE_LIT_NO_ILLUM;
+    for (lights = 1; lights <= 4; lights += 3) {
+        sprintf(name, "probe/lighting/lit-lights-off-%d", lights);
+        add_lighting_case(cases, &n, name, 3, XB_LIGHT_LAMBERT, lights, 0, 0, 0, 1, 0);
+        c = &cases[n - 1]; c->vertex_material = 1; c->probe = XB_PROBE_LIGHTS_OFF;
+    }
+    add_lighting_case(cases, &n, "probe/lighting/lit-directional-1", 3,
+                      XB_LIGHT_LAMBERT, 1, 1, 0, 0, 1, 0);
+    cases[n - 1].vertex_material = 1;
+    for (lights = 1; lights <= 4; lights += 3) {
+        sprintf(name, "probe/lighting/lit-point-%d", lights);
+        add_lighting_case(cases, &n, name, 3, XB_LIGHT_LAMBERT, lights, 0, 0, 0, 1, 0);
+        cases[n - 1].vertex_material = 1;
+    }
+    for (mode = 0; mode < 2; ++mode) {
+        add_lighting_case(cases, &n, mode ? "probe/state/lit-unlit-alternating" :
+                          "probe/state/lit-unlit-grouped", 3,
+                          XB_LIGHT_LAMBERT, 1, 0, 0, 0, 1, 0);
+        c = &cases[n - 1]; c->vertex_material = 1;
+        c->probe = mode ? XB_PROBE_STATE_ALTERNATE : XB_PROBE_STATE_GROUPED;
+    }
+    c = add_case(cases, &n, "probe/persist/depth-only-clear");
+    c->work = XB_DEPTH_CLEAR; c->probe = XB_PROBE_PERSIST_DEPTH;
+    c = add_case(cases, &n, "probe/persist/viewport-clear");
+    c->work = XB_COLOR_DEPTH_CLEAR; c->probe = XB_PROBE_PERSIST_VIEWPORT;
+    c = add_case(cases, &n, "probe/swap/interval");
+    c->work = XB_SWAP; c->probe = XB_PROBE_SWAP;
+    c = add_case(cases, &n, "probe/swap/busy-6ms");
+    c->work = XB_SWAP; c->probe = XB_PROBE_SWAP; c->probe_busy = .006;
     return n;
+}
+
+/* -test accepts comma-separated substrings; a case matching any is selected. */
+static int filter_matches(const char *name, const char *filter)
+{
+    const char *end;
+    size_t length, i, name_length;
+    name_length = strlen(name);
+    while (*filter) {
+        end = strchr(filter, ',');
+        length = end ? (size_t)(end - filter) : strlen(filter);
+        for (i = 0; length && i + length <= name_length; ++i)
+            if (!strncmp(name + i, filter, length)) return 1;
+        filter += length;
+        if (*filter == ',') ++filter;
+    }
+    return 0;
 }
 
 /* Sampled-color defaults keep related comparisons together. Native texture
@@ -482,7 +534,7 @@ static int select_cases(const xb_case *cases, int count, const xb_options *o, in
     n = 0;
     if (o->filter || o->profile == XB_EXTRALONG) {
         for (i = 0; i < count; ++i)
-            if (!o->filter || strstr(cases[i].name, o->filter)) order[n++] = i;
+            if (!o->filter || filter_matches(cases[i].name, o->filter)) order[n++] = i;
         return n;
     }
     quick_count = (int)(sizeof(quick) / sizeof(quick[0]));

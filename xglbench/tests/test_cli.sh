@@ -59,12 +59,15 @@ expect_fail -sim-fps 15.5
 expect_fail -sim-fps 60garbage
 expect_fail -sim-fps nan
 expect_fail -test __no_such_case__
+expect_fail -test ,
 
 XB_TEST_LOG="$test_dir/help.log" run_bench -help >"$test_dir/output" 2>&1
 test ! -e "$test_dir/help.log" || fail "help opened a display"
 XB_TEST_LOG="$test_dir/list.log" run_bench -extralong -list >"$test_dir/output" 2>&1
 test ! -e "$test_dir/list.log" || fail "list opened a display"
 grep 'submit/multi_polygon/batch-128' "$test_dir/output" >/dev/null || fail "missing stable case"
+run_bench -extralong -test probe/swap,overhead/swap, -list >"$test_dir/comma" 2>&1
+test "$(grep -c . "$test_dir/comma")" = 3 || fail "comma-separated -test selected the wrong cases"
 for area in 4 16 64 100 256 1024; do
     grep "area/${area}px" "$test_dir/output" >/dev/null || fail "missing calibrated $area pixel case"
 done

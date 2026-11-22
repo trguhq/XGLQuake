@@ -68,7 +68,7 @@ requires builds and readback checks against those installed SDKs/runtimes.
 
 ## Run
 
-Version 0.9.1 defaults to the **quick** profile at **320x240**, with a one-minute
+Version 0.9.2 defaults to the **quick** profile at **320x240**, with a one-minute
 elapsed-time limit:
 
 ```sh
@@ -91,7 +91,7 @@ limit.
 | `-quick` (default) | 16 | 320x240 | 0.2 | 1 | 0.02 s | 1.5 s | 60 s |
 | `-medium` | 34 | 320x240 | 0.25 | 2 | 0.03 s | 2.5 s | 180 s |
 | `-long` | 34 | 320x240, 640x480 | 0.4 | 2 | 0.05 s | 3.0 s | 420 s |
-| `-extralong` | 237 | 320x240, 640x480 | 0.5 | 3 | 0.1 s | 2.0 s | 2700 s (45 min) |
+| `-extralong` | 250 | 320x240, 640x480 | 0.5 | 3 | 0.1 s | 2.0 s | 2700 s (45 min) |
 
 Quick compares individual polygons and two batched submission APIs, sampled
 flat/smooth draws at depth one, matching frames with and without the HUD,
@@ -103,7 +103,7 @@ and console workloads, depth-two sampled colors, and serialized/streaming
 Quake-like smooth lighting.
 Long runs the same 34 cases at both resolutions with longer trials.
 Native texture mapping is optional: use an explicit `-test` filter or
-`-extralong`, which retains the complete 237-case registry. The later sections
+`-extralong`, which retains the complete 250-case registry. The later sections
 describe all available families; a short profile need not include every case
 described there.
 
@@ -183,7 +183,7 @@ warm-up work are outside the measured rendering intervals.
 ./xglbench -quick -test lighting/ -seconds .2 -warmup .02 -pause 0 -csv lighting.csv
 ```
 
-`-test TEXT` selects matching names from the **full 237-case registry**, even
+`-test TEXT` selects matching names from the **full 250-case registry**, even
 when they are outside the profile's usual subset. The chosen profile still
 supplies resolutions, timings, pauses and any elapsed-time limit.
 `-list` shows the selected profile or filter without opening XGL;
@@ -211,7 +211,7 @@ Options:
 | `-triangles N` | Positive even base triangle count, at most 16384; default 512. Normal transparency cases use a fixed eight triangles; explicit transparency stress cases use this setting. |
 | `-queue N` | Maximum outstanding work items in streaming cases, 1 through 8; default 2. Serialized controls use one slot. |
 | `-sim-fps N` | Deterministic simulated frame rate for 10 Hz lightstyles, from 1 to 240; default 15. Use 60 for the previous cadence. This does not pace rendering or change the elapsed-time limits. |
-| `-test TEXT` | Select matching names from the full registry, retaining the profile's other settings. |
+| `-test TEXT[,TEXT]` | Select names containing any of the comma-separated texts from the full registry, retaining the profile's other settings. |
 | `-csv PATH` | Save machine-readable results as well as the terminal report. |
 | `-display DISPLAY` | Select an X display. Local DGA is the intended path. |
 | `-allow-fallback` | Permit a software/non-DGA configuration for diagnosis. |
@@ -414,6 +414,43 @@ Quake-specific character codes need explicit glyph/color mappings. Preserve
 the original layout bounds and redraw the overlay into each cleared
 backbuffer; the existing status-bar dirty-page optimization must not leave
 it absent after a buffer clear. This benchmark does not modify engine files.
+
+## Hardware probes
+
+The `probe/` cases answer specific questions about the target device. They are
+selected only by `-test` or `-extralong`. Each prints its finding on the
+`note:` line; the timed columns keep their usual meaning.
+
+| Case | Question | How to read it |
+| --- | --- | --- |
+| `probe/lighting/unlit-color-points` | Baseline: smooth sampled colors, no normals, no illumination. | Reference `render_ms` for the rows below; all draw the same mesh. |
+| `probe/lighting/unlit-normal-points` | Does sending normals cost anything when illumination is off? | Compare with the baseline. |
+| `probe/lighting/lit-lights-off-1`, `-4` | What does per-vertex illumination cost with only ambient light, and does the number of allocated but switched-off lights matter? | Compare with `unlit-normal-points` and with each other. |
+| `probe/lighting/lit-directional-1`, `lit-point-1`, `lit-point-4` | Cost of static directional and positional lights. | Compare with `lit-lights-off-*`. |
+| `probe/state/lit-unlit-grouped`, `-alternating` | Price of changing between lit and unlit state within a frame. | Both draw half the batches unlit. The `render_ms` difference divided by the difference in state changes (in the notes) is the cost of one change. |
+| `probe/persist/depth-only-clear` | Does an undrawn region survive buffer switches when frames clear only Z? | PASS means it did, on both buffers. Timed work is a Z-only clear. |
+| `probe/persist/viewport-clear` | Do geometry and a color+Z clear stay inside a reduced DC viewport? | PASS means both did. Timed work is the clear within the 80% viewport; compare with `overhead/color-depth-clear`. A validation failure names the first check that failed. |
+| `probe/swap/interval` | How long is a buffer switch, and where is the delay? | The note gives the period between 200 consecutive switches (the retrace period if switches wait for retrace) and the median time in the switch call and in the following completion wait. |
+| `probe/swap/busy-6ms` | Can CPU work overlap that delay? | Same, with 6 ms of CPU work between the call and the wait. If the wait shrinks by about 6 ms and the period is unchanged, the work overlapped. |
+
+The lighting and state probes check lit output by readback before changing
+state; the ambient-only and illumination-off images themselves are not
+separately validated. No refresh rate is assumed. Building with `XB_FBIO=1`
+additionally prints the monitor timing reported by the Solaris frame-buffer
+driver, if `FBIOMONINFO` is available and `/dev/fb` is the same device:
+
+```sh
+make clean
+make XB_FBIO=1
+```
+
+If that fails to compile in `xglbench_xgl.c`, rebuild with plain `make`.
+
+Run the probes with the existing cases they are compared against:
+
+```sh
+./xglbench -extralong -winsize 320 240 -test probe/,overhead/,ui/,submit/strip,submit/multi_polygon/batch-128,submit/triangle_list/batch-128,transform/,texture-map/,subdivide/relight -csv zx-probe.csv >zx-probe.txt 2>&1
+```
 
 ## Combined clears and transparency
 

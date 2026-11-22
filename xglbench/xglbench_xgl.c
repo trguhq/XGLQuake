@@ -14,6 +14,12 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <unistd.h>
+#ifdef XB_FBIO
+/* Optional Solaris frame-buffer query; never needed for measurements. */
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/fbio.h>
+#endif
 
 
 /* Every pointer reachable by a retained draw remains stable until completion.
@@ -78,6 +84,9 @@ typedef struct {
     xb_native_slot stream[XB_MAX_QUEUE];
     int stream_active, stream_slots, stream_batch;
     Xgl_boolean stream_previous_volatile;
+    enum xb_probe probe;
+    int probe_lit, viewport_reduced;
+    Xgl_boolean probe_switches[XB_MAX_LIGHTS + 1];
 } xb_native;
 
 static xb_native b;
@@ -149,6 +158,9 @@ static int texture_enable(int enabled);
 static int set_transparency(int enabled, double opacity, int zwrite);
 static int validate_transparency(void);
 static int validate_combined_clear(void);
+static int apply_probe(const xb_case *test, char *note, size_t size);
+static void probe_set_lit(int lit);
+static void setup_view(void);
 
 static void free_stream_slots(void)
 {
@@ -1031,6 +1043,37 @@ void xb_backend_dimensions(int *width, int *height)
     *height = b.height;
 }
 
+#ifdef XB_FBIO
+static void fbio_info(FILE *out)
+{
+    struct fbtype type;
+#ifdef FBIOMONINFO
+    struct mon_info monitor;
+#endif
+    int fd;
+    fd = open("/dev/fb", O_RDONLY);
+    if (fd < 0) {
+        fprintf(out, "Frame buffer query: /dev/fb could not be opened; refresh rate not reported.\n");
+        return;
+    }
+    memset(&type, 0, sizeof(type));
+    if (ioctl(fd, FBIOGTYPE, &type) == 0)
+        fprintf(out, "Frame buffer /dev/fb: type %d, %dx%d, depth %d (may differ from the XGL device).\n",
+                (int)type.fb_type, (int)type.fb_width, (int)type.fb_height, (int)type.fb_depth);
+#ifdef FBIOMONINFO
+    memset(&monitor, 0, sizeof(monitor));
+    if (ioctl(fd, FBIOMONINFO, &monitor) == 0)
+        fprintf(out, "Monitor timing (FBIOMONINFO): vertical %lu Hz, horizontal %lu Hz, pixel clock %lu Hz.\n",
+                (unsigned long)monitor.vfreq, (unsigned long)monitor.hfreq,
+                (unsigned long)monitor.pixfreq);
+    else fprintf(out, "FBIOMONINFO is not supported by this driver; refresh rate not reported.\n");
+#else
+    fprintf(out, "FBIOMONINFO is not defined by <sys/fbio.h>; refresh rate not reported.\n");
+#endif
+    close(fd);
+}
+#endif
+
 void xb_backend_info(FILE *out)
 {
     fprintf(out, "XGL version: %s\nDevice: %s\n", b.version, b.device);
@@ -1048,6 +1091,11 @@ void xb_backend_info(FILE *out)
     fprintf(out, "Swap implementation: %s; transparency=%s; lighting=%s\n",
             b.inquiry.db_buffer_is_copy ? "copy" : "buffer switch",
             support(b.inquiry.transparency), support(b.inquiry.lighting));
+#ifdef XB_FBIO
+    fbio_info(out);
+#else
+    fprintf(out, "Refresh rate: not queried or assumed; probe/swap reports the measured switch period.\n");
+#endif
     fprintf(out, "Default state: flat facet RGB; illumination off; no textures; culling off; "
                  "six clipping planes; deferred submission; volatile geometry "
                  "except retained-array and pipeline cases.\n");
@@ -1611,6 +1659,13 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
         return 0;
     }
     if (b.errors) { copy_text(reason, size, b.error); return 0; }
+    b.probe = XB_PROBE_NONE;
+    if (b.viewport_reduced) {
+        /* A viewport probe leaves its reduced mapping for its timed clears. */
+        setup_view();
+        b.viewport_reduced = 0;
+        if (b.errors) { copy_text(reason, size, b.error); return 0; }
+    }
     if (!texture_enable(0)) { copy_text(reason, size, b.error); return 0; }
     b.texture_filter = XB_TEXTURE_OFF;
     xb_backend_stream_end();
@@ -1741,6 +1796,16 @@ int xb_backend_configure(const xb_case *test, const xb_mesh *mesh,
     if (b.texture_filter != XB_TEXTURE_OFF)
         copy_text(reason, size,
             "texture RGB/UV/wrap/filter/off gates passed; execution unclassified, may use software");
+    if (test->probe != XB_PROBE_NONE) {
+        char note[160];
+        b.stage = "hardware probe";
+        if (!apply_probe(test, note, sizeof(note))) {
+            if (!b.error[0]) fail("hardware probe failed");
+            copy_text(reason, size, b.error);
+            return 0;
+        }
+        copy_text(reason, size, note);
+    }
     if (xb_cancel_requested()) {
         b.failure = XB_FAILURE_TIME_LIMIT;
         copy_text(reason, size, "profile time budget reached");
@@ -1838,6 +1903,10 @@ size_t xb_backend_draw(enum xb_method method, int batch)
         if (count > (size_t)batch) count = (size_t)batch;
         facets.num_facets = (Xgl_usgn32)count;
         facets.facets.color_facets = b.facets ? b.facets + start : NULL;
+        if (b.probe == XB_PROBE_STATE_GROUPED)
+            probe_set_lit(start * 2 < b.triangles);
+        else if (b.probe == XB_PROBE_STATE_ALTERNATE)
+            probe_set_lit(!(calls & 1));
         if (method == XB_MULTI) {
             xgl_multi_simple_polygon(b.ctx,
                 XGL_FACET_FLAG_SIDES_ARE_3 | XGL_FACET_FLAG_SHAPE_CONVEX,
@@ -1854,6 +1923,8 @@ size_t xb_backend_draw(enum xb_method method, int batch)
         }
         ++calls;
     }
+    if (b.probe == XB_PROBE_STATE_GROUPED || b.probe == XB_PROBE_STATE_ALTERNATE)
+        probe_set_lit(1);
     return xb_cancel_requested() ? 0 : calls;
 }
 
@@ -2416,6 +2487,241 @@ static int validate_combined_clear(void)
     result = 1;
 done:
     return end_color_probe(previous_volatile, previous_z, result);
+}
+
+/* Mirrors the three state calls XGLQuake issues when a batch changes between
+ * lit and unlit: illumination, ambient light color and light switches. */
+static void probe_set_lit(int lit)
+{
+    Xgl_color ambient;
+    if (b.errors || xb_cancel_requested() || b.probe_lit == lit) return;
+    xgl_object_set(b.ctx,
+        XGL_CTX_SURF_FRONT_COLOR_SELECTOR, XGL_SURF_COLOR_VERTEX_ILLUM_DEP,
+        XGL_3D_CTX_SURF_FRONT_ILLUMINATION,
+            lit ? XGL_ILLUM_PER_VERTEX : XGL_ILLUM_NONE_INTERP_COLOR, 0);
+    memset(&ambient, 0, sizeof(ambient));
+    ambient.rgb.r = ambient.rgb.g = ambient.rgb.b = b.light_state.ambient;
+    xgl_object_set(b.lights[0], XGL_LIGHT_COLOR, &ambient, 0);
+    xgl_object_set(b.ctx, XGL_3D_CTX_LIGHT_SWITCHES, b.probe_switches, 0);
+    b.probe_lit = lit;
+}
+
+static int probe_band(float y0, float y1, float r, float g, float blue)
+{
+    Xgl_pt_f3d points[4];
+    Xgl_pt_list list;
+    Xgl_color_facet color;
+    Xgl_facet_list facets;
+    if (b.errors || xb_cancel_requested()) return 0;
+    memset(&list, 0, sizeof(list));
+    memset(&facets, 0, sizeof(facets));
+    memset(&color, 0, sizeof(color));
+    points[0].x = -1; points[0].y = y0; points[0].z = .5f;
+    points[1].x = 1; points[1].y = y0; points[1].z = .5f;
+    points[2].x = 1; points[2].y = y1; points[2].z = .5f;
+    points[3].x = -1; points[3].y = y1; points[3].z = .5f;
+    list.pt_type = XGL_PT_F3D; list.num_pts = 4; list.pts.f3d = points;
+    color.color.rgb.r = r; color.color.rgb.g = g; color.color.rgb.b = blue;
+    facets.facet_type = XGL_FACET_COLOR; facets.num_facets = 1;
+    facets.facets.color_facets = &color;
+    xgl_multi_simple_polygon(b.ctx,
+        XGL_FACET_FLAG_SIDES_ARE_4 | XGL_FACET_FLAG_SHAPE_CONVEX,
+        &facets, NULL, 1, &list);
+    xb_backend_sync();
+    return !b.errors && !xb_cancel_requested();
+}
+
+static int probe_at(int x, int y, float r, float g, float blue, const char *stage)
+{
+    xb_rgb expected;
+    expected.r = r; expected.g = g; expected.b = blue;
+    if (pixel_matches(x, y, &expected)) return 1;
+    if (!xb_cancel_requested()) error_context(stage);
+    return 0;
+}
+
+/* Can a status-bar band survive without being redrawn? A red band is drawn
+ * once on each buffer. Depth mode then renders four frames which clear only
+ * Z and repaint the remaining view. Viewport mode instead limits XGL's
+ * mapping to the view and checks that geometry and a color+Z clear both stay
+ * inside it. The band must still be red on both buffers after every switch. */
+static int probe_persist(int viewport, char *note, size_t size)
+{
+    Xgl_boolean previous_volatile;
+    Xgl_bounds_d3d dc;
+    xb_rgb actual;
+    char stage[80];
+    double height;
+    float green, blue;
+    int previous_z, result, i, x, band_y, view_y;
+    result = 0;
+    if (b.buffers < 2) {
+        fail_kind(XB_FAILURE_UNSUPPORTED, "persistence probe needs two window buffers");
+        return 0;
+    }
+    if (!begin_color_probe(&previous_volatile, &previous_z)) goto done;
+    x = b.width / 2; view_y = b.height / 2; band_y = b.height * 9 / 10;
+    for (i = 0; i < 2; ++i) {
+        xb_backend_clear(1, 1);
+        if (!probe_band(.6f, 1.0f, 1, 0, 0)) goto done;
+        /* Do not assume which raster edge VDC +Y reaches. */
+        if (!i && read_pixel(x, band_y, &actual) && actual.r < .5f) band_y = b.height / 10;
+        if (!probe_at(x, band_y, 1, 0, 0, "persistence setup: band not drawn")) goto done;
+        xb_backend_swap();
+    }
+    if (!viewport) {
+        for (i = 0; i < 4; ++i) {
+            green = i & 1 ? 0.0f : 1.0f; blue = 1.0f - green;
+            xb_backend_clear(0, 1);
+            if (!probe_band(-1.0f, .6f, 0, green, blue)) goto done;
+            sprintf(stage, "depth-only clear, frame %d: view repaint", i);
+            if (!probe_at(x, view_y, 0, green, blue, stage)) goto done;
+            sprintf(stage, "depth-only clear, frame %d: band lost after buffer switch", i);
+            if (!probe_at(x, band_y, 1, 0, 0, stage)) goto done;
+            xb_backend_swap();
+        }
+        copy_text(note, size, "band kept on both buffers over 4 switches; "
+                  "Z-only clear and view repaint leave it intact");
+    } else {
+        memset(&dc, 0, sizeof(dc));
+        xgl_object_get(b.ctx, XGL_CTX_DC_VIEWPORT, &dc);
+        if (b.errors) { error_context("reading the DC viewport"); goto done; }
+        height = dc.ymax - dc.ymin;
+        if (band_y > view_y) dc.ymax -= height * .2; else dc.ymin += height * .2;
+        xgl_object_set(b.ctx, XGL_CTX_VDC_MAP, XGL_VDC_MAP_OFF,
+                       XGL_CTX_DC_VIEWPORT, &dc, 0);
+        b.viewport_reduced = 1;
+        if (b.errors) { error_context("setting a reduced DC viewport"); goto done; }
+        for (i = 0; i < 4; ++i) {
+            if (!probe_band(-1.0f, 1.0f, 0, 1, 0)) goto done;
+            sprintf(stage, "DC viewport y %.0f..%.0f, frame %d: view not drawn",
+                    dc.ymin, dc.ymax, i);
+            if (!probe_at(x, view_y, 0, 1, 0, stage)) goto done;
+            sprintf(stage, "DC viewport y %.0f..%.0f, frame %d: geometry reached the band",
+                    dc.ymin, dc.ymax, i);
+            if (!probe_at(x, band_y, 1, 0, 0, stage)) goto done;
+            xb_backend_clear(1, 1);
+            xb_backend_sync();
+            sprintf(stage, "DC viewport y %.0f..%.0f, frame %d: view not cleared",
+                    dc.ymin, dc.ymax, i);
+            if (!probe_at(x, view_y, 0, 0, 0, stage)) goto done;
+            sprintf(stage, "DC viewport y %.0f..%.0f, frame %d: clear erased the band",
+                    dc.ymin, dc.ymax, i);
+            if (!probe_at(x, band_y, 1, 0, 0, stage)) goto done;
+            xb_backend_swap();
+        }
+        copy_text(note, size, "geometry and color+Z clear stayed inside an 80% DC viewport; "
+                  "band kept on both buffers; timed clears use that viewport");
+    }
+    result = 1;
+done:
+    return end_color_probe(previous_volatile, previous_z, result);
+}
+
+#define XB_SWAP_SAMPLES 200
+static void probe_sort(double *values, int count)
+{
+    double value;
+    int i, j;
+    for (i = 1; i < count; ++i) {
+        value = values[i];
+        for (j = i; j > 0 && values[j - 1] > value; --j) values[j] = values[j - 1];
+        values[j] = value;
+    }
+}
+
+/* Buffer switches with nothing to draw. The period between consecutive
+ * switch calls is the display's retrace period if switches wait for retrace.
+ * Call and wait times show where that delay is spent; busy CPU time placed
+ * between them shows whether other work can overlap it. Nothing is assumed
+ * about the refresh rate. */
+static int probe_swap(double busy, char *note, size_t size)
+{
+    static double period[XB_SWAP_SAMPLES], call[XB_SWAP_SAMPLES], wait[XB_SWAP_SAMPLES];
+    char text[200];
+    double t0, t1, t2, t3, previous;
+    int i, n;
+    if (b.buffers < 2) {
+        fail_kind(XB_FAILURE_UNSUPPORTED, "switch probe needs two window buffers");
+        return 0;
+    }
+    xb_backend_sync();
+    xgl_object_set(b.ctx, XGL_CTX_NEW_FRAME_ACTION, XGL_CTX_NEW_FRAME_SWITCH_BUFFER, 0);
+    previous = 0; n = 0;
+    for (i = 0; i <= XB_SWAP_SAMPLES && !b.errors && !xb_cancel_requested(); ++i) {
+        t0 = xb_now();
+        xgl_context_new_frame(b.ctx);
+        t1 = xb_now();
+        if (busy > 0) while (xb_now() - t1 < busy) {}
+        t2 = xb_now();
+        xgl_context_flush(b.ctx, XGL_FLUSH_SYNCHRONIZE);
+        t3 = xb_now();
+        if (i) {
+            period[n] = t0 - previous; call[n] = t1 - t0; wait[n] = t3 - t2;
+            ++n;
+        }
+        previous = t0;
+    }
+    if (i & 1) xb_backend_swap(); /* leave the original draw buffer selected */
+    if (b.errors || xb_cancel_requested() || n < 3) return 0;
+    probe_sort(period, n); probe_sort(call, n); probe_sort(wait, n);
+    sprintf(text, "%d switches: period med %.2f (min %.2f, max %.2f) ms; "
+            "call med %.2f, wait med %.2f ms; busy %.1f ms between",
+            n, period[n / 2] * 1000, period[0] * 1000, period[n - 1] * 1000,
+            call[n / 2] * 1000, wait[n / 2] * 1000, busy * 1000);
+    copy_text(note, size, text);
+    return 1;
+}
+
+static int apply_probe(const xb_case *test, char *note, size_t size)
+{
+    char text[160];
+    size_t calls;
+    int i;
+    note[0] = '\0';
+    switch (test->probe) {
+    case XB_PROBE_PERSIST_DEPTH: return probe_persist(0, note, size);
+    case XB_PROBE_PERSIST_VIEWPORT: return probe_persist(1, note, size);
+    case XB_PROBE_SWAP: return probe_swap(test->probe_busy, note, size);
+    default: break;
+    }
+    if (!b.hardware_lighting || b.shading != XB_SMOOTH || test->method != XB_MULTI ||
+        test->update != XB_STATIC || test->work != XB_DRAW) {
+        fail_kind(XB_FAILURE_UNSUPPORTED,
+            "lighting/state probes need static smooth multi-polygon draws with native lights");
+        return 0;
+    }
+    b.probe_switches[0] = TRUE;
+    for (i = 1; i <= XB_MAX_LIGHTS; ++i) b.probe_switches[i] = i <= b.light_count;
+    b.probe_lit = 1;
+    switch (test->probe) {
+    case XB_PROBE_LIT_NO_ILLUM:
+        xgl_object_set(b.ctx, XGL_3D_CTX_SURF_FRONT_ILLUMINATION,
+                       XGL_ILLUM_NONE_INTERP_COLOR, 0);
+        copy_text(note, size, "color+normal points with illumination off; "
+                  "lit readback passed before the switch");
+        break;
+    case XB_PROBE_LIGHTS_OFF:
+        for (i = 1; i <= XB_MAX_LIGHTS; ++i) b.probe_switches[i] = FALSE;
+        xgl_object_set(b.ctx, XGL_3D_CTX_LIGHT_SWITCHES, b.probe_switches, 0);
+        sprintf(text, "per-vertex illumination, ambient only: %d point light(s) allocated "
+                "and switched off after lit readback", b.light_count);
+        copy_text(note, size, text);
+        break;
+    case XB_PROBE_STATE_GROUPED:
+    case XB_PROBE_STATE_ALTERNATE:
+        calls = (b.triangles + (size_t)b.batch - 1) / (size_t)b.batch;
+        sprintf(text, "%lu lit/unlit state changes per frame over %lu batches, "
+                "3 attribute calls each; half the batches unlit",
+                (unsigned long)(test->probe == XB_PROBE_STATE_GROUPED ?
+                    (calls > 1 ? 2 : 0) : (calls & 1 ? calls - 1 : calls)),
+                (unsigned long)calls);
+        copy_text(note, size, text);
+        b.probe = test->probe;
+        break;
+    default: break;
+    }
+    return !b.errors && !xb_cancel_requested();
 }
 
 static int validate_transparency(void)
