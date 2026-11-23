@@ -35,6 +35,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 #define XGL_ALIAS_POSE_BYTES (1024UL * 1024UL)
 #define XGL_ALIAS_POSE_VERTICES 4096
 #define XGL_ENTITY_BATCH_VERTICES (256 * 3)
+/* The most points in one triangle strip of a model. */
+#define XGL_ALIAS_STRIP_POINTS 128
 
 /* Particle effects also use this original Quake normal table. */
 float r_avertexnormals[XGL_VERTEX_NORMALS][3] = {
@@ -46,6 +48,11 @@ static cvar_t xgl_sprite_cells = {"xgl_sprite_cells", "8", true, false, 0, NULL}
 static cvar_t xgl_entity_triangles = {"xgl_entity_triangles", "512", true, false, 0, NULL};
 static cvar_t xgl_playercolors = {"xgl_playercolors", "1", true, false, 0, NULL};
 static cvar_t xgl_alias_shade = {"xgl_alias_shade", "1", false, false, 0, NULL};
+/* The fewest triangles a run of a model's triangles must have to be sent as
+ * a strip. Strips of eight and more cost the Sun ZX a third less for each
+ * triangle than separate triangles; how short a strip still pays is not yet
+ * measured there. Below 2, every triangle is sent separately. */
+static cvar_t xgl_alias_strips = {"xgl_alias_strips", "4", false, false, 0, NULL};
 static byte xgl_player_translation[MAX_SCOREBOARD][256];
 static int xgl_player_color[MAX_SCOREBOARD];
 static int xgl_entity_extra_used;
@@ -108,6 +115,18 @@ typedef struct {
     int *commands;
     xgl_alias_parent_t *parents;
     unsigned short *indices;
+    /* The same triangles joined into strips, where the commands say which
+     * pose vertices are one point of the mesh; none otherwise. strip_lengths
+     * has the number of points of each strip, longest first, and
+     * strip_vertices their points, one strip after another, as pose
+     * vertices. point_corner says, for a pose vertex that is a strip point,
+     * which corner of which triangle has its color: four times the
+     * triangle, plus the corner. */
+    int strip_count;
+    unsigned short *strip_lengths, *strip_vertices, *point_corner;
+    /* For the fewest triangles last asked of a strip: how many strips have
+     * as many, and their points in all. */
+    int split_shortest, split_strips, split_points;
     size_t bytes;
 } xgl_alias_topology_t;
 
@@ -132,8 +151,15 @@ typedef struct {
  * until the main thread joins the jobs, before it draws any entities. */
 #define XGL_ALIAS_FRAME_JOBS 32
 #define XGL_ALIAS_FRAME_CORNERS 16380
+#define XGL_ALIAS_FRAME_STRIPS 4096
 typedef struct {
     int visible_index, lit, triangles, count;
+    /* With strips above zero the output begins with that many strips, of
+     * strip_points points in all and `lengths` each, and the rest of it is
+     * separate triangles. The lengths are the frame's own copy: the caches
+     * may change before the output is drawn. */
+    int strips, strip_points;
+    const unsigned short *lengths;
     float light;
     xgl_alias_shade_t shade;
     vec3_t scale, scale_origin, forward, right, up, origin;
@@ -149,7 +175,8 @@ typedef struct {
 
 typedef struct {
     xgl_alias_job_t jobs[XGL_ALIAS_FRAME_JOBS];
-    int job_count, pose_count, corner_count, pending;
+    int job_count, pose_count, corner_count, length_count, pending;
+    unsigned short lengths[XGL_ALIAS_FRAME_STRIPS];
     byte palette[768];
     float gamma[256];
     trivertx_t poses[XGL_ALIAS_FRAME_CORNERS];
@@ -173,6 +200,7 @@ static int xgl_alias_planned;
 
 static void XGL_RunAliasJob(void *argument);
 static void XGL_JoinAliasJobs(void);
+static int XGL_EntitySetting(float value, int low, int high);
 
 void XGL_AliasFinishFrame(void)
 {
@@ -182,6 +210,7 @@ void XGL_AliasFinishFrame(void)
         xgl_alias_frame->job_count = 0;
         xgl_alias_frame->pose_count = 0;
         xgl_alias_frame->corner_count = 0;
+        xgl_alias_frame->length_count = 0;
     }
 }
 
@@ -246,6 +275,9 @@ static void XGL_FreeAliasTopology(xgl_alias_topology_t *topology,
     free(topology->commands);
     free(topology->parents);
     free(topology->indices);
+    free(topology->strip_lengths);
+    free(topology->strip_vertices);
+    free(topology->point_corner);
     xgl_alias_pose_bytes -= topology->bytes;
     memset(topology, 0, sizeof(*topology));
 }
@@ -467,6 +499,213 @@ static int XGL_AliasPoseRoom(size_t bytes, const xgl_alias_topology_t *keep)
     return 1;
 }
 
+/* Join a topology's triangles into strips, once, when it is made. Two
+ * corners are the same point of a strip when they are the same point of the
+ * mesh: pose vertices that `welds` says are one, or middles of edges between
+ * the same two points. Such corners are at one position, have one normal and
+ * one place on the skin, so one color, whatever the pose and the skin.
+ *
+ * Each triangle in turn, unless a strip already has it, begins a strip that
+ * is carried through its neighbors both ways until none is free; of the
+ * three ways the triangle can lie in a strip, the longest is kept. The
+ * device does not cull, so a strip may turn either way. Without memory, or
+ * with welds that make no sense, the topology is left without strips. */
+static void XGL_BuildAliasStrips(xgl_alias_topology_t *topology, const int *welds)
+{
+    unsigned short strip[XGL_ALIAS_STRIP_POINTS], best[XGL_ALIAS_STRIP_POINTS];
+    unsigned short backward[XGL_ALIAS_STRIP_POINTS];
+    short members[XGL_ALIAS_STRIP_POINTS], best_members[XGL_ALIAS_STRIP_POINTS];
+    int counts[XGL_ALIAS_STRIP_POINTS + 1];
+    void *memory;
+    int *edge_slots;
+    unsigned short *canon, *middle_slots, *points, *lengths, *corner;
+    short (*neighbor)[3];
+    byte *used;
+    size_t bytes, extra;
+    unsigned int hash;
+    int triangles, vertices, base, edge_size, middle_size, i, j, k, e, t, n, a, b, x, y, z;
+    int low, high, other, other_edge, slot, seed, way, best_n, forward, back, total, strips;
+    int most, length, offset;
+    triangles = topology->triangle_count; vertices = topology->vertex_count;
+    base = topology->base_count;
+    if (triangles < 2 || triangles > 32767 || vertices > 65535) return;
+    for (edge_size = 16; edge_size < 6 * triangles; edge_size <<= 1) {}
+    for (middle_size = 16; middle_size < 2 * (vertices - base); middle_size <<= 1) {}
+    bytes = (size_t)edge_size * sizeof(*edge_slots) +
+            ((size_t)vertices + middle_size + 3 * (size_t)triangles + triangles) * sizeof(unsigned short) +
+            (size_t)triangles * sizeof(*neighbor) + (size_t)triangles;
+    memory = malloc(bytes);
+    if (!memory) return;
+    memset(memory, 0, bytes);
+    edge_slots = (int *)memory;
+    canon = (unsigned short *)(edge_slots + edge_size);
+    middle_slots = canon + vertices;
+    points = middle_slots + middle_size;
+    lengths = points + 3 * triangles;
+    neighbor = (short (*)[3])(lengths + triangles);
+    used = (byte *)(neighbor + triangles);
+    /* Which vertex stands for each: the first that is the same point. */
+    for (i = 0; i < base; ++i) {
+        if (welds[i] < 0 || welds[i] > i || welds[welds[i]] != welds[i]) { free(memory); return; }
+        canon[i] = (unsigned short)welds[i];
+    }
+    for (; i < vertices; ++i) {
+        a = canon[topology->parents[i].a]; b = canon[topology->parents[i].b];
+        low = a < b ? a : b; high = a < b ? b : a;
+        hash = ((unsigned int)low * 2654435761U ^ (unsigned int)high * 40503U) & (unsigned int)(middle_size - 1);
+        for (;; hash = (hash + 1) & (unsigned int)(middle_size - 1)) {
+            if (!middle_slots[hash]) {
+                middle_slots[hash] = (unsigned short)(i - base + 1);
+                canon[i] = (unsigned short)i;
+                break;
+            }
+            j = middle_slots[hash] - 1 + base;
+            a = canon[topology->parents[j].a]; b = canon[topology->parents[j].b];
+            if ((a < b ? a : b) == low && (a < b ? b : a) == high) { canon[i] = (unsigned short)j; break; }
+        }
+    }
+    /* Which triangle lies across each edge of each. An edge with more than
+     * two triangles on it joins the first two; a triangle with two corners
+     * at one point joins nothing. */
+    for (t = 0; t < triangles; ++t) neighbor[t][0] = neighbor[t][1] = neighbor[t][2] = -1;
+    for (t = 0; t < triangles; ++t) {
+        corner = topology->indices + 3 * t;
+        if (canon[corner[0]] == canon[corner[1]] || canon[corner[1]] == canon[corner[2]] ||
+            canon[corner[2]] == canon[corner[0]]) continue;
+        for (e = 0; e < 3; ++e) {
+            a = canon[corner[e]]; b = canon[corner[e == 2 ? 0 : e + 1]];
+            low = a < b ? a : b; high = a < b ? b : a;
+            hash = ((unsigned int)low * 2654435761U ^ (unsigned int)high * 40503U) & (unsigned int)(edge_size - 1);
+            for (;; hash = (hash + 1) & (unsigned int)(edge_size - 1)) {
+                slot = edge_slots[hash];
+                if (!slot) { edge_slots[hash] = 3 * t + e + 1; break; }
+                other = (slot - 1) / 3; other_edge = (slot - 1) % 3;
+                a = canon[topology->indices[3 * other + other_edge]];
+                b = canon[topology->indices[3 * other + (other_edge == 2 ? 0 : other_edge + 1)]];
+                if ((a < b ? a : b) != low || (a < b ? b : a) != high) continue;
+                if (neighbor[other][other_edge] < 0 && other != t) {
+                    neighbor[other][other_edge] = (short)t;
+                    neighbor[t][e] = (short)other;
+                }
+                break;
+            }
+        }
+    }
+    total = strips = 0;
+    for (seed = 0; seed < triangles; ++seed) {
+        if (used[seed]) continue;
+        corner = topology->indices + 3 * seed;
+        best_n = 0;
+        for (way = 0; way < 3; ++way) {
+            /* The seed's corner `way` is the middle one of its three
+             * points; the strip leaves through the edges either side. */
+            strip[0] = canon[corner[way == 0 ? 2 : way - 1]];
+            strip[1] = canon[corner[way]];
+            strip[2] = canon[corner[way == 2 ? 0 : way + 1]];
+            members[0] = (short)seed; used[seed] = 2;
+            n = 1; forward = 3; back = 0;
+            for (k = 0; k < 2; ++k) {
+                /* Onward from the last triangle, then back from the first. */
+                t = seed;
+                x = k ? strip[1] : strip[1]; y = k ? strip[0] : strip[2];
+                while (n < XGL_ALIAS_STRIP_POINTS - 2) {
+                    const unsigned short *at = topology->indices + 3 * t;
+                    for (e = 0; e < 3; ++e) {
+                        a = canon[at[e]]; b = canon[at[e == 2 ? 0 : e + 1]];
+                        if ((a == x && b == y) || (a == y && b == x)) break;
+                    }
+                    if (e == 3 || neighbor[t][e] < 0 || used[neighbor[t][e]]) break;
+                    t = neighbor[t][e];
+                    at = topology->indices + 3 * t;
+                    z = canon[at[0]];
+                    if (z == x || z == y) z = canon[at[1]];
+                    if (z == x || z == y) z = canon[at[2]];
+                    if (k) backward[back++] = (unsigned short)z;
+                    else strip[forward++] = (unsigned short)z;
+                    members[n++] = (short)t; used[t] = 2;
+                    x = y; y = z;
+                }
+            }
+            if (n > best_n) {
+                best_n = n;
+                for (i = 0; i < back; ++i) best[i] = backward[back - 1 - i];
+                memcpy(best + back, strip, (size_t)forward * sizeof(strip[0]));
+                memcpy(best_members, members, (size_t)n * sizeof(members[0]));
+            }
+            for (i = 0; i < n; ++i) used[members[i]] = 0;
+        }
+        for (i = 0; i < best_n; ++i) used[best_members[i]] = 1;
+        memcpy(points + total, best, (size_t)(best_n + 2) * sizeof(best[0]));
+        lengths[strips++] = (unsigned short)(best_n + 2);
+        total += best_n + 2;
+    }
+    /* Every triangle is in exactly one strip. */
+    if (total - 2 * strips != triangles) { free(memory); return; }
+    extra = ((size_t)strips + total + vertices) * sizeof(unsigned short);
+    if (!XGL_AliasPoseRoom(extra, topology)) { free(memory); return; }
+    topology->strip_lengths = (unsigned short *)malloc((size_t)strips * sizeof(unsigned short));
+    topology->strip_vertices = (unsigned short *)malloc((size_t)total * sizeof(unsigned short));
+    topology->point_corner = (unsigned short *)malloc((size_t)vertices * sizeof(unsigned short));
+    if (!topology->strip_lengths || !topology->strip_vertices || !topology->point_corner) {
+        free(topology->strip_lengths); free(topology->strip_vertices); free(topology->point_corner);
+        topology->strip_lengths = topology->strip_vertices = topology->point_corner = NULL;
+        free(memory);
+        return;
+    }
+    /* Longest first: those long enough to be sent as strips then come
+     * before the rest, whatever length is asked. */
+    memset(counts, 0, sizeof(counts));
+    for (i = 0; i < strips; ++i) ++counts[lengths[i]];
+    most = offset = 0;
+    for (length = XGL_ALIAS_STRIP_POINTS; length >= 3; --length) {
+        n = counts[length];
+        counts[length] = most;
+        most += n;
+    }
+    /* counts[length] is now the place of the next strip of that length;
+     * where its points go follows from the strips before it. */
+    for (i = 0; i < strips; ++i) topology->strip_lengths[counts[lengths[i]]++] = lengths[i];
+    for (length = XGL_ALIAS_STRIP_POINTS; length >= 3; --length) counts[length] = 0;
+    for (i = 0; i < strips; ++i) {
+        /* The points before the first strip of each length. */
+        if (!i || topology->strip_lengths[i] != topology->strip_lengths[i - 1])
+            counts[topology->strip_lengths[i]] = offset;
+        offset += topology->strip_lengths[i];
+    }
+    offset = 0;
+    for (i = 0; i < strips; ++i) {
+        memcpy(topology->strip_vertices + counts[lengths[i]], points + offset,
+               (size_t)lengths[i] * sizeof(unsigned short));
+        counts[lengths[i]] += lengths[i];
+        offset += lengths[i];
+    }
+    memset(topology->point_corner, 0xff, (size_t)vertices * sizeof(unsigned short));
+    for (t = 0; t < triangles; ++t)
+        for (j = 0; j < 3; ++j) {
+            i = canon[topology->indices[3 * t + j]];
+            if (topology->point_corner[i] == 0xffff) topology->point_corner[i] = (unsigned short)(4 * t + j);
+        }
+    topology->strip_count = strips;
+    topology->split_shortest = -1;
+    topology->bytes += extra;
+    xgl_alias_pose_bytes += extra;
+    free(memory);
+}
+
+/* How many of a topology's strips have at least `shortest` triangles, and
+ * how many points those have. */
+static void XGL_AliasStripSplit(xgl_alias_topology_t *topology, int shortest)
+{
+    int strips, points;
+    if (topology->split_shortest == shortest) return;
+    strips = points = 0;
+    while (strips < topology->strip_count && topology->strip_lengths[strips] - 2 >= shortest)
+        points += topology->strip_lengths[strips++];
+    topology->split_shortest = shortest;
+    topology->split_strips = strips;
+    topology->split_points = points;
+}
+
 static xgl_alias_topology_t *XGL_AliasTopology(const aliashdr_t *header,
                                                const xgl_alias_cache_t *colors, int create)
 {
@@ -541,7 +780,49 @@ static xgl_alias_topology_t *XGL_AliasTopology(const aliashdr_t *header,
         XGL_FreeAliasTopology(topology, XGL_PROFILE_ALIAS_POSE_SLOT_EVICTIONS);
         return NULL;
     }
+    /* A model the loader built says, after its commands, which pose
+     * vertices are one point of the mesh. */
+    if ((int)(order - colors->commands) + header->poseverts == colors->command_words)
+        XGL_BuildAliasStrips(topology, order);
     return topology;
+}
+
+/* Where on the skin a pose vertex is: a command's own coordinates, or for
+ * the middle of an edge the mean of its two ends', as the fallback has it. */
+static void XGL_AliasSkinPlace(const xgl_alias_topology_t *topology, int vertex, float *place)
+{
+    const int *order;
+    float a[2], b[2];
+    int count, consumed;
+    if (vertex >= topology->base_count) {
+        XGL_AliasSkinPlace(topology, topology->parents[vertex].a, a);
+        XGL_AliasSkinPlace(topology, topology->parents[vertex].b, b);
+        place[0] = (a[0] + b[0]) * .5f;
+        place[1] = (a[1] + b[1]) * .5f;
+        return;
+    }
+    place[0] = place[1] = 0;
+    order = topology->commands;
+    consumed = 0;
+    while ((count = *order++) != 0) {
+        if (count < 0) count = -count;
+        if (vertex < consumed + count) {
+            memcpy(place, order + 2 * (vertex - consumed), 2 * sizeof(float));
+            return;
+        }
+        consumed += count;
+        order += count * 2;
+    }
+}
+
+/* Two normals that cancel leave the point between them no direction of its
+ * own, and it takes one of theirs. Which one must not depend on which end
+ * is named first: the triangles either side of the edge name them in
+ * opposite orders, and both must light that point alike, the more so when
+ * it is one point of a strip. The end that comes first on the skin has it. */
+static int XGL_AliasSkinFirst(const float *a, const float *b)
+{
+    return a[0] < b[0] || (a[0] == b[0] && a[1] <= b[1]);
 }
 
 static xgl_alias_pose_cache_t *XGL_FindAliasPose(const aliashdr_t *header,
@@ -551,6 +832,7 @@ static xgl_alias_pose_cache_t *XGL_FindAliasPose(const aliashdr_t *header,
     xgl_alias_pose_cache_t *cache;
     xgl_alias_topology_t *topology;
     xgl_alias_normals_t normals;
+    float place_a[2], place_b[2];
     unsigned int hash;
     size_t bytes;
     int slot, i, j, index, a, b;
@@ -615,8 +897,11 @@ static xgl_alias_pose_cache_t *XGL_FindAliasPose(const aliashdr_t *header,
         a = topology->parents[i].a; b = topology->parents[i].b;
         for (j = 0; j < 3; ++j)
             cache->normals[i][j] = (cache->normals[a][j] + cache->normals[b][j]) * .5f;
-        if (VectorNormalize(cache->normals[i]) == 0)
-            VectorCopy(cache->normals[a], cache->normals[i]);
+        if (VectorNormalize(cache->normals[i]) == 0) {
+            XGL_AliasSkinPlace(topology, a, place_a);
+            XGL_AliasSkinPlace(topology, b, place_b);
+            VectorCopy(cache->normals[XGL_AliasSkinFirst(place_a, place_b) ? a : b], cache->normals[i]);
+        }
     }
     return cache;
 }
@@ -766,10 +1051,32 @@ typedef struct {
     byte valid[257];
 } xgl_alias_output_cursor_t;
 
+/* A palette color under the model's light, ready for the device: worked
+ * out once for each color a model uses. Providing a gamma snapshot makes
+ * this a pure worker operation. */
+static const float *XGL_AliasColor(const xgl_alias_job_t *job, xgl_alias_output_cursor_t *cursor,
+                                   int index)
+{
+    float *rgb;
+    int k, slot;
+    slot = index + 1;
+    rgb = cursor->prepared[slot];
+    if (!cursor->valid[slot]) {
+        XGL_AliasRawColor(job->palette, index, rgb);
+        for (k = 0; k < 3; ++k) rgb[k] *= job->light;
+        if (job->gamma) {
+            /* Palette and clamped entity light are both in [0,1]. */
+            for (k = 0; k < 3; ++k)
+                rgb[k] = job->gamma[(int)(rgb[k] * 255.0f + .5f)];
+        } else XGL_PrepareColor(rgb);
+        cursor->valid[slot] = 1;
+    }
+    return rgb;
+}
+
 /* Resume at the next visible triangle when a native batch was split.
- * Providing a gamma snapshot makes this a pure worker operation. Models the
- * device illuminates are written as points with normals; all others, which
- * are submitted unlit, as points without. */
+ * Models the device illuminates are written as points with normals; all
+ * others, which are submitted unlit, as points without. */
 static void XGL_CopyAliasOutput(const xgl_alias_job_t *job, xgl_alias_output_cursor_t *cursor,
                                 void *output, int count)
 {
@@ -778,8 +1085,9 @@ static void XGL_CopyAliasOutput(const xgl_alias_job_t *job, xgl_alias_output_cur
     const xgl_alias_work_vertex_t *source;
     xgl_native_vertex_t *out;
     xgl_color_vertex_t *plain;
-    float *rgb, shade;
-    int i, j, k, slot, mode;
+    const float *rgb;
+    float shade;
+    int i, j, mode;
     topology = job->cached_pose->topology;
     mode = job->shade.mode;
     out = (xgl_native_vertex_t *)output;
@@ -789,18 +1097,7 @@ static void XGL_CopyAliasOutput(const xgl_alias_job_t *job, xgl_alias_output_cur
         colors = &job->colors->colors[i];
         if (!colors->visible) continue;
         for (j = 0; j < 3; ++j) {
-            slot = colors->index[j] + 1;
-            rgb = cursor->prepared[slot];
-            if (!cursor->valid[slot]) {
-                XGL_AliasRawColor(job->palette, colors->index[j], rgb);
-                for (k = 0; k < 3; ++k) rgb[k] *= job->light;
-                if (job->gamma) {
-                    /* Palette and clamped entity light are both in [0,1]. */
-                    for (k = 0; k < 3; ++k)
-                        rgb[k] = job->gamma[(int)(rgb[k] * 255.0f + .5f)];
-                } else XGL_PrepareColor(rgb);
-                cursor->valid[slot] = 1;
-            }
+            rgb = XGL_AliasColor(job, cursor, colors->index[j]);
             source = &job->work[topology->indices[i * 3 + j]];
             if (mode == XGL_SHADE_NATIVE) {
                 VectorCopy(source->position, out->position);
@@ -823,18 +1120,117 @@ static void XGL_CopyAliasOutput(const xgl_alias_job_t *job, xgl_alias_output_cur
     }
 }
 
+/* The points of strips, `count` of them, as records without normals: each
+ * where its pose vertex is, in the color that vertex's place on the skin
+ * has under the model's light. */
+static void XGL_CopyAliasPoints(const xgl_alias_job_t *job, xgl_alias_output_cursor_t *cursor,
+                                const unsigned short *vertices, int count,
+                                xgl_color_vertex_t *out)
+{
+    const xgl_alias_topology_t *topology;
+    const xgl_alias_color_t *colors;
+    const xgl_alias_work_vertex_t *source;
+    const float *rgb;
+    float shade;
+    int i, corner, shaded;
+    topology = job->cached_pose->topology;
+    colors = job->colors->colors;
+    shaded = job->shade.mode == XGL_SHADE_CPU;
+    for (i = 0; i < count; ++i, ++out) {
+        corner = topology->point_corner[vertices[i]];
+        rgb = XGL_AliasColor(job, cursor, colors[corner >> 2].index[corner & 3]);
+        source = &job->work[vertices[i]];
+        VectorCopy(source->position, out->position);
+        if (shaded) {
+            shade = source->light.shade;
+            out->color.rgb[0] = rgb[0] * shade;
+            out->color.rgb[1] = rgb[1] * shade;
+            out->color.rgb[2] = rgb[2] * shade;
+        } else { VectorCopy(rgb, out->color.rgb); }
+    }
+}
+
+/* Where the writing of the strips too short to send as strips has got to:
+ * they go out as separate triangles, as the native batch has room. */
+typedef struct {
+    int strip, triangle;
+    const unsigned short *vertices;
+} xgl_alias_rest_t;
+
+static void XGL_CopyAliasRest(const xgl_alias_job_t *job, xgl_alias_output_cursor_t *cursor,
+                              xgl_alias_rest_t *rest, xgl_color_vertex_t *out, int count)
+{
+    const xgl_alias_topology_t *topology;
+    topology = job->cached_pose->topology;
+    for (; count > 0 && rest->strip < topology->strip_count; count -= 3, out += 3) {
+        XGL_CopyAliasPoints(job, cursor, rest->vertices + rest->triangle, 3, out);
+        if (++rest->triangle == topology->strip_lengths[rest->strip] - 2) {
+            rest->vertices += topology->strip_lengths[rest->strip];
+            rest->triangle = 0;
+            ++rest->strip;
+        }
+    }
+}
+
+/* Whether a model goes out as strips, and if so with the topology's count
+ * of those long enough up to date. Strips are points without normals, so a
+ * model the device illuminates has none; nor has one with holes in it. */
+static int XGL_AliasUsesStrips(xgl_alias_topology_t *topology, const xgl_alias_cache_t *colors,
+                               const xgl_alias_shade_t *shade)
+{
+    int shortest;
+    shortest = XGL_EntitySetting(xgl_alias_strips.value, 0, XGL_ALIAS_STRIP_POINTS);
+    if (shortest < 2 || shade->mode == XGL_SHADE_NATIVE || !topology->strip_count ||
+        colors->visible_triangles != colors->triangle_count) return 0;
+    XGL_AliasStripSplit(topology, shortest);
+    return topology->split_strips > 0;
+}
+
+/* The records a model comes to as strips and the triangles left over. */
+static int XGL_AliasStripRecords(const xgl_alias_topology_t *topology)
+{
+    return topology->split_points +
+        3 * (topology->triangle_count - (topology->split_points - 2 * topology->split_strips));
+}
+
 static void XGL_EmitAliasPose(const xgl_alias_pose_cache_t *cache,
                              xgl_alias_draw_t *draw, float light, int lit)
 {
+    static xgl_color_vertex_t points[XGL_ALIAS_STRIP_POINTS];
     xgl_alias_output_cursor_t cursor;
     xgl_alias_job_t job;
+    xgl_alias_rest_t rest;
+    xgl_alias_topology_t *topology;
+    xgl_color_vertex_t *plain;
     void *vertices;
-    int count, remaining;
+    int count, remaining, i;
     cursor.triangle = 0;
     memset(cursor.valid, 0, sizeof(cursor.valid));
     job.work = xgl_alias_work; job.colors = draw->cache; job.cached_pose = cache;
     job.palette = xgl_palette; job.light = light; job.gamma = NULL;
     job.shade = *draw->shade;
+    topology = cache->topology;
+    if (XGL_AliasUsesStrips(topology, draw->cache, draw->shade)) {
+        /* Each strip is a native call of its own; what is left joins the
+         * batch of separate triangles. */
+        rest.vertices = topology->strip_vertices;
+        for (i = 0; i < topology->split_strips; ++i) {
+            count = topology->strip_lengths[i];
+            XGL_CopyAliasPoints(&job, &cursor, rest.vertices, count, points);
+            XGL_DrawColorStrip(points, count, 1, 1);
+            rest.vertices += count;
+        }
+        rest.strip = topology->split_strips; rest.triangle = 0;
+        remaining = XGL_AliasStripRecords(topology) - topology->split_points;
+        while (remaining) {
+            count = remaining;
+            plain = XGL_ReserveColorTriangles(&count, 1, 1);
+            if (!plain) return;
+            XGL_CopyAliasRest(&job, &cursor, &rest, plain, count);
+            remaining -= count;
+        }
+        return;
+    }
     remaining = draw->cache->visible_triangles * 3;
     while (remaining) {
         count = remaining;
@@ -849,13 +1245,27 @@ static void XGL_EmitAliasPose(const xgl_alias_pose_cache_t *cache,
 
 static void XGL_RunAliasJob(void *argument)
 {
+    const xgl_alias_topology_t *topology;
     xgl_alias_job_t *job;
     xgl_alias_output_cursor_t cursor;
+    xgl_alias_rest_t rest;
     job = (xgl_alias_job_t *)argument;
     cursor.triangle = 0;
     memset(cursor.valid, 0, sizeof(cursor.valid));
     XGL_PrepareAliasPose(job->scale, job->scale_origin, job->pose, job->cached_pose,
                          job->forward, job->right, job->up, job->origin, &job->shade, job->work);
+    if (job->strips > 0) {
+        /* The strips one after another, then the triangles left over. */
+        topology = job->cached_pose->topology;
+        XGL_CopyAliasPoints(job, &cursor, topology->strip_vertices, job->strip_points,
+                            (xgl_color_vertex_t *)job->output);
+        rest.strip = job->strips; rest.triangle = 0;
+        rest.vertices = topology->strip_vertices + job->strip_points;
+        XGL_CopyAliasRest(job, &cursor, &rest,
+                          (xgl_color_vertex_t *)job->output + job->strip_points,
+                          job->count - job->strip_points);
+        return;
+    }
     XGL_CopyAliasOutput(job, &cursor, job->output, job->count);
 }
 
@@ -875,6 +1285,7 @@ void XGL_EntitiesInit(void)
     Cvar_RegisterVariable(&xgl_entity_triangles);
     Cvar_RegisterVariable(&xgl_playercolors);
     Cvar_RegisterVariable(&xgl_alias_shade);
+    Cvar_RegisterVariable(&xgl_alias_strips);
     for (i = 0; i < MAX_SCOREBOARD; ++i) xgl_player_color[i] = -1;
 }
 
@@ -915,13 +1326,19 @@ static void XGL_EntityMidpoint(const xgl_entity_vertex_t *a,
                               const xgl_entity_vertex_t *b,
                               xgl_entity_vertex_t *out)
 {
+    const xgl_entity_vertex_t *first;
+    float place_a[2], place_b[2];
     int i;
     for (i = 0; i < 3; ++i) {
         out->position[i] = (a->position[i] + b->position[i]) * .5f;
         out->normal[i] = (a->normal[i] + b->normal[i]) * .5f;
     }
     if (VectorNormalize(out->normal) == 0) {
-        VectorCopy(a->normal, out->normal);
+        /* The same choice as the cached pose makes. */
+        place_a[0] = a->s; place_a[1] = a->t;
+        place_b[0] = b->s; place_b[1] = b->t;
+        first = XGL_AliasSkinFirst(place_a, place_b) ? a : b;
+        VectorCopy(first->normal, out->normal);
     }
     out->s = (a->s + b->s) * .5f;
     out->t = (a->t + b->t) * .5f;
@@ -1060,6 +1477,7 @@ static void XGL_SubmitAliasJob(int visible_index, const entity_t *entity, const 
                                const vec3_t right, const vec3_t up, float light, int lit,
                                const xgl_alias_shade_t *shade)
 {
+    xgl_alias_topology_t *topology;
     xgl_alias_job_t *job;
     int corners;
     job = &xgl_alias_frame->jobs[xgl_alias_frame->job_count];
@@ -1082,10 +1500,24 @@ static void XGL_SubmitAliasJob(int visible_index, const entity_t *entity, const 
     job->palette = xgl_alias_frame->palette;
     job->gamma = xgl_alias_frame->gamma;
     corners = colors->visible_triangles * 3;
+    job->strips = job->strip_points = 0;
+    job->lengths = NULL;
+    topology = cached_pose->topology;
+    if (XGL_AliasUsesStrips(topology, colors, shade) &&
+        topology->split_strips <= XGL_ALIAS_FRAME_STRIPS - xgl_alias_frame->length_count) {
+        /* Never more records than as separate triangles. */
+        job->strips = topology->split_strips;
+        job->strip_points = topology->split_points;
+        job->lengths = xgl_alias_frame->lengths + xgl_alias_frame->length_count;
+        memcpy(xgl_alias_frame->lengths + xgl_alias_frame->length_count, topology->strip_lengths,
+               (size_t)job->strips * sizeof(topology->strip_lengths[0]));
+        corners = XGL_AliasStripRecords(topology);
+    }
     job->count = corners;
     job->output = xgl_alias_frame->output + xgl_alias_frame->corner_count;
     if (XGL_SMPSubmit(XGL_RunAliasJob, job)) {
         ++xgl_alias_frame->job_count;
+        xgl_alias_frame->length_count += job->strips;
         xgl_alias_frame->corner_count += corners;
         xgl_alias_frame->pose_count += header->poseverts;
         xgl_alias_frame->pending = 1;
@@ -1347,6 +1779,7 @@ void XGL_AliasPrepareFrame(void)
         if (!xgl_alias_frame) return;
         xgl_alias_frame->pending = xgl_alias_frame->job_count = 0;
         xgl_alias_frame->pose_count = xgl_alias_frame->corner_count = 0;
+        xgl_alias_frame->length_count = 0;
         /* Every record handed to the device has been written in full; this
          * only keeps the first frame's untouched tail well defined. */
         memset(xgl_alias_frame->output, 0, sizeof(xgl_alias_frame->output));
@@ -1519,7 +1952,8 @@ void XGL_DrawAliasEntities(void)
 {
     xgl_profile_draw_scope_t profile;
     xgl_alias_job_t *job;
-    int i, pass, next_job, plan;
+    const xgl_color_vertex_t *points;
+    int i, j, pass, next_job, plan;
     /* Hit probes never allocate or evict. Fence before normal serial cache
      * accesses by later/fallback draws and before reading worker output. */
     XGL_JoinAliasJobs();
@@ -1539,7 +1973,15 @@ void XGL_DrawAliasEntities(void)
             job = xgl_alias_frame && next_job < xgl_alias_frame->job_count ?
                 &xgl_alias_frame->jobs[next_job] : NULL;
             if (plan >= 0 && job && job->visible_index == i) {
-                if (job->shade.mode == XGL_SHADE_NATIVE)
+                if (job->strips > 0) {
+                    points = (const xgl_color_vertex_t *)job->output;
+                    for (j = 0; j < job->strips; ++j) {
+                        XGL_DrawColorStrip(points, job->lengths[j], 1, 1);
+                        points += job->lengths[j];
+                    }
+                    if (job->count > job->strip_points)
+                        XGL_DrawColorTriangles(points, job->count - job->strip_points, 1, 1);
+                } else if (job->shade.mode == XGL_SHADE_NATIVE)
                     XGL_DrawNativeTriangles((const xgl_native_vertex_t *)job->output,
                                             job->count, job->lit, 1, 1);
                 else XGL_DrawColorTriangles((const xgl_color_vertex_t *)job->output,

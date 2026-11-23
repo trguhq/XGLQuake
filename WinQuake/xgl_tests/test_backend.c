@@ -42,6 +42,8 @@ static const void *submitted_sources[8192 / 3];
 /* Points submitted without normals are recorded with a zero normal. */
 static byte submitted_plain[8192];
 static int submitted_count;
+/* Triangle strip calls, and the points of the last. */
+static int strip_calls, strip_points;
 static Xgl_color recorded_quad_colors[1024];
 static Xgl_pt_f2d recorded_quad_points[1024][4];
 static const Xgl_pt_list *queued_quad_lists[1024];
@@ -249,6 +251,32 @@ void xgl_context_new_frame(Xgl_ctx context)
         native_event('C');
         ++clear_calls;
         clear_viewport = dc_viewport;
+    }
+}
+
+/* One strip of points that carry their own colors, as the Sun ZX was
+ * found to draw them: no facet data, no normals, and so unlit. Its points
+ * are recorded with the triangles'. */
+void xgl_triangle_strip(Xgl_ctx context, Xgl_facet_list *facets, Xgl_pt_list *list)
+{
+    Xgl_pt_color_f3d point;
+    Xgl_usgn32 i;
+    assert(context == xb.scene && !facets && list && !list->bbox);
+    assert(mapping != XGL_VDC_MAP_OFF);
+    assert(list->pt_type == XGL_PT_COLOR_F3D && list->num_pts >= 3);
+    assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+    native_event('R');
+    ++strip_calls;
+    strip_points = (int)list->num_pts;
+    for (i = 0; i < list->num_pts; ++i) {
+        assert(submitted_count < (int)(sizeof(submitted_vertices) / sizeof(submitted_vertices[0])));
+        memcpy(&point, (const byte *)list->pts.color_f3d + i * sizeof(point), sizeof(point));
+        memset(&submitted_vertices[submitted_count], 0, sizeof(submitted_vertices[0]));
+        submitted_vertices[submitted_count].x = point.x;
+        submitted_vertices[submitted_count].y = point.y;
+        submitted_vertices[submitted_count].z = point.z;
+        submitted_vertices[submitted_count].color = point.color;
+        submitted_plain[submitted_count++] = 1;
     }
 }
 
@@ -465,6 +493,7 @@ static void reset_backend(void)
     }
     clear_calls = swap_calls = polygon_calls = text_calls = extent_calls = flush_calls = 0;
     text_color_sets = audio_updates = submitted_count = 0;
+    strip_calls = strip_points = 0;
     glyph_count = spacing_mode = proportional_metrics = vertical_advance = 0;
     space_mode = 0;
     current_spacing = 0;
@@ -1174,6 +1203,68 @@ static void test_color_batches(void)
     assert(!xb.count && polygon_calls == 1);
 }
 
+static void test_color_strips(void)
+{
+    xgl_color_vertex_t points[8], cached[6];
+    xgl_native_vertex_t normals[3];
+    int i;
+    reset_backend();
+    fill_color_vertices(points, 8, 0);
+    fill_color_vertices(cached, 6, 100);
+    /* Without a scene, or without three points, nothing is drawn. */
+    XGL_DrawColorStrip(points, 8, 1, 1);
+    XGL_BeginScene();
+    XGL_DrawColorStrip(points, 2, 1, 1);
+    XGL_DrawColorStrip(NULL, 8, 1, 1);
+    assert(!strip_calls && !submitted_count);
+    /* A strip is one native call, made at once. Triangles of the same
+     * state that wait in the batch stay there. */
+    XGL_DrawColorTriangles(cached, 6, 1, 1);
+    XGL_DrawColorStrip(points, 8, 1, 1);
+    assert(strip_calls == 1 && strip_points == 8 && !polygon_calls && xb.count == 6);
+    assert(submitted_count == 8 && illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+    for (i = 0; i < 8; ++i) {
+        assert(submitted_plain[i] && submitted_vertices[i].x == (float)i);
+        assert(submitted_vertices[i].y == .25f && submitted_vertices[i].color.rgb.b == .6f);
+    }
+    assert(profile_counts[XGL_PROFILE_TRIANGLES] == 6);
+    assert(profile_counts[XGL_PROFILE_STRIP_CALLS] == 1);
+    assert(profile_counts[XGL_PROFILE_STRIP_TRIANGLES] == 6);
+    assert(profile_counts[XGL_PROFILE_NATIVE_DIRECT_VERTICES] == 8);
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 1 && profile_sections[XGL_PROFILE_SUBMIT] == 1);
+    XGL_DrawColorStrip(points + 2, 3, 1, 1);
+    assert(strip_calls == 2 && strip_points == 3 && profile_counts[XGL_PROFILE_STATE_CHANGES] == 1);
+    XGL_Flush();
+    assert(polygon_calls == 1 && submitted_count == 8 + 3 + 6);
+    assert(profile_counts[XGL_PROFILE_TRIANGLES] == 6 + 1 + 2);
+    assert(profile_counts[XGL_PROFILE_STRIP_TRIANGLES] == 7);
+    /* A strip has no normals and is unlit: illuminated triangles that
+     * wait are sent first, with the one state change between. */
+    reset_backend(); XGL_BeginScene();
+    fill_native_vertices(normals, 3, 0);
+    XGL_DrawNativeTriangles(normals, 3, 1, 1, 1);
+    XGL_DrawColorStrip(points, 5, 1, 1);
+    assert(polygon_calls == 1 && strip_calls == 1 && !xb.count);
+    assert(strchr(native_events, 'G') < strchr(native_events, 'R'));
+    assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 2);
+    /* Blended triangles that wait go first as well: their order shows. */
+    reset_backend(); XGL_BeginScene();
+    XGL_DrawColorTriangles(cached, 3, .5f, 0);
+    XGL_DrawColorStrip(points, 4, .5f, 0);
+    assert(polygon_calls == 1 && strip_calls == 1 && !xb.count);
+    assert(strchr(native_events, 'G') < strchr(native_events, 'R'));
+    assert(transparency == XGL_TRANSP_BLENDED && freeze_z && !write_mask);
+    /* Triangles after a strip join a batch of the strip's state. */
+    XGL_DrawColorTriangles(cached, 3, .5f, 0);
+    assert(polygon_calls == 1 && xb.count == 3);
+    XGL_Flush();
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 1);
+    /* Invisible geometry is not sent. */
+    XGL_DrawColorStrip(points, 4, 0, 1);
+    assert(strip_calls == 1);
+}
+
 static void test_prepared_palette(void)
 {
     float expected[3], actual[3];
@@ -1648,6 +1739,7 @@ int main(void)
     test_strided_prepared_colors();
     test_native_batches();
     test_color_batches();
+    test_color_strips();
     test_prepared_palette();
     test_ui_batch_order_and_capacity();
     test_completion_and_attribute_reuse();

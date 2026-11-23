@@ -11,6 +11,10 @@ by native state, map-load mesh building, the per-frame build limit, detail
 eviction and the identity record that lets model caches skip comparisons;
 detail placed by contrast and by apparent size; and geometry submitted with
 and without normals, including the copies walls keep for dynamic lights.
+The entity tests also draw a model as triangle strips and as separate
+triangles and require the same triangles either way, from the serial path
+and from the worker's output, and the mesh tests check the loader's record
+of which vertices are one point.
 The shape tests examine made-up textures: which have shapes and which do
 not, bands, sloping edges, where a repeat begins, and the frames of an
 animated texture. They cut faces along the result and check that the pieces

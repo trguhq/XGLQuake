@@ -536,6 +536,39 @@ void XGL_DrawColorTriangles(const xgl_color_vertex_t *vertices, int count,
     }
 }
 
+/* A strip is a native call of its own, made at once. The triangles
+ * waiting in the batch are of the same state and stay there, except that
+ * blended ones go first: their order shows. */
+void XGL_DrawColorStrip(const xgl_color_vertex_t *points, int count,
+                        float opacity, int zwrite)
+{
+    Xgl_pt_list list;
+    double start;
+    if (!points || count < 3 || !xb.frame || !xb.scene_active) return;
+    opacity = bound_color(opacity);
+    if (opacity <= 0) return;
+    zwrite = zwrite != 0;
+    if (xb.count && (xb.lit || xb.opacity != opacity || xb.zwrite != zwrite ||
+                     opacity < .9999f)) XGL_Flush();
+    xb.lit = 0; xb.opacity = opacity; xb.zwrite = zwrite;
+    apply_draw_state();
+    list.pt_type = XGL_PT_COLOR_F3D;
+    list.bbox = NULL;
+    list.num_pts = (Xgl_usgn32)count;
+    list.pts.color_f3d = (Xgl_pt_color_f3d *)points;
+    xb.stage = "triangle strip submission";
+    start = XGL_ProfileNow();
+    /* Shaded between the points' own colors: no facet data. */
+    xgl_triangle_strip(xb.scene, NULL, &list);
+    XGL_ProfileAdd(XGL_PROFILE_SUBMIT, start);
+    XGL_ProfileCount(XGL_PROFILE_TRIANGLES, (unsigned long)(count - 2));
+    XGL_ProfileCount(XGL_PROFILE_STRIP_CALLS, 1);
+    XGL_ProfileCount(XGL_PROFILE_STRIP_TRIANGLES, (unsigned long)(count - 2));
+    XGL_ProfileCount(XGL_PROFILE_NATIVE_DIRECT_VERTICES, (unsigned long)count);
+    xb.scene_pending = 1;
+    native_check();
+}
+
 void XGL_DrawNativeTriangles(const xgl_native_vertex_t *vertices, int count,
                             int lit, float opacity, int zwrite)
 {

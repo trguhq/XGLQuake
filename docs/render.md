@@ -262,6 +262,37 @@ caches cannot be built is drawn by direct recursion instead.
 `xgl_alias_subdivide` and `xgl_entity_triangles` bound the extra triangles.
 The allowance is spent in visible-list order whatever the drawing order.
 
+A model's triangles are sent as triangle strips where they join up. On the
+Sun ZX, smooth-shaded strips of eight triangles and more took a third less
+time for each triangle than separate ones, and a strip needs one new vertex
+for each triangle instead of three, so the CPU also writes fewer than half
+as many.
+
+- The loader records which vertices of a model's command list are the same
+  point of the mesh: the same model vertex at the same place on the skin.
+  When a model's subdivided mesh is first built, its triangles are joined
+  across those points, and across the middles of shared edges, into strips
+  of up to 126 triangles. That is done once for each model and depth;
+  scaled from a development host it should take the SM61 a few
+  milliseconds, and some tens for the largest model.
+- Every corner that shares such a point has the same position, light and
+  skin color, so strips draw exactly the triangles that were drawn before.
+  One rule changed to make that so. Where two opposite vertex normals leave
+  the middle of an edge with no direction of its own, it now takes the
+  normal of the end that comes first on the skin, from both triangles on
+  the edge; it used to take whichever end each triangle named first.
+- `xgl_alias_strips` is the fewest triangles a run must have to be sent as a
+  strip. Shorter runs go out as separate triangles in the ordinary batch.
+  The default of 4 is cautious: how short a strip still pays on the Sun ZX
+  has not been measured. 0 sends every triangle separately.
+- Strips are points without normals. Models the device illuminates
+  (`xgl_alias_shade 0`) are therefore still sent as separate triangles, as
+  is a model whose skin has holes.
+
+With the default settings the models of the shareware episode come to about
+1.3 vertices a triangle near the viewer, where they are subdivided, and 1.6
+far off, against 3 before.
+
 ### Multiprocessor rendering
 
 `xgl_smp` controls CPU preparation of vertices for animated models. The
@@ -366,6 +397,7 @@ kept at all; a line on the terminal says so.
 | `xgl_detailbuild` | 128 | Detailed-mesh triangles built per frame; one mesh is always allowed, 0 removes the limit. |
 | `xgl_shapes` | 1 | Cut walls along the shapes of their textures where a texture has them; 0 draws every wall as a smooth mesh. See [texture shapes](#texture-shapes). |
 | `xgl_alias_subdivide` | 1 | Alias subdivision depth, 0–2; distant models use less. |
+| `xgl_alias_strips` | 4 | Fewest triangles a run of a model's triangles must have to be sent as a triangle strip; 0 sends every triangle separately. |
 | `xgl_entity_triangles` | 512 | Additional alias subdivision triangles per frame; original model triangles remain. |
 | `xgl_sprite_cells` | 8 | Sample grid per sprite dimension, clamped to 2–16. |
 | `xgl_playercolors` | 1 | Apply original player shirt/pants palette translations to sampled skins. |

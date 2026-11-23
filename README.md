@@ -49,6 +49,7 @@ locations and shareware restrictions.
 | `-winsize 640 480` | Set the window size. |
 | `+_snd_mixahead 0.3` | Buffer 0.3 seconds of audio; see [audio](#solaris-audio-and-hardware-interfaces). |
 | `+xgl_alias_subdivide 0` | Keep original model triangles without extra subdivision. |
+| `+xgl_alias_strips 0` | Send every model triangle separately. By default runs of four and more go out as triangle strips. |
 | `+xgl_smp 0` | Select serial vertex preparation. The default detects multiple CPUs. Use 1 to request a helper. |
 | `+xgl_detailtris 2048` | Set the detailed world triangle allowance; complete coarse faces remain. |
 | `+xgl_detailerror 16` | Set how much a texture or shadow must differ before it is given more triangles; larger is coarser. |

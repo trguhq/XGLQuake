@@ -46,6 +46,12 @@ static int numcommands;
 static int vertexorder[MAXALIASTRIS * 3];
 static int numorder;
 
+// for each vertex in that order, the first one that is the same point of
+// the mesh: the same model vertex with the same skin coordinates. The
+// renderer joins triangles into strips across the commands by it.
+static int vertexweld[MAXALIASTRIS * 3];
+static int weldfirst[2][MAXALIASVERTS];
+
 
 
 static int stripverts[MAXALIASTRIS + 2];
@@ -204,7 +210,7 @@ static void BuildTris (void)
     int len, bestlen, besttype;
     int bestverts[MAXALIASTRIS + 2];
     int besttris[MAXALIASTRIS];
-    int type;
+    int type, back;
 
 	//
 	// build tristrips
@@ -212,6 +218,8 @@ static void BuildTris (void)
 	numorder = 0;
 	numcommands = 0;
 	memset (used, 0, sizeof(used));
+	for (i=0 ; i<pheader->numverts ; i++)
+		weldfirst[0][i] = weldfirst[1][i] = -1;
 	for (i=0 ; i<pheader->numtris ; i++)
 	{
 		// pick an unused triangle and start the trifan
@@ -256,12 +264,16 @@ static void BuildTris (void)
 		{
 			// emit a vertex into the reorder buffer
 			k = bestverts[j];
+			back = !triangles[besttris[0]].facesfront && stverts[k].onseam;
+			if (weldfirst[back][k] < 0)
+				weldfirst[back][k] = numorder;
+			vertexweld[numorder] = weldfirst[back][k];
 			vertexorder[numorder++] = k;
 
 			// emit s/t coords into the commands stream
 			s = stverts[k].s;
 			t = stverts[k].t;
-			if (!triangles[besttris[0]].facesfront && stverts[k].onseam)
+			if (back)
 				s += pheader->skinwidth / 2;	// on back side
 			s = (s + 0.5) / pheader->skinwidth;
 			t = (t + 0.5) / pheader->skinheight;
@@ -302,16 +314,18 @@ void XGL_MakeAliasModelDisplayLists (model_t *m, aliashdr_t *hdr)
     paliashdr = hdr;
     BuildTris ();
     paliashdr->poseverts = numorder;
-    /* The identity record travels with the commands in the cache block. */
-    identity = Hunk_Alloc (sizeof(*identity) + numcommands * sizeof(*cmds));
+    /* The identity record travels with the commands in the cache block,
+     * and so does the list of welds, straight after their terminator. */
+    identity = Hunk_Alloc (sizeof(*identity) + (numcommands + numorder) * sizeof(*cmds));
     cmds = (int *)(identity + 1);
     paliashdr->commands = (byte *)cmds - (byte *)paliashdr;
     memcpy (cmds, commands, numcommands * sizeof(*cmds));
+    memcpy (cmds + numcommands, vertexweld, numorder * sizeof(*cmds));
     if (!++generation) ++generation;
     identity->magic = XGL_ALIAS_IDENTITY_MAGIC;
     identity->generation = generation;
-    identity->words = numcommands;
-    identity->hash = XGL_AliasCommandHash (cmds, numcommands);
+    identity->words = numcommands + numorder;
+    identity->hash = XGL_AliasCommandHash (cmds, identity->words);
     verts = Hunk_Alloc (paliashdr->numposes * numorder * sizeof(*verts));
     paliashdr->posedata = (byte *)verts - (byte *)paliashdr;
     for (i = 0; i < paliashdr->numposes; ++i)

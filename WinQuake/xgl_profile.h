@@ -40,6 +40,10 @@ typedef enum {
     XGL_PROFILE_TRIANGLES,
     XGL_PROFILE_GLYPHS,
     XGL_PROFILE_POLYGON_CALLS,
+    /* Native triangle strip calls, one strip each, and their triangles,
+     * which XGL_PROFILE_TRIANGLES counts as well. */
+    XGL_PROFILE_STRIP_CALLS,
+    XGL_PROFILE_STRIP_TRIANGLES,
     XGL_PROFILE_WAIT_CALLS,
     XGL_PROFILE_STATE_CHANGES,
     /* Frames whose clear left the status bar in place. */

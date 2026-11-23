@@ -56,6 +56,10 @@ times and per-frame counts:
   may defer part of a change's cost to the next submission.
 - `triangles` includes alias subdivision and particles; `glyphs` and
   `polygon calls` include the UI.
+- `strip calls`: native triangle strip calls, one strip each, with the
+  triangles they drew in brackets. Those triangles are part of `triangles`;
+  the rest went out in `polygon calls`. See
+  [animated models](render.md#animated-models).
 - `status bar kept`: the share of frames, 0 to 1, whose clear left the status
   bar in place. In the rest the bar may have been drawn; `glyphs` shows how
   often it was. Zero throughout means the bar is not being kept: see

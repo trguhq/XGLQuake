@@ -222,6 +222,8 @@ static void test_aggregation(void)
     XGL_ProfileCount(XGL_PROFILE_TRIANGLES, 30);
     XGL_ProfileCount(XGL_PROFILE_GLYPHS, 2);
     XGL_ProfileCount(XGL_PROFILE_POLYGON_CALLS, 2);
+    XGL_ProfileCount(XGL_PROFILE_STRIP_CALLS, 5);
+    XGL_ProfileCount(XGL_PROFILE_STRIP_TRIANGLES, 24);
     XGL_ProfileCount(XGL_PROFILE_WAIT_CALLS, 1);
     clock_time = 10.5; XGL_ProfileEndFrame();
     assert(print_calls == 0);
@@ -238,7 +240,8 @@ static void test_aggregation(void)
     assert(strstr(output, "2 frames; gfx 550.00 ms (max 600.00)"));
     assert(strstr(output, "world 175.00"));
     assert(strstr(output, "native calls (overlap stages): submit 12.50 sync 12.50 swap 0.00 state 3.00 ms"));
-    assert(strstr(output, "triangles 20.0 glyphs 4.0 polygon calls 3.0 waits 2.0 state changes 1.5 "
+    assert(strstr(output, "triangles 20.0 glyphs 4.0 polygon calls 3.0 "
+                          "strip calls 2.5 (12.0 triangles) waits 2.0 state changes 1.5 "
                           "status bar kept 0.50\n"));
 
     /* Output is aggregated once per interval; a new interval has no stale
@@ -251,7 +254,8 @@ static void test_aggregation(void)
     assert(print_calls == 2);
     assert(strstr(output, "2 frames; gfx 405.00 ms (max 500.00)"));
     assert(strstr(output, "world 0.00"));
-    assert(strstr(output, "triangles 0.0 glyphs 0.0 polygon calls 0.0 waits 0.0 state changes 0.0 "
+    assert(strstr(output, "triangles 0.0 glyphs 0.0 polygon calls 0.0 "
+                          "strip calls 0.0 (0.0 triangles) waits 0.0 state changes 0.0 "
                           "status bar kept 0.00\n"));
 }
 

@@ -118,6 +118,13 @@ void XGL_DrawColorTriangles(const xgl_color_vertex_t *vertices, int count,
     abort();
 }
 
+void XGL_DrawColorStrip(const xgl_color_vertex_t *points, int count,
+                        float opacity, int zwrite)
+{
+    (void)points; (void)count; (void)opacity; (void)zwrite;
+    abort();
+}
+
 static void reset_output(void)
 {
     assert(!reserved_count);

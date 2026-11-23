@@ -115,6 +115,12 @@ xgl_native_vertex_t *XGL_ReserveTriangles(int *count, int lit,
 void XGL_DrawColorTriangles(const xgl_color_vertex_t *vertices, int count,
                            float opacity, int zwrite);
 xgl_color_vertex_t *XGL_ReserveColorTriangles(int *count, float opacity, int zwrite);
+/* Submit `count` points without normals, three or more, as one triangle
+ * strip: each point after the second makes a triangle with the two before
+ * it. The strip goes to the device before this returns, so the points need
+ * not be kept. Colors are prepared. */
+void XGL_DrawColorStrip(const xgl_color_vertex_t *points, int count,
+                        float opacity, int zwrite);
 unsigned int XGL_ColorRevision(void);
 void XGL_CopyGammaOutput(float output[256]);
 void XGL_PrepareColor(float rgb[3]);
