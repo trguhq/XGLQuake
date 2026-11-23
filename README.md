@@ -100,7 +100,11 @@ filter levels at another 8 MiB, and alias color caches at 1 MiB. The alias
 normal/topology cache, its fixed entry table and reusable work array together
 are capped at another 1 MiB. The XGL audio ring is 32 KiB, building world
 meshes uses about 0.35 MiB of fixed scratch space, and a multiprocessor
-worker adds about 0.75 MiB.
+worker adds about 0.75 MiB. Cutting walls along
+[texture shapes](docs/render.md#texture-shapes) uses another 0.25 MiB of
+fixed scratch space and keeps about 3 KiB for each texture that has shapes;
+examining a texture borrows memory while a map loads, 0.3 MiB for one of 64
+texels square and about 4 MiB for the largest examined, 256 square.
 Native contexts, window buffers, program data and
 library allocations are additional. These limits are not a measurement of
 total process memory.
