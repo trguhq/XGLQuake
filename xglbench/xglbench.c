@@ -7,7 +7,7 @@
 #include <string.h>
 #include <sys/utsname.h>
 
-#define XB_MAX_CASES 256
+#define XB_MAX_CASES 288
 #define XB_TARGET_FRAME_SECONDS (1.0 / 15.0)
 /* A case whose single frame takes longer than this is abandoned: it is not
  * interactive, and repeating it only spends the device's and the run's time. */
@@ -470,14 +470,25 @@ static int make_cases(xb_case *cases)
         c->probe = mode ? XB_PROBE_STATE_ALTERNATE : XB_PROBE_STATE_GROUPED;
     }
     /* Would connected geometry pay? One smooth sampled-material mesh,
-     * submitted as the renderer does now and three other ways. */
-    for (mode = 0; mode < 4; ++mode) {
-        c = add_case(cases, &n, mode == 0 ? "probe/mesh/polygons" :
-                     (mode == 1 ? "probe/mesh/triangle-list" :
-                      (mode == 2 ? "probe/mesh/strips-8" : "probe/mesh/strips-32")));
+     * submitted as the renderer does now and three other ways. Then what
+     * the calls themselves cost, and how short a strip still pays: the
+     * same mesh as polygons and as a list eight triangles to a call, and
+     * as strips of two and of four. */
+    for (mode = 0; mode < 8; ++mode) {
+        static const char *const mesh_names[8] = {
+            "probe/mesh/polygons", "probe/mesh/triangle-list",
+            "probe/mesh/strips-8", "probe/mesh/strips-32",
+            "probe/mesh/polygons-8", "probe/mesh/triangle-list-8",
+            "probe/mesh/strips-2", "probe/mesh/strips-4"
+        };
+        static const enum xb_method mesh_methods[8] = {
+            XB_MULTI, XB_TLIST, XB_STRIP, XB_STRIP, XB_MULTI, XB_TLIST, XB_STRIP, XB_STRIP
+        };
+        static const int mesh_batches[8] = {256, 256, 8, 32, 8, 8, 2, 4};
+        c = add_case(cases, &n, mesh_names[mode]);
         c->connected = 1; c->depth = 1; c->shade = XB_SMOOTH; c->vertex_material = 1;
-        c->method = mode == 0 ? XB_MULTI : (mode == 1 ? XB_TLIST : XB_STRIP);
-        c->batch = mode < 2 ? 256 : (mode == 2 ? 8 : 32);
+        c->method = mesh_methods[mode];
+        c->batch = mesh_batches[mode];
         c->probe = XB_PROBE_MESH;
     }
     c = add_case(cases, &n, "probe/persist/depth-only-clear");
@@ -1392,6 +1403,146 @@ static const xb_result *find_result(const xb_result *r, int count,
     return NULL;
 }
 
+/* Render time for each triangle of a mesh probe case, in microseconds: the
+ * median of its trials, with the quickest and the slowest of them. Zero
+ * when the case did not run. */
+static double mesh_microseconds(const xb_result *r, int count, int width, int height,
+                                const char *name, double *quickest, double *slowest)
+{
+    const xb_result *found;
+    double scale, value;
+    int i;
+    *quickest = *slowest = 0;
+    found = find_result(r, count, width, height, name);
+    if (!found || !found->triangles || found->samples < 1 || !(found->render_median > 0))
+        return 0;
+    scale = 1e6 / (double)found->triangles;
+    *quickest = *slowest = found->render[0] * scale;
+    for (i = 1; i < found->samples; ++i) {
+        value = found->render[i] * scale;
+        if (value < *quickest) *quickest = value;
+        if (value > *slowest) *slowest = value;
+    }
+    return found->render_median * scale;
+}
+
+/* The least number of triangles in a strip which strips send quicker than
+ * `other` microseconds a triangle; zero when no length up to the longest
+ * measured does. Between two measured lengths the time of a triangle is
+ * taken as a fixed part plus the call's cost shared among the triangles of
+ * the strip; a strip shorter than the shortest measured follows the
+ * shortest pair. */
+static int mesh_strip_pays(const int *lengths, const double *time, int n, double other)
+{
+    double call, base;
+    int length, i;
+    if (n < 2 || !(other > 0)) return 0;
+    for (length = 1; length <= lengths[n - 1]; ++length) {
+        for (i = 0; i < n - 2 && length > lengths[i + 1]; ++i) {}
+        call = (time[i] - time[i + 1]) / (1.0 / lengths[i] - 1.0 / lengths[i + 1]);
+        base = time[i + 1] - call / lengths[i + 1];
+        if (base + call / length < other) return length;
+    }
+    return 0;
+}
+
+/* What a call costs beyond its triangles, in microseconds, from the times
+ * of a triangle sent `few` and `many` to a call. */
+static double mesh_call_cost(double few_time, double many_time, int few, int many)
+{
+    double cost;
+    cost = (few_time - many_time) / (1.0 / few - 1.0 / many);
+    return cost > -.05 && cost < .05 ? 0 : cost;
+}
+
+static const char *mesh_from(int length, char *text)
+{
+    if (length) sprintf(text, "from %d", length);
+    else strcpy(text, "at no length");
+    return text;
+}
+
+/* One line: from how many triangles a strip is quicker than another way of
+ * sending the same triangles, by that way's median and by its trials. */
+static void mesh_strip_line(const char *other_name, const int *lengths, const double *time,
+                            int n, double other, double quickest, double slowest)
+{
+    char first[32], second[32];
+    int median, low, high;
+    if (n < 2 || !(other > 0)) return;
+    median = mesh_strip_pays(lengths, time, n, other);
+    low = mesh_strip_pays(lengths, time, n, slowest);
+    high = mesh_strip_pays(lengths, time, n, quickest);
+    if (median)
+        printf("  Strips are quicker than %s, 256 to a call, from %d triangle%s to a strip",
+               other_name, median, median == 1 ? "" : "s");
+    else
+        printf("  No strip of up to %d triangles is quicker than %s, 256 to a call",
+               lengths[n - 1], other_name);
+    if (low != median || high != median)
+        printf(" (%s by that case's slowest trial, %s by its quickest)",
+               mesh_from(low, first), mesh_from(high, second));
+    printf(".\n");
+    if (median == 1 || low == 1 || high == 1)
+        printf("  A strip of 1 is not measured: its time is carried down from strips of %d and %d.\n",
+               lengths[0], lengths[1]);
+}
+
+/* What the mesh probes say when read together. The time of a triangle sent
+ * k to a call is taken to be a fixed part plus the call's own cost shared
+ * among the k, so two cases of one kind give both parts. A strip call's
+ * cost includes the two points it repeats. These are fits through medians
+ * of a few trials: read them with the trial ranges above. */
+static void mesh_findings(const xb_result *r, int count, int width, int height)
+{
+    static const char *const names[8] = {
+        "polygons", "polygons-8", "triangle-list", "triangle-list-8",
+        "strips-2", "strips-4", "strips-8", "strips-32"
+    };
+    static const int strip_lengths[4] = {2, 4, 8, 32};
+    char name[80];
+    double time[8], quickest[8], slowest[8], strip_time[4];
+    int lengths[4];
+    int i, n, shown;
+    shown = 0;
+    for (i = 0; i < 8; ++i) {
+        sprintf(name, "probe/mesh/%s", names[i]);
+        time[i] = mesh_microseconds(r, count, width, height, name, &quickest[i], &slowest[i]);
+        if (!(time[i] > 0)) continue;
+        printf("%s%s %.2f", shown ? ", " :
+               "  Mesh probe, render microseconds a triangle (medians of the trials): ",
+               names[i], time[i]);
+        ++shown;
+    }
+    if (!shown) return;
+    printf(".\n");
+    if (time[0] > 0 && time[1] > 0)
+        printf("  A polygon call costs about %.1f microseconds beyond its triangles "
+               "(8 against 256 to a call).\n", mesh_call_cost(time[1], time[0], 8, 256));
+    if (time[2] > 0 && time[3] > 0)
+        printf("  A triangle-list call costs about %.1f microseconds beyond its triangles "
+               "(8 against 256 to a call).\n", mesh_call_cost(time[3], time[2], 8, 256));
+    n = 0;
+    for (i = 0; i < 4; ++i) {
+        if (!(time[4 + i] > 0)) continue;
+        lengths[n] = strip_lengths[i];
+        strip_time[n++] = time[4 + i];
+    }
+    if (n < 2) return;
+    printf("  A strip call costs about %.1f microseconds beyond its triangles "
+           "(strips of %d against strips of %d)",
+           mesh_call_cost(strip_time[0], strip_time[1], lengths[0], lengths[1]),
+           lengths[0], lengths[1]);
+    if (n > 3)
+        printf(", and about %.1f among longer strips (%d against %d)",
+               mesh_call_cost(strip_time[n - 2], strip_time[n - 1],
+                              lengths[n - 2], lengths[n - 1]),
+               lengths[n - 2], lengths[n - 1]);
+    printf(".\n");
+    mesh_strip_line("polygons", lengths, strip_time, n, time[0], quickest[0], slowest[0]);
+    mesh_strip_line("a triangle list", lengths, strip_time, n, time[2], quickest[2], slowest[2]);
+}
+
 static void findings(const xb_result *r, int count, int width, int height)
 {
     int i, d, update, shade, lights;
@@ -1543,6 +1694,7 @@ static void findings(const xb_result *r, int count, int width, int height)
                    "(this scene only).\n", 1000.0 / 15.0 - a->median * 1000);
         }
     }
+    mesh_findings(r, count, width, height);
     printf("  Choose depth 1 only if its measured frame budget leaves enough CPU time;\n"
            "  reserve depth 2 for selected surfaces and retain a complete coarse mesh.\n");
 }

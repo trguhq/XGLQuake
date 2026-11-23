@@ -72,10 +72,10 @@ grep -x 'texture-map/facet-flat/draw/depth-0' "$test_dir/output" >/dev/null ||
 if grep -E '^texture-map/(point|bilinear|trilinear)/' "$test_dir/output" >/dev/null; then
     fail "extralong selected native texture cases without being asked"
 fi
-test "$(grep -c . "$test_dir/output")" = 233 || fail "extralong selected the wrong number of cases"
+test "$(grep -c . "$test_dir/output")" = 237 || fail "extralong selected the wrong number of cases"
 # Every name contains a slash: this lists the complete registry.
 run_bench -extralong -test / -list >"$test_dir/output" 2>&1
-test "$(grep -c . "$test_dir/output")" = 254 || fail "registry has the wrong number of cases"
+test "$(grep -c . "$test_dir/output")" = 258 || fail "registry has the wrong number of cases"
 grep 'submit/multi_polygon/batch-128' "$test_dir/output" >/dev/null || fail "missing stable case"
 run_bench -extralong -test probe/swap,overhead/swap, -list >"$test_dir/comma" 2>&1
 test "$(grep -c . "$test_dir/comma")" = 3 || fail "comma-separated -test selected the wrong cases"
@@ -1014,6 +1014,51 @@ awk -F, '
             polygons != 4 || batches != 4 || bad) exit 1
     }
 ' "$test_dir/lit-submit.csv" || fail "lit polygon/batch comparison lost submission semantics"
+
+# The mesh probe sends one 2048-triangle mesh eight ways. Calls are counted as
+# the native backend makes them: a row of 64 triangles longer than the batch
+# continues in further calls, so strips of 2 take 1024 calls and strips of 32
+# take 64.
+run_bench -winsize 320 240 -test probe/mesh -seconds .001 -warmup 0 -repeats 1 \
+    -csv "$test_dir/mesh.csv" >"$test_dir/output" 2>&1 || fail "mesh probe cases failed"
+awk -F, '
+    NR == 1 {
+        for (i=1; i<=NF; ++i) { gsub(/"/, "", $i); col[$i]=i }
+        record=col["record"]; status=col["status"]; method=col["method"]
+        facets=col["triangles"]; calls=col["calls"]; batch=col["batch"]; name=col["test"]
+        want["probe/mesh/polygons"] = "multi_polygon 256 8"
+        want["probe/mesh/triangle-list"] = "triangle_list 256 8"
+        want["probe/mesh/strips-8"] = "triangle_strip 8 256"
+        want["probe/mesh/strips-32"] = "triangle_strip 32 64"
+        want["probe/mesh/polygons-8"] = "multi_polygon 8 256"
+        want["probe/mesh/triangle-list-8"] = "triangle_list 8 256"
+        want["probe/mesh/strips-2"] = "triangle_strip 2 1024"
+        want["probe/mesh/strips-4"] = "triangle_strip 4 512"
+        next
+    }
+    $record == "summary" {
+        gsub(/"/, "", $name)
+        if ($status != "ok" || $facets != 2048 || !($name in want) ||
+            ($method " " $batch " " $calls) != want[$name]) bad++
+        delete want[$name]
+        seen++
+    }
+    END {
+        for (left in want) bad++
+        if (!record || !status || !method || !facets || !calls || !batch || !name ||
+            seen != 8 || bad) exit 1
+    }
+' "$test_dir/mesh.csv" || fail "mesh probe cases lost their submission method, batch or call count"
+grep '^  Mesh probe, render microseconds a triangle (medians of the trials): polygons ' \
+    "$test_dir/output" >/dev/null || fail "mesh probe results were not read together"
+# One strip length alone gives no call cost and no length to send strips from.
+run_bench -winsize 320 240 -test probe/mesh/strips-4,probe/mesh/polygons -seconds .001 \
+    -warmup 0 -repeats 1 >"$test_dir/output" 2>&1 || fail "a partial mesh probe failed"
+grep '^  Mesh probe, render microseconds a triangle' "$test_dir/output" >/dev/null ||
+    fail "a partial mesh probe was not reported"
+if grep 'strip call costs\|Strips are quicker\|No strip of up to' "$test_dir/output" >/dev/null; then
+    fail "a single strip length was fitted"
+fi
 
 # CPU Quake-like updates retain independently owned facet or vertex arrays in
 # each outstanding slot. Both serialized and streaming variants fully drain.

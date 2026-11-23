@@ -37,7 +37,7 @@ XB_TEST_LOG="$test_dir/list.log" "$bench" -list >"$test_dir/default.list"
 test ! -e "$test_dir/list.log" || fail "default listing opened the display"
 for profile in quick medium long extralong; do
     "$bench" "-$profile" -list >"$test_dir/$profile.list"
-    case "$profile" in quick) count=16 ;; medium|long) count=34 ;; *) count=233 ;; esac
+    case "$profile" in quick) count=16 ;; medium|long) count=34 ;; *) count=237 ;; esac
     test "$(wc -l <"$test_dir/$profile.list" | tr -d ' ')" = "$count" ||
         fail "$profile selected the wrong number of cases"
     sort "$test_dir/$profile.list" >"$test_dir/$profile.sorted"
@@ -126,7 +126,7 @@ for profile in quick medium long extralong; do
     awk '/^clock-sleep / { if ($2 <= 0 || $2 > .100001) bad++; sleeps++ }
          END { if (!sleeps || bad) exit 1 }' "$test_dir/$profile.log" ||
         fail "$profile disabled mandatory rest or used uninterruptible sleep chunks"
-    case "$profile" in quick) completed=16 ;; medium) completed=34 ;; long) completed=68 ;; *) completed=466 ;; esac
+    case "$profile" in quick) completed=16 ;; medium) completed=34 ;; long) completed=68 ;; *) completed=474 ;; esac
     grep "Completed $completed cases; 0 skipped/failed" "$test_dir/output" >/dev/null ||
         fail "$profile omitted short samples from its selection"
 done
@@ -346,6 +346,70 @@ for draw in 1 4; do
     fi
 done
 
+# What the report makes of the mesh probe, checked against pretended costs:
+# a microsecond a point, 4.4 a call and .8 more for a triangle sent as a
+# polygon. A triangle in a strip of k then takes 1 + 6.4 / k microseconds
+# (k + 2 points and one call among k triangles), 3.82 as polygons and 3.02
+# in a list, 256 to a call: strips of 2 take 4.20 and lose to both, strips of
+# 3 would take 3.13 and beat the polygons only, strips of 4 take 2.60.
+# Arguments: the three costs, the cases, and optionally a draw to hold up
+# and the seconds to hold it.
+mesh_probe()
+{
+    XB_TEST_CLOCK_STEP=.000001 XB_TEST_MESH_COST="$1" \
+        XB_TEST_DRAW_ADVANCE_AT="${3:-0}" XB_TEST_DRAW_ADVANCE="${4:-0}" \
+        "$bench" -medium -winsize 320 240 -test "$2" >"$test_dir/output" 2>&1 ||
+        fail "mesh probe failed at costs $1"
+}
+mesh_line()
+{
+    grep -F -x "  $1" "$test_dir/output" >/dev/null || fail "mesh probe report lacks: $1"
+}
+mesh_probe '1 4.4 .8' probe/mesh
+mesh_line 'Mesh probe, render microseconds a triangle (medians of the trials): polygons 3.82, polygons-8 4.35, triangle-list 3.02, triangle-list-8 3.55, strips-2 4.20, strips-4 2.60, strips-8 1.80, strips-32 1.20.'
+mesh_line 'A polygon call costs about 4.4 microseconds beyond its triangles (8 against 256 to a call).'
+mesh_line 'A triangle-list call costs about 4.4 microseconds beyond its triangles (8 against 256 to a call).'
+mesh_line 'A strip call costs about 6.4 microseconds beyond its triangles (strips of 2 against strips of 4), and about 6.4 among longer strips (8 against 32).'
+mesh_line 'Strips are quicker than polygons, 256 to a call, from 3 triangles to a strip.'
+mesh_line 'Strips are quicker than a triangle list, 256 to a call, from 4 triangles to a strip.'
+grep 'Completed 8 cases; 0 skipped/failed' "$test_dir/output" >/dev/null || fail "mesh probe lost a case"
+# Three strip lengths: the longest pair is not reported apart, and lengths
+# between 4 and 32 follow that one pair. A filter is a prefix, so the
+# polygons bring their 8-to-a-call case with them.
+mesh_probe '1 4.4 .8' probe/mesh/polygons,probe/mesh/strips-2,probe/mesh/strips-4,probe/mesh/strips-32
+mesh_line 'A polygon call costs about 4.4 microseconds beyond its triangles (8 against 256 to a call).'
+mesh_line 'A strip call costs about 6.4 microseconds beyond its triangles (strips of 2 against strips of 4).'
+mesh_line 'Strips are quicker than polygons, 256 to a call, from 3 triangles to a strip.'
+if grep 'triangle list\|triangle-list' "$test_dir/output" >/dev/null; then
+    fail "an unmeasured list was compared"
+fi
+# One frame held up in the second trial of the polygons, the first case: by
+# that trial and by the median strips of 2 are already quicker, by the other
+# trial only strips of 3.
+mesh_probe '1 4.4 .8' probe/mesh 50 .06
+mesh_line "Strips are quicker than polygons, 256 to a call, from 2 triangles to a strip (from 2 by that case's slowest trial, from 3 by its quickest)."
+mesh_line 'Strips are quicker than a triangle list, 256 to a call, from 4 triangles to a strip.'
+grep '^  Variable timing: probe/mesh/polygons ' "$test_dir/output" >/dev/null ||
+    fail "the uneven polygon trials were not reported"
+# Calls dear enough that no measured strip pays, and calls that cost nothing.
+mesh_probe '1 400 0' probe/mesh
+mesh_line 'No strip of up to 32 triangles is quicker than polygons, 256 to a call.'
+mesh_line 'No strip of up to 32 triangles is quicker than a triangle list, 256 to a call.'
+mesh_probe '1 0 0' probe/mesh
+mesh_line 'A polygon call costs about 0.0 microseconds beyond its triangles (8 against 256 to a call).'
+mesh_line 'A strip call costs about 2.0 microseconds beyond its triangles (strips of 2 against strips of 4), and about 2.0 among longer strips (8 against 32).'
+mesh_line 'Strips are quicker than polygons, 256 to a call, from 2 triangles to a strip.'
+# A strip of one triangle is not measured, and the report says so when the
+# fit reaches down to it.
+mesh_probe '1 0 5' probe/mesh
+mesh_line 'Strips are quicker than polygons, 256 to a call, from 1 triangle to a strip.'
+mesh_line 'A strip of 1 is not measured: its time is carried down from strips of 2 and 4.'
+mesh_line 'Strips are quicker than a triangle list, 256 to a call, from 2 triangles to a strip.'
+if XB_TEST_MESH_COST='1 2' "$bench" -medium -winsize 320 240 -test probe/mesh/polygons \
+    >"$test_dir/output" 2>&1; then
+    fail "an incomplete test-only mesh cost was accepted"
+fi
+
 # Extralong has a larger finite deadline and keeps protective rest. Setup plus
 # its rest interval can exceed shorter profiles while still fitting extralong.
 XB_TEST_OPEN_ADVANCE=200 "$bench" -extralong -winsize 320 240 -triangles 8 \
@@ -363,7 +427,7 @@ if XB_TEST_OPEN_ADVANCE=2701 XB_TEST_LOG="$test_dir/extra-expiry.log" \
 fi
 grep 'Time limit: 2700 seconds' "$test_dir/output" >/dev/null || fail "extralong overrides changed the ceiling"
 grep 'Profile time budget reached' "$test_dir/output" >/dev/null || fail "extralong remained unbounded"
-grep '466 selected cases not run' "$test_dir/output" >/dev/null || fail "extralong expiry lost unrun cases"
+grep '474 selected cases not run' "$test_dir/output" >/dev/null || fail "extralong expiry lost unrun cases"
 if grep '^lighting-configure ' "$test_dir/extra-expiry.log" >/dev/null; then
     fail "expired extralong profile configured a workload"
 fi
@@ -379,4 +443,4 @@ if grep '^lighting-configure ' "$test_dir/cancel.log" >/dev/null; then fail "can
 test "$(grep -c '^clock-sleep ' "$test_dir/cancel.log")" = 1 || fail "cancellation waited through the entire pause"
 grep 'interrupted' "$test_dir/output" >/dev/null || fail "cooldown cancellation was not reported"
 
-echo 'Profile tests: selection, defaults, overrides, nominal durations, real idle scheduling, mandatory rest, slow-frame and deadline rejection and cancellation passed'
+echo 'Profile tests: selection, defaults, overrides, nominal durations, real idle scheduling, mandatory rest, mesh probe findings, slow-frame and deadline rejection and cancellation passed'

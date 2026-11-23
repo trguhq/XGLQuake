@@ -317,7 +317,30 @@ static void test_correct_device(void)
     assert(run_probe(MOCK_CORRECT, XB_STRIP, 32, note));
     assert(strstr(note, "192 smooth triangles as 204 points in 6 triangle_strip call(s)"));
     assert(strip_calls == 6 && strip_points == 204);
+    /* The shortest strips measured: a row of 32 is sixteen calls of 4 points,
+     * or eight of 6. Each call repeats the two points it continues from. */
+    assert(run_probe(MOCK_CORRECT, XB_STRIP, 2, note));
+    assert(strstr(note, "192 smooth triangles as 384 points in 96 triangle_strip call(s)"));
+    assert(strip_calls == 96 && strip_points == 384 && !list_calls);
+    assert(xb_backend_input_bytes(XB_STRIP, 2) == 384 * sizeof(Xgl_pt_color_f3d));
+    assert(xb_backend_draw(XB_STRIP, 2) == 96 && drawn_count == TRIANGLES);
+    assert(run_probe(MOCK_CORRECT, XB_STRIP, 4, note));
+    assert(strstr(note, "192 smooth triangles as 288 points in 48 triangle_strip call(s)"));
+    assert(strip_calls == 48 && strip_points == 288);
+    assert(xb_backend_input_bytes(XB_STRIP, 4) == 288 * sizeof(Xgl_pt_color_f3d));
+    /* The same triangles eight to a call, as polygons and as a list: what
+     * the calls themselves cost is read from these against 256 to a call. */
+    assert(run_probe(MOCK_CORRECT, XB_MULTI, 8, note));
+    assert(strstr(note, "192 smooth triangles as 576 points in 24 multi_polygon call(s)"));
+    assert(polygon_calls == 3 + 24 && !strip_calls && !list_calls);
+    assert(xb_backend_draw(XB_MULTI, 8) == 24 && drawn_count == TRIANGLES);
+    assert(run_probe(MOCK_CORRECT, XB_TLIST, 8, note));
+    assert(strstr(note, "192 smooth triangles as 576 points in 24 triangle_list call(s)"));
+    assert(list_calls == 24 && list_points == 576 && !strip_calls);
+    assert(xb_backend_input_bytes(XB_TLIST, 8) == 576 * sizeof(Xgl_pt_color_f3d));
+    assert(xb_backend_draw(XB_TLIST, 8) == 24 && drawn_count == TRIANGLES);
     /* Every strip point carries the color of the corner it is. */
+    assert(run_probe(MOCK_CORRECT, XB_STRIP, 32, note));
     assert(b.strip_color_points && b.strip_corners && !b.strip_points);
     assert(b.strip_color_points[5].color.rgb.r == mesh_colors[b.strip_corners[5]].r);
     assert(b.strip_color_points[5].x == mesh_points[b.strip_corners[5]].x);
@@ -332,9 +355,12 @@ static void test_rejected_devices(void)
 {
     static const struct { enum mock_fault fault; enum xb_method method; int batch; } wrong[] = {
         {MOCK_STRIP_AS_LIST, XB_STRIP, 8}, {MOCK_STRIP_AS_LIST, XB_STRIP, 32},
-        {MOCK_STRIP_NOT_DRAWN, XB_STRIP, 8},
+        {MOCK_STRIP_AS_LIST, XB_STRIP, 2}, {MOCK_STRIP_AS_LIST, XB_STRIP, 4},
+        {MOCK_STRIP_NOT_DRAWN, XB_STRIP, 8}, {MOCK_STRIP_NOT_DRAWN, XB_STRIP, 2},
         {MOCK_LIST_AS_STRIP, XB_TLIST, 64},
-        {MOCK_FLAT_COLOR, XB_STRIP, 8}, {MOCK_FLAT_COLOR, XB_TLIST, 64}
+        {MOCK_FLAT_COLOR, XB_STRIP, 8}, {MOCK_FLAT_COLOR, XB_TLIST, 64},
+        {MOCK_FLAT_COLOR, XB_STRIP, 2}, {MOCK_FLAT_COLOR, XB_STRIP, 4},
+        {MOCK_FLAT_COLOR, XB_TLIST, 8}
     };
     char note[240];
     size_t i;

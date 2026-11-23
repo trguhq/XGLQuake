@@ -5,11 +5,11 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define XB_VERSION "0.9.4"
+#define XB_VERSION "0.9.5"
 #define XB_MAX_QUEUE 8
 #define XB_MAX_LIGHTS 4
 #define XB_STYLE_LAYERS 4
-#define XB_MAX_RESULTS 512
+#define XB_MAX_RESULTS 576
 #define XB_MAX_REPEATS 31
 #define XB_METHODS 4
 #define XB_TEXTURE_WIDTH 64
