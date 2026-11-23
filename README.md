@@ -4,13 +4,15 @@ XGLQuake ports WinQuake 1.06 to Sun XGL on Solaris, targeting a SPARCstation
 10 with a 60 MHz SM61 processor, 64 MB RAM, and Sun ZX (Leo) graphics. It
 approximates textures with sampled-color polygons and draws the HUD and menus
 with native XGL text and geometry. A similar approach can be seen at
-[testglobe.dev](https://testglobe.dev/web).
+[testglobe.dev](https://testglobe.dev/web). XGLQuake originated as a port
+specifically for the ZX graphics card, so texture mapping is not supported yet 
+but it will be added for Sun hardware that supports it.
 
 ## Quick start
 
 ### Build
 
-Install GNU make, GCC (for example [tgcware](https://jupiterrise.com/tgcware/sunos5.6_sparc/stable/)), the [Sun XGL SDK](https://archive.org/details/xgl-solaris2.6), and OpenWindows development files.
+Install GNU make (tested on 3.8.2), GCC (tested on 4.3.6, for example from [tgcware](https://jupiterrise.com/tgcware/sunos5.6_sparc/stable/)), the [Sun XGL SDK](https://archive.org/details/xgl-solaris2.6), and OpenWindows development files.
 From the repository root:
 
 ```sh
@@ -120,9 +122,6 @@ the mixer during rendering and cache preparation, at most every 25 ms. Its
 default 0.3-second lookahead trades some sound latency for tolerance of long
 frames. A single blocking graphics call longer than the queued audio can
 still cause a gap; this is not an independent audio thread.
-
-An existing `config.cfg` may restore `_snd_mixahead 0.1`. The commands in
-this document pass `+_snd_mixahead 0.3` so that a run does not depend on it.
 
 ## More documentation
 
