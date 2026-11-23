@@ -107,7 +107,10 @@ uploaded as XGL textures.
 A mesh therefore shows a texture's shapes at about the scale of its
 triangles: with the defaults, features of roughly 16 texels and more, such as
 arches, discs, panels and borders. A pattern finer than that, such as small
-bricks, averages to one color and is given no triangles.
+bricks, averages to one color and is given no triangles. Colors that run
+smoothly from vertex to vertex also soften every edge they cross; textures
+with clear shapes are therefore drawn another way, described under
+[texture shapes](#texture-shapes).
 
 - Coarse meshes and their texture samples are built while the map loads, up
   to five eighths of the world cache; faces beyond that, on very large maps,
@@ -145,6 +148,81 @@ Light, lightstyle and gamma changes recolor a mesh's distinct vertices from
 their stored texture samples with integer arithmetic. The texture is not
 sampled again and the mesh keeps its shape, which was decided with every
 light style at its nominal level.
+
+### Texture shapes
+
+Some textures are made of a few shapes of nearly one color each: a panel, a
+light strip, a door's grooves, a border. A smooth mesh blurs such shapes,
+because every triangle fades from one vertex color to the next. A wall of
+such a texture is instead cut along the shapes, and each piece is drawn in
+one color under the baked light at its own corners. `xgl_shapes 0` turns
+this off and draws every wall as a smooth mesh.
+
+Each wall texture is examined once, while the map loads:
+
+- The repeat of the texture is divided by the straight cut that most reduces
+  its color error, then either part by its best cut, and so on, up to 48
+  pieces. Cuts along the texture's axes are tried at every texel, singly and
+  in pairs that take out a thin band of 2 to 12 texels, such as a groove or
+  a strip.
+- Where the edge a cut found lies differently in the two halves of a part,
+  the cut is tilted to follow it, and kept only if the color really steps
+  across the tilted line along its whole length. A part with a tilted side
+  is also tried with a cut parallel to that side, since an outline is often
+  a thin line of its own color.
+- A piece is drawn in the color of what mostly fills it: the mean of its
+  texels without the darkest and the brightest fifth, so that a thin line or
+  a few specks not yet cut out do not tint it.
+- The repeat is taken to begin where the picture has an edge, so that the
+  border between repeats is not one more line through a shape.
+- The texture is drawn this way only if the pieces describe it distinctly
+  better than a smooth mesh with as many triangles would: they must leave at
+  most 85% of its color error. Rock, brick, wood grain and rough metal do
+  not pass and are drawn as before.
+
+In the shareware episode this selects between none and a third of a map's
+wall area: about 28% in `e1m1`, 34% in `e1m5`, 15% in `start`, 3% in `e1m2`
+and under 2% elsewhere.
+
+A face is cut by the lines of its texture's division, repeated as the
+texture repeats. Pieces share their corners along their sides, so no seam
+can open between them, and a piece longer than `xgl_subdivide` texels is
+halved so that baked light is still sampled along it. How many of the cuts
+are made depends on a step of detail that follows the distance:
+
+- A repeat of the texture gets as many pieces as `xgl_detaildensity` pays
+  for at that distance, in steps of 1, 2, 3, 4, 6, 8 and so on. The step
+  depends on the texture and the distance alone, so every face of a wall is
+  cut alike and its pattern runs unbroken across them.
+- A cut must also be worth its triangles, by the same measure as a split in
+  a smooth mesh (`xgl_detailerror` and `xgl_detailedge`); nearer than about
+  160 units, where a texel is wider than a pixel, a cut needs to be worth
+  less. A part that would be narrower than a pixel and a half is not cut
+  off: it would only flicker.
+- A wall is made finer in the frame it is called for, but coarser only when
+  the distance asks for half the pieces or fewer, and then one wall every
+  four frames. A step that would make the same cuts as the mesh a wall has
+  does not build it again.
+- One face has at most 256 triangles. A large face of a busy texture is cut
+  at the finest step that fits; that is found out the first time and
+  remembered.
+- These walls take part in the frame's detail allowance like others, with
+  two differences. Their faces rank by nearness alone, so that when the
+  allowance runs out it is the far walls that go plain and not the small
+  faces of a near one; and they may run a quarter over `xgl_detailtris`
+  before any is left plain.
+
+An animated texture keeps one division for all its frames, that of the
+frame with the most pieces, and each piece takes the color it has in the
+frame showing. The mesh is not built again as the texture changes.
+
+Examining the textures adds to the time a map takes to load, and the engine
+reports how long it took. No timing from the target machine is available
+yet: scaled from a development host, the estimate is 2 to 7 seconds for a
+map of the shareware episode on the SM61. Replayed off the machine on the
+same maps, walls cut this way cost about what they cost before: in views
+of `e1m1`, 1725 wall triangles a frame against 1785, with the mean color
+error against the full textures down from 9.9 to 9.4 of 255.
 
 ### Frame order
 
@@ -286,6 +364,7 @@ kept at all; a line on the terminal says so.
 | `xgl_detailtris` | 2048 | Detailed wall and brush-entity triangles per frame; faces beyond the allowance draw their coarse mesh. |
 | `xgl_detaildistance` | 512 | Distance within which faces are considered for detail and water uses its finer grid. |
 | `xgl_detailbuild` | 128 | Detailed-mesh triangles built per frame; one mesh is always allowed, 0 removes the limit. |
+| `xgl_shapes` | 1 | Cut walls along the shapes of their textures where a texture has them; 0 draws every wall as a smooth mesh. See [texture shapes](#texture-shapes). |
 | `xgl_alias_subdivide` | 1 | Alias subdivision depth, 0–2; distant models use less. |
 | `xgl_entity_triangles` | 512 | Additional alias subdivision triangles per frame; original model triangles remain. |
 | `xgl_sprite_cells` | 8 | Sample grid per sprite dimension, clamped to 2–16. |
@@ -302,7 +381,8 @@ kept at all; a line on the terminal says so.
 | `r_wateralpha` | 1 | Water opacity; values below 1 request native blending. |
 
 Changing `xgl_subdivide`, `xgl_detailerror`, `xgl_detailedge`,
-`xgl_detailface` or `xgl_detaildensity` rebuilds the mesh cache.
+`xgl_detailface`, `xgl_detaildensity` or `xgl_shapes` rebuilds the mesh
+cache. Textures are not examined again for it.
 
 Settings in configuration files or command-line options override these
 defaults. In particular, `xgl_entity_triangles` is saved in `config.cfg`, so

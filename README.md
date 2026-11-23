@@ -53,6 +53,7 @@ locations and shareware restrictions.
 | `+xgl_detailtris 2048` | Set the detailed world triangle allowance; complete coarse faces remain. |
 | `+xgl_detailerror 16` | Set how much a texture or shadow must differ before it is given more triangles; larger is coarser. |
 | `+xgl_detaildensity 160` | Set how many triangles a face may have for its apparent size; 0 gives every face the same limit. |
+| `+xgl_shapes 0` | Draw every wall as a smooth mesh. By default walls whose textures have clear shapes are cut along them; see [texture shapes](docs/render.md#texture-shapes). |
 | `+xgl_keepbar 0` | Clear and redraw the status bar every frame. By default an unchanged bar is left in place in small windows. |
 | `+xgl_profile 0` | Disable profiling for FPS measurements. Use 1 for summary timings or 2 for detail. |
 

@@ -107,9 +107,11 @@ Detailed counts are per-frame averages.
   `detail meshes evicted` counts detailed meshes released because the world
   cache was full.
 - **world detail per frame**: faces drawn from their detailed mesh and the
-  triangles in them, water on its finer grid included; then the dynamic
-  lights enabled for illuminated geometry and the faces drawn illuminated,
-  both zero in a frame with no dynamic light.
+  triangles in them, water on its finer grid included; how many of those
+  faces and triangles were walls cut along
+  [texture shapes](render.md#texture-shapes); then the dynamic lights
+  enabled for illuminated geometry and the faces drawn illuminated, both
+  zero in a frame with no dynamic light.
 - **alias cache per frame**: color and pose (normal/topology) cache hits,
   misses and evictions, and fallback draws, show cache pressure. Compare text
   calls with glyphs to see how well the installed font allows runs. Both are

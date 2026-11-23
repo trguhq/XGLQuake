@@ -11,6 +11,12 @@ by native state, map-load mesh building, the per-frame build limit, detail
 eviction and the identity record that lets model caches skip comparisons;
 detail placed by contrast and by apparent size; and geometry submitted with
 and without normals, including the copies walls keep for dynamic lights.
+The shape tests examine made-up textures: which have shapes and which do
+not, bands, sloping edges, where a repeat begins, and the frames of an
+animated texture. They cut faces along the result and check that the pieces
+cover the face exactly, have the texture's colors, and share every corner
+that lies along a side. The world tests then draw such walls: their colors
+and baked light, the steps of detail by distance, and the limits.
 The screen tests cover when an unchanged status bar is left in place, and
 the UI tests that every picture name draws what it did before.
 Run from `WinQuake/`:
