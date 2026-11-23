@@ -234,6 +234,21 @@ qboolean XGL_TextureHasAlpha(int id)
     return xgl_materials[id-1].has_alpha;
 }
 
+/* The palette indices of a material's texels, top row first, with its size;
+ * NULL when there is no such material or it has transparent texels. For
+ * work that reads every texel. They stay valid until the material is next
+ * loaded or released. */
+const byte *XGL_TextureTexels(int id, int *width, int *height)
+{
+    xgl_material_t *material;
+    if (id <= 0 || id > XGL_MAX_MATERIALS) return NULL;
+    material = &xgl_materials[id-1];
+    if (!material->pixels || material->has_alpha) return NULL;
+    if (width) *width = material->width;
+    if (height) *height = material->height;
+    return material->pixels;
+}
+
 /* RGB averages never interpolate palette indices. Every level covers the
  * complete repeating image; odd final rows/columns are included. */
 static void XGL_BuildTextureFilter(xgl_material_t *material)

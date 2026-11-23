@@ -193,7 +193,8 @@ void XGL_ProfileEndFrame(void)
             "  world per frame: cached draws %.1f fallback draws %.1f "
             "builds %.1f failed builds %.1f; color reuse %.1f updates %.1f; "
             "vertices built %.1f recolored %.1f animated %.1f; detail meshes evicted %.1f\n"
-            "  world detail per frame: faces %.1f triangles %.1f; "
+            "  world detail per frame: faces %.1f triangles %.1f, "
+            "of them cut along texture shapes %.1f and %.1f; "
             "dynamic lights in use %.2f, faces illuminated %.1f\n"
             "  alias cache per frame: color hits %.1f misses %.1f evictions %.1f; "
             "pose hits %.1f misses %.1f evictions %.1f; fallbacks %.1f; text calls %.1f\n"
@@ -235,6 +236,8 @@ void XGL_ProfileEndFrame(void)
             (double)total_counts[XGL_PROFILE_WORLD_EVICTIONS] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_DETAIL_SURFACES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_DETAIL_TRIANGLES] / total_frames,
+            (double)total_counts[XGL_PROFILE_WORLD_SHAPE_SURFACES] / total_frames,
+            (double)total_counts[XGL_PROFILE_WORLD_SHAPE_TRIANGLES] / total_frames,
             (double)total_counts[XGL_PROFILE_POINT_LIGHTS] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_LIT_SURFACES] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_COLOR_HITS] / total_frames,

@@ -25,8 +25,8 @@ COMMON_SOURCES = chase.c cl_demo.c cl_input.c cl_main.c cl_parse.c cl_tent.c \
     pr_cmds.c pr_edict.c pr_exec.c r_part.c sbar.c sv_main.c sv_phys.c \
     sv_move.c sv_user.c zone.c view.c wad.c world.c gl_refrag.c \
     cd_null.c sys_sun.c snd_dma.c snd_mem.c snd_mix.c
-XGL_SOURCES = xgl_model.c xgl_mesh.c xgl_texture.c xgl_rmain.c xgl_world.c \
-    xgl_light.c xgl_draw.c xgl_vid.c xgl_backend.c xgl_screen.c \
+XGL_SOURCES = xgl_model.c xgl_mesh.c xgl_texture.c xgl_shapes.c xgl_rmain.c \
+    xgl_world.c xgl_light.c xgl_draw.c xgl_vid.c xgl_backend.c xgl_screen.c \
     xgl_effects.c xgl_entities.c xgl_filesystem.c xgl_snd_sun.c xgl_profile.c \
     xgl_smp.c
 SOURCES = $(COMMON_SOURCES) $(XGL_SOURCES)
@@ -79,8 +79,9 @@ check: $(TEST_BUILD_DIR)/test_texture $(TEST_BUILD_DIR)/test_mesh \
        $(TEST_BUILD_DIR)/test_filesystem $(TEST_BUILD_DIR)/test_audio \
        $(TEST_BUILD_DIR)/test_profile $(TEST_BUILD_DIR)/test_effects \
        $(TEST_BUILD_DIR)/test_alias_colors $(TEST_BUILD_DIR)/test_screen \
-       $(TEST_BUILD_DIR)/test_smp
+       $(TEST_BUILD_DIR)/test_smp $(TEST_BUILD_DIR)/test_shapes
 	./$(TEST_BUILD_DIR)/test_texture
+	./$(TEST_BUILD_DIR)/test_shapes
 	./$(TEST_BUILD_DIR)/test_mesh
 	./$(TEST_BUILD_DIR)/test_draw
 	./$(TEST_BUILD_DIR)/test_entities
@@ -132,6 +133,10 @@ $(TEST_BUILD_DIR)/test_texture: xgl_tests/test_texture.c xgl_texture.c $(HEADERS
 	@mkdir -p $(TEST_BUILD_DIR)
 	$(HOST_CC) $(HOST_CFLAGS) -DXGLQUAKE -I. -o $@ xgl_tests/test_texture.c xgl_texture.c -lm
 
+$(TEST_BUILD_DIR)/test_shapes: xgl_tests/test_shapes.c xgl_shapes.c $(HEADERS)
+	@mkdir -p $(TEST_BUILD_DIR)
+	$(HOST_CC) $(HOST_CFLAGS) -DXGLQUAKE -I. -o $@ xgl_tests/test_shapes.c xgl_shapes.c -lm
+
 $(TEST_BUILD_DIR)/test_mesh: xgl_tests/test_mesh.c xgl_mesh.c $(HEADERS)
 	@mkdir -p $(TEST_BUILD_DIR)
 	$(HOST_CC) $(HOST_CFLAGS) -DXGLQUAKE -I. -o $@ xgl_tests/test_mesh.c xgl_mesh.c -lm
@@ -145,10 +150,10 @@ $(TEST_BUILD_DIR)/test_entities: xgl_tests/test_entities.c xgl_entities.c mathli
 	$(HOST_CC) $(HOST_CFLAGS) -DXGLQUAKE -I. -ffunction-sections -fdata-sections \
 	    -o $@ xgl_tests/test_entities.c mathlib.c -Wl,--gc-sections -lm
 
-$(TEST_BUILD_DIR)/test_world: xgl_tests/test_world.c xgl_world.c xgl_light.c mathlib.c $(HEADERS)
+$(TEST_BUILD_DIR)/test_world: xgl_tests/test_world.c xgl_world.c xgl_shapes.c xgl_light.c mathlib.c $(HEADERS)
 	@mkdir -p $(TEST_BUILD_DIR)
 	$(HOST_CC) $(HOST_CFLAGS) -DXGLQUAKE -I. -ffunction-sections -fdata-sections \
-	    -o $@ xgl_tests/test_world.c xgl_light.c mathlib.c -Wl,--gc-sections -lm
+	    -o $@ xgl_tests/test_world.c xgl_shapes.c xgl_light.c mathlib.c -Wl,--gc-sections -lm
 
 $(TEST_BUILD_DIR)/test_input: xgl_tests/test_input.c xgl_vid.c $(HEADERS) \
                            $(wildcard xgl_tests/include/X11/*.h)

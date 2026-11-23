@@ -90,6 +90,11 @@ static float gamma_scale;
 static float captured_opacity;
 static unsigned long profile_counts[XGL_PROFILE_COUNTER_COUNT];
 static int profile_sections[XGL_PROFILE_SECTION_COUNT];
+/* The texels the shape analysis is given for each texture, as palette
+ * indices, with their size; none unless a test supplies them. */
+static const byte *shape_texels[2];
+static int shape_width, shape_height, texel_calls;
+static double test_clock;
 
 double XGL_ProfileDetailNow(void) { return 1; }
 void XGL_ProfileAdd(xgl_profile_section_t section, double start)
@@ -104,7 +109,24 @@ void XGL_ProfileCount(xgl_profile_counter_t counter, unsigned long count)
     profile_counts[counter] += count;
 }
 
-void Con_Printf(char *format, ...) { (void)format; }
+static char printed[1024];
+void Con_Printf(char *format, ...)
+{
+    va_list arguments;
+    size_t used = strlen(printed);
+    va_start(arguments, format);
+    vsnprintf(printed + used, sizeof(printed) - used, format, arguments);
+    va_end(arguments);
+}
+double Sys_FloatTime(void) { return test_clock += .5; }
+const byte *XGL_TextureTexels(int id, int *width, int *height)
+{
+    assert(id == 1 || id == 2);
+    ++texel_calls;
+    if (!shape_texels[id - 1]) return NULL;
+    *width = shape_width; *height = shape_height;
+    return shape_texels[id - 1];
+}
 int XGL_SMPActive(void) { return smp_active; }
 void XGL_AliasPrepareFrame(void)
 {
@@ -447,6 +469,9 @@ static void setup_world(void)
     /* Most contracts give every face the same limit; sharing by apparent
      * size has a test of its own. */
     xgl_detaildensity.value = 0;
+    /* Walls are cut along texture shapes only in the tests of that. */
+    xgl_shapes.value = 0;
+    shape_texels[0] = shape_texels[1] = NULL; texel_calls = 0; printed[0] = 0;
     pattern_material = box_calls = 0;
     /* Most contracts exercise on-demand building without a per-frame limit;
      * map-load building and the limit have tests of their own. */
@@ -2066,6 +2091,292 @@ static void test_brush_entity_basis_and_external_cache(void)
     assert(!xgl_cache_bytes && !xgl_brush_cache[0].faces && !xgl_brush_cache[1].faces);
 }
 
+/* Walls cut along the shapes of their textures. The texture is 64 texels
+ * square: a ground with a panel on it and a thin strip across, in the tones
+ * of one of two frames. The test face shows it four times. */
+static byte shape_images[2][64 * 64];
+static const int shape_tones[2][3] = {{200, 40, 250}, {30, 90, 120}};
+static texture_t shape_frame;
+static byte shape_light[33 * 33];
+
+static int shape_picture(int image, int x, int y)
+{
+    x &= 63; y &= 63;
+    if (y >= 52 && y < 56) return shape_tones[image][2];
+    if (x >= 16 && x < 40 && y >= 12 && y < 44) return shape_tones[image][1];
+    return shape_tones[image][0];
+}
+
+static void setup_shapes(void)
+{
+    int image, x, y;
+    setup_world();
+    for (image = 0; image < 2; ++image)
+        for (y = 0; y < 64; ++y)
+            for (x = 0; x < 64; ++x)
+                shape_images[image][y * 64 + x] = (byte)shape_picture(image, x, y);
+    shape_texels[0] = shape_images[0]; shape_texels[1] = shape_images[1];
+    shape_width = shape_height = 64;
+    test_texture.width = test_texture.height = 64;
+    xgl_shapes.value = 1;
+    printed[0] = 0;
+    XGL_WorldNewMap();
+}
+
+/* What was drawn is the face, whole, in triangles of one flat color each:
+ * the picture's at the triangle's middle. Fullbright frames only. Returns
+ * the number of triangles. */
+static int check_shape_frame(int image, float offset_z)
+{
+    const xgl_native_vertex_t *vertex;
+    float x, y, expected;
+    int i, j, k;
+    assert(captured_count >= 9 && captured_count % 3 == 0);
+    assert(fabs(captured_area() - 128.0f * 128.0f) < 2);
+    for (i = 0; i < captured_count; i += 3) {
+        vertex = &captured[i];
+        x = (vertex[0].position[0] + vertex[1].position[0] + vertex[2].position[0]) / 3;
+        y = (vertex[0].position[1] + vertex[1].position[1] + vertex[2].position[1]) / 3;
+        expected = shape_picture(image, (int)floor(x), (int)floor(y)) / 255.0f;
+        for (j = 0; j < 3; ++j) {
+            assert(vertex[j].position[2] == offset_z);
+            for (k = 0; k < 3; ++k) assert(fabs(vertex[j].color.rgb[k] - expected) < 4 / 255.0f);
+        }
+    }
+    return captured_count / 3;
+}
+
+static void test_shaped_wall(void)
+{
+    static model_t external;
+    static msurface_t external_surface;
+    const xgl_native_vertex_t *vertex;
+    entity_t entity;
+    int i, j, k, triangles, shaded, calls;
+    setup_shapes();
+    /* The textures were examined while the map loaded, and it says so. */
+    assert(texel_calls == 1);
+    assert(strstr(printed, "XGL: wall textures examined for shapes: 1 in 0.5 s, 1 with shapes\n"));
+    r_fullbright.value = 1;
+    begin_frame();
+    assert(texel_calls == 1);
+    triangles = check_shape_frame(0, 0);
+    assert(xgl_surfaces[0].shape_step > 0 && xgl_surfaces[0].shape_need == xgl_surfaces[0].shape_step);
+    assert(xgl_surfaces[0].detail.count == triangles * 3 && triangles <= XGL_SHAPE_TRIANGLES);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 2);
+    assert(profile_counts[XGL_PROFILE_WORLD_DETAIL_SURFACES] == 1);
+    assert(profile_counts[XGL_PROFILE_WORLD_DETAIL_TRIANGLES] == (unsigned long)triangles);
+    assert(profile_counts[XGL_PROFILE_WORLD_SHAPE_SURFACES] == 1);
+    assert(profile_counts[XGL_PROFILE_WORLD_SHAPE_TRIANGLES] == (unsigned long)triangles);
+    /* The pieces have the colors the division found: nothing was sampled. */
+    assert(!box_calls && !sample_calls);
+    /* The mesh is kept: the next frame builds and colors nothing. */
+    begin_frame();
+    assert(check_shape_frame(0, 0) == triangles);
+    assert(!profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS]);
+    assert(profile_counts[XGL_PROFILE_WORLD_COLOR_HITS] == 1);
+    assert(!profile_counts[XGL_PROFILE_WORLD_COLOR_UPDATES] && !box_calls);
+    /* Baked light is looked up at every corner of every piece: with light
+     * that grows along s, so does each triangle's color. */
+    r_fullbright.value = 0;
+    for (i = 0; i < 81; ++i) test_samples[i] = (byte)(40 + 8 * (i % 9));
+    XGL_WorldNewMap();
+    begin_frame();
+    assert(captured_count == triangles * 3);
+    shaded = 0;
+    for (i = 0; i < captured_count; i += 3) {
+        vertex = &captured[i];
+        for (j = 0; j < 3; ++j)
+            for (k = 0; k < 3; ++k) {
+                if (vertex[j].position[0] < vertex[k].position[0] - .5f) {
+                    assert(vertex[j].color.rgb[0] <= vertex[k].color.rgb[0]);
+                    shaded += vertex[j].color.rgb[0] < vertex[k].color.rgb[0];
+                }
+            }
+    }
+    assert(shaded > triangles);
+    /* A box built as maps are, drawn as an entity, is cut the same way. */
+    r_fullbright.value = 1;
+    external = test_model; external_surface = test_surface;
+    external.surfaces = &external_surface;
+    memset(&entity, 0, sizeof(entity));
+    entity.model = &external;
+    entity.origin[2] = 5;
+    begin_frame();
+    memset(profile_counts, 0, sizeof(profile_counts));
+    captured_count = 0; calls = box_calls;
+    XGL_DrawBrushModel(&entity);
+    assert(check_shape_frame(0, 5) == triangles);
+    assert(profile_counts[XGL_PROFILE_WORLD_SHAPE_SURFACES] == 1 && box_calls == calls);
+    /* Switched off, the wall is the ordinary sampled mesh again; switched
+     * back on, the texture is not examined a second time. */
+    xgl_shapes.value = 0;
+    begin_frame();
+    assert(!profile_counts[XGL_PROFILE_WORLD_SHAPE_SURFACES] && box_calls > calls);
+    assert(xgl_surfaces[0].shape_need == -1 && !xgl_surfaces[0].shape_step);
+    calls = texel_calls;
+    xgl_shapes.value = 1;
+    begin_frame();
+    assert(check_shape_frame(0, 0) == triangles && texel_calls == calls);
+    assert(profile_counts[XGL_PROFILE_WORLD_SHAPE_SURFACES] == 1);
+    /* A mesh evicted for want of memory is built again when next wanted. */
+    XGL_Flush();
+    XGL_EvictDetailFrom(&xgl_surfaces[0], 0);
+    assert(!xgl_surfaces[0].detail.vertices && !xgl_surfaces[0].shape_step);
+    begin_frame();
+    assert(check_shape_frame(0, 0) == triangles);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 1);
+    XGL_WorldShutdown();
+}
+
+static void test_shape_distance(void)
+{
+    const xgl_surface_mesh_t *mesh;
+    const xgl_color_vertex_t *kept;
+    float z, distances[4];
+    int i, step, steps[4], triangles[4], near_step, frames;
+    setup_shapes();
+    r_fullbright.value = 1;
+    xgl_detaildensity.value = 160;
+    r_origin[2] = 700;
+    begin_frame();
+    /* Far off, the plain mesh shows all the wall can be given. */
+    assert(xgl_surfaces[0].shape_need == 0 && !xgl_surfaces[0].detail.vertices);
+    assert(captured_count == 6);
+    /* Nearer, it is cut, and the nearer the finer. With no limit on
+     * building it always has just what its distance asks for. */
+    distances[0] = 250; distances[1] = 120; distances[2] = 60; distances[3] = 30;
+    for (i = 0; i < 4; ++i) {
+        r_origin[2] = distances[i];
+        begin_frame();
+        steps[i] = xgl_surfaces[0].shape_step;
+        triangles[i] = captured_count / 3;
+        assert(steps[i] == XGL_SurfaceShapeStep(&test_surface, distances[i] * distances[i]));
+        assert(steps[i] > 0 && xgl_surfaces[0].detail.count == captured_count);
+        assert(fabs(captured_area() - 128.0f * 128.0f) < 2);
+        if (i) assert(steps[i] >= steps[i - 1] && triangles[i] >= triangles[i - 1]);
+    }
+    assert(steps[3] > steps[0] && triangles[3] > triangles[0]);
+    /* Where every cut is made, each piece is one color of the picture. */
+    assert(check_shape_frame(0, 0) == triangles[3]);
+    /* A step is a set of cuts: the lowest of those that make the same. */
+    step = XGL_SurfaceShapeStep(&test_surface, 0);
+    assert(step == steps[3]);
+    for (i = 3; i >= 0; --i) {
+        r_origin[2] = distances[i];
+        begin_frame();
+        assert(xgl_surfaces[0].shape_step == steps[i] && captured_count == triangles[i] * 3);
+    }
+    /* Too far for any cut, it draws its plain mesh again. */
+    r_origin[2] = 700;
+    begin_frame();
+    assert(xgl_surfaces[0].detail_frame != r_framecount && captured_count == 6);
+    /* With building limited, as in play, the wall is made finer at once
+     * but coarser only when half the pieces or fewer are asked for, and
+     * then only in one frame out of four. */
+    xgl_detailbuild.value = 128;
+    r_origin[2] = 30;
+    begin_frame();
+    near_step = xgl_surfaces[0].shape_step;
+    assert(near_step == steps[3]);
+    kept = xgl_surfaces[0].detail.vertices;
+    for (z = 30; z < 700; z += 1) {
+        step = XGL_SurfaceShapeStep(&test_surface, z * z);
+        if (xgl_shape_levels[step] * 2 <= xgl_shape_levels[near_step]) break;
+        if (step == near_step) continue;
+        /* A pace back: fewer pieces asked for, the mesh stays. */
+        r_origin[2] = z;
+        begin_frame();
+        assert(xgl_surfaces[0].shape_need == step);
+        assert(xgl_surfaces[0].shape_step == near_step && xgl_surfaces[0].detail.vertices == kept);
+    }
+    assert(z < 700);
+    r_origin[2] = z;
+    for (frames = 0; frames < 8 && xgl_surfaces[0].shape_step == near_step; ++frames) {
+        begin_frame();
+        if (r_framecount % XGL_SHAPE_COARSEN) assert(xgl_surfaces[0].shape_step == near_step);
+    }
+    assert(frames >= 1 && frames <= XGL_SHAPE_COARSEN && xgl_surfaces[0].shape_step == step);
+    assert(r_framecount % XGL_SHAPE_COARSEN == 0);
+    /* And finer again in the very next frame. */
+    r_origin[2] = 30;
+    begin_frame();
+    assert(xgl_surfaces[0].shape_step == near_step);
+    mesh = &xgl_surfaces[0].detail;
+    assert(mesh->count == triangles[3] * 3);
+    XGL_WorldShutdown();
+}
+
+static void test_shape_animation(void)
+{
+    int triangles;
+    setup_shapes();
+    r_fullbright.value = 1;
+    /* Two frames with the same shapes in other tones. */
+    shape_frame = test_texture;
+    shape_frame.gl_texturenum = 2;
+    test_texture.anim_total = shape_frame.anim_total = 2;
+    test_texture.anim_min = 0; test_texture.anim_max = 1; test_texture.anim_next = &shape_frame;
+    shape_frame.anim_min = 1; shape_frame.anim_max = 2; shape_frame.anim_next = &test_texture;
+    XGL_WorldNewMap();
+    assert(texel_calls == 3); /* The first once more for the new map, and the other. */
+    cl.time = 0;
+    begin_frame();
+    triangles = check_shape_frame(0, 0);
+    /* The wall keeps its mesh as the texture changes: every piece takes
+     * the new frame's color, and nothing is built or sampled. */
+    cl.time = .1;
+    begin_frame();
+    assert(check_shape_frame(1, 0) == triangles);
+    assert(!profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS]);
+    assert(profile_counts[XGL_PROFILE_WORLD_COLOR_UPDATES] == 1);
+    cl.time = .2;
+    begin_frame();
+    assert(check_shape_frame(0, 0) == triangles);
+    assert(!profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] && !box_calls);
+    XGL_WorldShutdown();
+}
+
+static void test_shape_limits(void)
+{
+    int i, triangles;
+    /* A face that shows the texture sixty-four times. Every cut would
+     * make more pieces than one mesh holds: it is cut at the finest step
+     * that fits, and that is found out once. */
+    setup_shapes();
+    for (i = 1; i < 4; ++i) {
+        test_vertices[i].position[0] *= 4;
+        test_vertices[i].position[1] *= 4;
+    }
+    memset(shape_light, 64, sizeof(shape_light));
+    test_surface.samples = shape_light;
+    test_surface.extents[0] = test_surface.extents[1] = 512;
+    xgl_subdivide.value = 256;
+    XGL_WorldNewMap();
+    begin_frame();
+    assert(xgl_surfaces[0].detail.vertices && xgl_surfaces[0].shape_most > 1);
+    assert(xgl_surfaces[0].shape_step == xgl_surfaces[0].shape_most - 1);
+    assert(xgl_surfaces[0].shape_need > xgl_surfaces[0].shape_step);
+    triangles = xgl_surfaces[0].detail.count / 3;
+    assert(triangles > 2 && triangles <= XGL_SHAPE_TRIANGLES && captured_count == triangles * 3);
+    assert(fabs(captured_area() - 512.0f * 512.0f) < 16);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 2 && xgl_detail_built == triangles);
+    begin_frame();
+    assert(captured_count == triangles * 3 && !xgl_detail_built);
+    assert(!profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS]);
+    /* With pieces kept so short for the light that no step fits, the face
+     * keeps its plain mesh, and is not tried again either. */
+    xgl_subdivide.value = 8;
+    begin_frame();
+    assert(!xgl_surfaces[0].detail.vertices && xgl_surfaces[0].shape_most == 1);
+    assert(!xgl_surfaces[0].shape_step && xgl_surfaces[0].shape_need > 0);
+    assert(captured_count == 6 && xgl_detail_built == XGL_DETAIL_ATTEMPT);
+    assert(!profile_counts[XGL_PROFILE_WORLD_SHAPE_SURFACES]);
+    begin_frame();
+    assert(captured_count == 6 && !xgl_detail_built);
+    XGL_WorldShutdown();
+}
+
 int main(void)
 {
     test_adaptive_detail();
@@ -2090,6 +2401,10 @@ int main(void)
     test_detail_eviction();
     test_state_order_and_clip_flags();
     test_brush_entity_basis_and_external_cache();
+    test_shaped_wall();
+    test_shape_distance();
+    test_shape_animation();
+    test_shape_limits();
     XGL_WorldShutdown();
     assert(xgl_cache_bytes == 0 && xgl_surfaces == NULL);
     puts("XGL world/light contracts passed");

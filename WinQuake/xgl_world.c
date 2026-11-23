@@ -66,7 +66,9 @@ static const float xgl_turb_sin[256] = {
 
 typedef struct {
     float st[2];
-    /* Mean length, in texels, of the mesh edges that meet at the vertex. */
+    /* Mean length, in texels, of the mesh edges that meet at the vertex.
+     * Below zero for a vertex of a piece of a wall cut along the shapes of
+     * its texture: the piece is then node -spacing - 1 of the division. */
     float spacing;
     byte material[3];
     byte samples[MAXLIGHTMAPS];
@@ -104,6 +106,13 @@ typedef struct {
      * light_frame: frame in which a dynamic light reached this wall. */
     int center_valid, detail_frame, detail_used, bucket, light_frame;
     float area, radius;
+    /* For a wall cut along the shapes of its texture. shape_step: the step
+     * of detail its detailed mesh was last built for; zero while its plain
+     * mesh serves. shape_need: the step this frame's distance asks for; -1
+     * for a wall drawn the ordinary way. shape_most: one more than the
+     * finest step that fits one mesh, once a finer has been found not to;
+     * zero until then. */
+    short shape_step, shape_need, shape_most;
 } xgl_surface_cache_t;
 
 typedef struct {
@@ -150,6 +159,7 @@ static mleaf_t *xgl_pvs_leaf;
 static int xgl_pvs_novis;
 /* The settings the cached meshes were built with. */
 static float xgl_cache_step, xgl_cache_error, xgl_cache_face, xgl_cache_edge, xgl_cache_density;
+static float xgl_cache_shapes;
 static xgl_water_surface_t xgl_water[XGL_WATER_QUEUE];
 static int xgl_water_count;
 static xgl_brush_cache_t xgl_brush_cache[XGL_BRUSH_CACHE_MODELS];
@@ -188,6 +198,7 @@ cvar_t xgl_detailerror = {"xgl_detailerror", "16", false, false, 0, NULL};
 cvar_t xgl_detailface = {"xgl_detailface", "192", false, false, 0, NULL};
 cvar_t xgl_detailedge = {"xgl_detailedge", "16", false, false, 0, NULL};
 cvar_t xgl_detaildensity = {"xgl_detaildensity", "160", false, false, 0, NULL};
+cvar_t xgl_shapes = {"xgl_shapes", "1", false, false, 0, NULL};
 
 void XGL_SurfaceLightSamples(msurface_t *, const float *, byte[MAXLIGHTMAPS]);
 void XGL_LightSamplesAt(msurface_t *, float, float, byte[MAXLIGHTMAPS]);
@@ -231,7 +242,9 @@ static void XGL_FreeBrushCache (xgl_brush_cache_t *entry)
     memset(entry, 0, sizeof(*entry));
 }
 
-void XGL_WorldShutdown (void)
+/* Release every cached mesh. What is known of the textures' shapes stays:
+ * a change of settings builds the meshes again from it. */
+static void XGL_WorldRelease (void)
 {
     int i;
     XGL_Flush(); /* Native batches may still borrow cached vertex arrays. */
@@ -261,6 +274,12 @@ void XGL_WorldShutdown (void)
     memset(&xgl_sky, 0, sizeof(xgl_sky));
     memset(xgl_tones, 0, sizeof(xgl_tones));
     xgl_tone_next = 0;
+}
+
+void XGL_WorldShutdown (void)
+{
+    XGL_WorldRelease();
+    XGL_ShapesClear();
 }
 
 static void XGL_SurfacePoint (model_t *model, msurface_t *surface, int index, vec3_t point)
@@ -333,6 +352,7 @@ static void XGL_EvictDetailFrom (xgl_surface_cache_t *cache, int age)
     if (!cache->detail.vertices || r_framecount - cache->detail_used < age) return;
     XGL_FreeSurfaceMesh(&cache->detail);
     cache->detail_attempted = cache->detail_retry = cache->detail_limit = 0;
+    cache->shape_step = 0;
     XGL_ProfileCount(XGL_PROFILE_WORLD_EVICTIONS, 1);
 }
 
@@ -408,6 +428,10 @@ static struct {
     int capped;
     /* Edges no longer than this, in texels, are never split. */
     float minimum;
+    /* After a mesh cut along shapes was asked for: the step that fit one
+     * mesh when the step asked for did not, zero if none did; -1 when the
+     * step asked for was not too much. */
+    int shape_fit;
 } xgl_build;
 
 /* Baked light with every style at its nominal level, as a factor that takes
@@ -993,17 +1017,261 @@ static float XGL_Setting (float value, float low, float high)
     return value > high ? high : value;
 }
 
+/* ---- Walls cut along the shapes in their textures -----------------------
+ * xgl_shapes.c divides a texture into pieces of nearly one color and cuts a
+ * face along that division. A wall of such a texture is drawn as those
+ * pieces, each in its color under the baked light at its own corners.
+ *
+ * How finely depends only on the texture and on a step of detail that
+ * follows the distance, never on the face: every face of a wall is then cut
+ * alike and the pattern runs unbroken across them. */
+
+/* Pieces to a repeat of the texture: the triangles the frame's density
+ * allows that much wall, over this. Set so that walls cut this way cost
+ * about what they cost as smooth meshes. A cut is judged worth making as if
+ * a piece cost somewhat more. */
+#define XGL_SHAPE_PER_PIECE 2.2f
+#define XGL_SHAPE_PIECE_COST 3.3f
+/* A step serves a range of distances, and is judged as from the middle of
+ * it: the squared distance at which it begins, over this. */
+#define XGL_SHAPE_STEP_MIDDLE 1.2f
+/* At this distance a texel is about a pixel wide. Nearer, a cut need be
+ * worth less, down to this share; and no part is cut off that would be
+ * narrower than this many pixels, which would only flicker. */
+#define XGL_SHAPE_PIXEL_DISTANCE 160.0f
+#define XGL_SHAPE_NEAR .25f
+#define XGL_SHAPE_THIN 1.5f
+/* Walls cut along shapes may run this far over the frame's allowance before
+ * one of their faces is left plain, and rank among the other walls as if
+ * each face were this large. */
+#define XGL_SHAPE_OVER 1.25f
+#define XGL_SHAPE_RANK_AREA 16384.0f
+/* Frames between two meshes made coarser because the viewer moved away. */
+#define XGL_SHAPE_COARSEN 4
+
+/* The pieces a repeat of the texture may have at each step: steps, so that
+ * faces a little nearer or farther agree. Past the most pieces a division
+ * has, the steps only ask less of a cut. */
+static const short xgl_shape_levels[XGL_SHAPE_STEPS] = {
+    1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,
+    96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+};
+/* Changes whenever the settings the steps depend on may have. */
+static int xgl_shape_key = 1;
+static int xgl_coarsen_frame = -1;
+
+/* The division of a wall's texture, or NULL for a wall drawn the ordinary
+ * way. An animated texture has one division for all its frames. */
+static xgl_shape_tree_t *XGL_SurfaceShapes (const msurface_t *surface)
+{
+    if (!xgl_shapes.value || (surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB))) return NULL;
+    return XGL_TextureShapes(surface->texinfo->texture);
+}
+
+/* What a step of detail asks of a cut. */
+static void XGL_ShapeTerms (const xgl_shape_tree_t *tree, int step, xgl_shape_terms_t *terms)
+{
+    float threshold, edge, distance, nearness;
+    int level;
+    level = xgl_shape_levels[step];
+    terms->most = 2 * ((level < XGL_SHAPE_PIECES ? level : XGL_SHAPE_PIECES) - 1);
+    /* The squared distance the step is judged from. With no density every
+     * wall in range is as if at the viewer's feet. */
+    distance = 0;
+    if (xgl_detaildensity.value > 0)
+        distance = (float)tree->width * tree->height * xgl_detaildensity.value /
+                   (XGL_SHAPE_PER_PIECE * XGL_SHAPE_STEP_MIDDLE * level) - 64;
+    if (distance < 0) distance = 0;
+    /* A cut must be worth what the ordinary builder asks of a split: a step
+     * of xgl_detailerror levels in every channel across a piece
+     * xgl_detailedge texels square, for each triangle it adds. What it
+     * removes counts by the screen it covers, so near the viewer a small
+     * feature is worth more; farther off, the count of pieces already holds
+     * the cuts back. */
+    threshold = XGL_Setting(xgl_detailerror.value, 1, 255);
+    edge = XGL_Setting(xgl_detailedge.value, 4, 64);
+    nearness = (distance + 64) / (XGL_SHAPE_PIXEL_DISTANCE * XGL_SHAPE_PIXEL_DISTANCE);
+    if (nearness < XGL_SHAPE_NEAR) nearness = XGL_SHAPE_NEAR;
+    if (nearness > 1) nearness = 1;
+    terms->worth = .375f * edge * edge * threshold * threshold * XGL_SHAPE_PIECE_COST * nearness;
+    terms->thin = XGL_SHAPE_THIN * (float)sqrt(distance) / XGL_SHAPE_PIXEL_DISTANCE;
+}
+
+/* For each step, the lowest step that makes the same cuts: a later step
+ * makes every cut an earlier one does, so two that make as many make the
+ * same. A wall is then not built again for a step that would not change it,
+ * and step zero stands for every step that leaves the plain mesh. */
+static const byte *XGL_ShapeSteps (xgl_shape_tree_t *tree)
+{
+    xgl_shape_terms_t terms;
+    int i, cuts, previous;
+    if (tree->steps_key == xgl_shape_key) return tree->steps;
+    tree->steps[0] = 0;
+    previous = 0;
+    for (i = 1; i < XGL_SHAPE_STEPS; ++i) {
+        XGL_ShapeTerms(tree, i, &terms);
+        cuts = XGL_ShapeCuts(tree, &terms);
+        tree->steps[i] = cuts == previous ? tree->steps[i - 1] : (byte)i;
+        previous = cuts;
+    }
+    tree->steps_key = xgl_shape_key;
+    return tree->steps;
+}
+
+/* The step of detail a wall of this texture has at a squared distance: the
+ * pieces a repeat gets are what the frame's density of triangles pays for.
+ * Zero when its plain mesh shows all it can be given there. */
+static int XGL_ShapeStep (xgl_shape_tree_t *tree, float distance_squared)
+{
+    float pieces;
+    int step;
+    step = XGL_SHAPE_STEPS - 1;
+    if (xgl_detaildensity.value > 0) {
+        pieces = (float)tree->width * tree->height * xgl_detaildensity.value /
+                 ((distance_squared + 64) * XGL_SHAPE_PER_PIECE);
+        for (step = 0; step + 1 < XGL_SHAPE_STEPS && xgl_shape_levels[step + 1] <= pieces; ++step) {}
+    }
+    return XGL_ShapeSteps(tree)[step];
+}
+
+/* That step for a wall; -1 for one not cut along shapes. */
+static int XGL_SurfaceShapeStep (const msurface_t *surface, float distance_squared)
+{
+    xgl_shape_tree_t *tree = XGL_SurfaceShapes(surface);
+    return tree ? XGL_ShapeStep(tree, distance_squared) : -1;
+}
+
+/* A scratch vertex of a piece. Its recorded coordinates are the piece's
+ * middle, and in place of a spacing it records which node of the division
+ * the piece is: the piece takes its color from that. */
+static int XGL_ShapeVertex (msurface_t *surface, const float *where, const float *anchor,
+                            const float *map, const xgl_shape_piece_t *piece)
+{
+    xgl_build_vertex_t *vertex;
+    int j;
+    if (xgl_build.vertex_count == XGL_MESH_VERTICES) return -1;
+    vertex = &xgl_build.vertices[xgl_build.vertex_count];
+    for (j = 0; j < 3; ++j)
+        vertex->position[j] = anchor[j] + (where[0] - anchor[3]) * map[j] +
+                              (where[1] - anchor[4]) * map[3 + j];
+    XGL_LightSamplesAt(surface, where[0], where[1], vertex->samples);
+    vertex->st[0] = piece->middle[0]; vertex->st[1] = piece->middle[1];
+    vertex->spacing = -(float)(piece->node + 1);
+    return xgl_build.vertex_count++;
+}
+
+/* Lay the pieces of the face cut last into the scratch mesh. Returns 0 when
+ * they come to more than one mesh may hold. */
+static int XGL_ShapeEmit (msurface_t *surface, int pieces, const float *anchor, const float *map)
+{
+    static xgl_shape_piece_t piece;
+    static int index[XGL_SHAPE_CORNERS];
+    unsigned short *triangle;
+    int p, i, center, count;
+    xgl_build.current = 0;
+    xgl_build.vertex_count = xgl_build.triangle_count = xgl_build.edge_count = 0;
+    for (p = 0; p < pieces; ++p) {
+        if ((p & 15) == 15) XGL_AudioUpdate();
+        if (!XGL_ShapePiece(p, &piece)) return 0;
+        count = piece.center ? piece.count : piece.count - 2;
+        if (xgl_build.triangle_count + count > XGL_SHAPE_TRIANGLES) return 0;
+        for (i = 0; i < piece.count; ++i) {
+            index[i] = XGL_ShapeVertex(surface, piece.corner[i], anchor, map, &piece);
+            if (index[i] < 0) return 0;
+        }
+        center = index[0];
+        if (piece.center) {
+            center = XGL_ShapeVertex(surface, piece.middle, anchor, map, &piece);
+            if (center < 0) return 0;
+        }
+        for (i = 0; i < count; ++i) {
+            triangle = xgl_build.triangles[0][xgl_build.triangle_count];
+            xgl_build.tested[0][xgl_build.triangle_count++] = 0;
+            triangle[0] = (unsigned short)center;
+            if (piece.center) {
+                triangle[1] = (unsigned short)index[i];
+                triangle[2] = (unsigned short)index[(i + 1) % piece.count];
+            } else {
+                triangle[1] = (unsigned short)index[i + 1];
+                triangle[2] = (unsigned short)index[i + 2];
+            }
+        }
+    }
+    return 1;
+}
+
+/* Build, in the scratch, a face's mesh cut along the shapes of its texture
+ * at a step of detail. A face too large for that step to fit one mesh is
+ * cut at the finest step that does, and xgl_build.shape_fit says which.
+ * Returns 0, with nothing built, when the face shows no part of the texture
+ * that the step cuts or no step fits: its plain mesh then serves. */
+static int XGL_BuildShapes (model_t *model, msurface_t *surface, float longest, int step)
+{
+    xgl_shape_tree_t *tree;
+    const byte *steps;
+    xgl_shape_terms_t terms;
+    vec3_t points[XGL_MESH_POLYGON], first, second;
+    float st[XGL_MESH_POLYGON][2], anchor[5], map[6], e1[2], e2[2], determinant, best;
+    int i, j, k, count, bi, bj, pieces, asked, built;
+    xgl_build.shape_fit = -1;
+    tree = XGL_SurfaceShapes(surface);
+    count = surface->numedges;
+    if (!tree || count < 3 || count > XGL_MESH_POLYGON) return 0;
+    steps = XGL_ShapeSteps(tree);
+    for (i = 0; i < count; ++i) {
+        XGL_SurfacePoint(model, surface, i, points[i]);
+        for (j = 0; j < 2; ++j)
+            st[i][j] = DotProduct(points[i], surface->texinfo->vecs[j]) + surface->texinfo->vecs[j][3];
+    }
+    /* Texture coordinates back to positions, from the two corners that
+     * spread widest about the first. */
+    best = 0; bi = 1; bj = 2;
+    for (i = 1; i < count; ++i)
+        for (j = i + 1; j < count; ++j) {
+            determinant = (st[i][0] - st[0][0]) * (st[j][1] - st[0][1]) -
+                          (st[j][0] - st[0][0]) * (st[i][1] - st[0][1]);
+            if (fabs(determinant) > fabs(best)) { best = determinant; bi = i; bj = j; }
+        }
+    if (fabs(best) < .001f) return 0;
+    e1[0] = st[bi][0] - st[0][0]; e1[1] = st[bi][1] - st[0][1];
+    e2[0] = st[bj][0] - st[0][0]; e2[1] = st[bj][1] - st[0][1];
+    VectorSubtract(points[bi], points[0], first); VectorSubtract(points[bj], points[0], second);
+    for (k = 0; k < 3; ++k) {
+        map[k] = (first[k] * e2[1] - second[k] * e1[1]) / best;
+        map[3 + k] = (second[k] * e1[0] - first[k] * e2[0]) / best;
+        anchor[k] = points[0][k];
+    }
+    anchor[3] = st[0][0]; anchor[4] = st[0][1];
+    asked = step; built = 0;
+    /* Too much for one mesh: the next step down that cuts less. A step
+     * that cuts nothing this face shows ends it: no lower one will. */
+    for (; step > 0; step = steps[step - 1]) {
+        XGL_ShapeTerms(tree, step, &terms);
+        pieces = XGL_ShapeCutFace(tree, &terms, st, count, longest);
+        if (!pieces) break;
+        if (pieces > 0 && XGL_ShapeEmit(surface, pieces, anchor, map)) {
+            built = 1;
+            break;
+        }
+    }
+    if (step != asked) xgl_build.shape_fit = built ? step : 0;
+    return built;
+}
+
 /* detail is zero for the coarse mesh, else the most triangles the detailed
- * one may have. Returns 1 when built, 0 when this face can have no such mesh
- * (a detailed one that would be no finer than the coarse one included), and
- * -1 when the cache had no room even after evicting idle detail. */
+ * one may have. shape_step, when above zero, has the detailed mesh cut
+ * along the shapes of the face's texture at that step of detail instead.
+ * Returns 1 when built, 0 when this face can have no such mesh (a detailed
+ * one that would be no finer than the coarse one included), and -1 when the
+ * cache had no room even after evicting idle detail. */
 static int XGL_BuildSurfaceMeshData (model_t *model, msurface_t *surface,
-                                xgl_surface_mesh_t *mesh, int detail)
+                                xgl_surface_mesh_t *mesh, int detail, int shape_step)
 {
     texture_t *texture;
     float grid, step, threshold;
     int level, base, limit;
     xgl_build.capped = 0;
+    xgl_build.shape_fit = -1;
     if (surface->numedges < 3) return 0;
     if (surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB)) {
         if (surface->flags & SURF_DRAWSKY) {
@@ -1016,6 +1284,11 @@ static int XGL_BuildSurfaceMeshData (model_t *model, msurface_t *surface,
             if (detail || grid >= 4096) return 0;
             grid *= 2;
         }
+        return XGL_BuildFinish(surface, mesh);
+    }
+    if (detail && shape_step > 0) {
+        if (!XGL_BuildShapes(model, surface, XGL_Setting(xgl_subdivide.value, 8, 256), shape_step))
+            return 0;
         return XGL_BuildFinish(surface, mesh);
     }
     texture = detail ? XGL_SurfaceTexture(surface->texinfo->texture, NULL) : NULL;
@@ -1038,12 +1311,12 @@ static int XGL_BuildSurfaceMeshData (model_t *model, msurface_t *surface,
 }
 
 static int XGL_BuildSurfaceMesh (model_t *model, msurface_t *surface,
-                                xgl_surface_mesh_t *mesh, int detail)
+                                xgl_surface_mesh_t *mesh, int detail, int shape_step)
 {
     double start;
     int built;
     start = XGL_ProfileDetailNow();
-    built = XGL_BuildSurfaceMeshData(model, surface, mesh, detail);
+    built = XGL_BuildSurfaceMeshData(model, surface, mesh, detail, shape_step);
     XGL_ProfileAdd(XGL_PROFILE_WORLD_BUILD, start);
     if (built > 0) {
         XGL_ProfileCount(XGL_PROFILE_WORLD_MESH_BUILDS, 1);
@@ -1071,27 +1344,61 @@ static int XGL_DetailWant (float area, float distance_squared)
  * the face draws its coarse mesh meanwhile. A face that has nothing to show
  * in more detail is examined once and never again. A mesh that its triangle
  * limit cut short is built again when `want`, which grows as the viewer
- * approaches, reaches twice that limit; the old one serves until then. */
+ * approaches, reaches twice that limit; the old one serves until then.
+ *
+ * shape_step is -1 for such a face. For a wall cut along the shapes of its
+ * texture it is the step of detail the distance asks for, and the mesh
+ * follows it both ways: finer at once, coarser only when the step asks for
+ * half the pieces or fewer, so that a wall does not change with every pace
+ * back and forth, and then without hurry. */
 static void XGL_TryBuildDetail (model_t *model, msurface_t *surface,
-                                xgl_surface_cache_t *cache, int want)
+                                xgl_surface_cache_t *cache, int want, int shape_step)
 {
     xgl_surface_mesh_t mesh;
-    int built, built_triangles, limit, most, larger;
+    int built, built_triangles, limit, most, larger, change, coarser;
     /* Build somewhat ahead of the present need, to rebuild less often. */
     most = limit = (int)XGL_Setting(xgl_detailface.value, 4, XGL_MESH_TRIANGLES);
     if (xgl_detaildensity.value > 0 && want + want / 2 < limit) limit = want + want / 2;
-    /* Worth building again at twice the size, or to reach the most a face
-     * may have from anything up to three quarters of it. */
-    larger = cache->detail_limit && (limit >= cache->detail_limit * 2 ||
-        (limit == most && cache->detail_limit * 4 <= most * 3));
-    if (cache->detail.vertices && !larger) return;
-    if (cache->detail_attempted && !larger &&
-        !(cache->detail_retry && r_framecount >= cache->detail_retry)) return;
+    coarser = 0;
+    if (shape_step >= 0) {
+        /* A face too large for the finer steps was found out when it was
+         * first asked for one: it is not tried again. */
+        if (cache->shape_most && shape_step >= cache->shape_most) shape_step = cache->shape_most - 1;
+        /* With no limit on building a wall always has just what is asked. */
+        if (!(xgl_detailbuild.value > 0)) change = shape_step != cache->shape_step;
+        else change = shape_step > cache->shape_step ||
+                      xgl_shape_levels[shape_step] * 2 <= xgl_shape_levels[cache->shape_step];
+        coarser = change && shape_step < cache->shape_step;
+        /* Making a mesh coarser is never urgent: one in every few frames. */
+        if (coarser && xgl_detailbuild.value > 0 &&
+            (r_framecount % XGL_SHAPE_COARSEN || xgl_coarsen_frame == r_framecount)) change = 0;
+        /* A build that found no memory waits its turn like any other. */
+        if (!change || (cache->detail_retry && r_framecount < cache->detail_retry)) return;
+        if (!shape_step) {
+            /* The plain mesh shows all the wall can be given from here. */
+            if (cache->detail.vertices) {
+                if (cache->detail.queued_frame == r_framecount) XGL_Flush();
+                XGL_FreeSurfaceMesh(&cache->detail);
+                xgl_coarsen_frame = r_framecount;
+            }
+            cache->shape_step = 0;
+            cache->detail_retry = 0;
+            return;
+        }
+    } else {
+        /* Worth building again at twice the size, or to reach the most a
+         * face may have from anything up to three quarters of it. */
+        larger = cache->detail_limit && (limit >= cache->detail_limit * 2 ||
+            (limit == most && cache->detail_limit * 4 <= most * 3));
+        if (cache->detail.vertices && !larger) return;
+        if (cache->detail_attempted && !larger &&
+            !(cache->detail_retry && r_framecount >= cache->detail_retry)) return;
+    }
     if (xgl_detailbuild.value > 0 && xgl_detail_built >= xgl_detailbuild.value) return;
     cache->detail_attempted = 1;
     cache->detail_retry = 0;
     memset(&mesh, 0, sizeof(mesh));
-    built = XGL_BuildSurfaceMesh(model, surface, &mesh, limit);
+    built = XGL_BuildSurfaceMesh(model, surface, &mesh, limit, shape_step);
     built_triangles = built > 0 ? mesh.count / 3 : 0;
     xgl_detail_built += built_triangles > XGL_DETAIL_ATTEMPT ? built_triangles : XGL_DETAIL_ATTEMPT;
     if (built < 0) {
@@ -1100,12 +1407,21 @@ static void XGL_TryBuildDetail (model_t *model, msurface_t *surface,
         return;
     }
     cache->detail_limit = xgl_build.capped ? limit : 0;
-    if (!built) return;
-    if (cache->detail.vertices) {
-        /* A brush entity may have queued the old mesh in this frame. */
+    if (shape_step >= 0) {
+        cache->shape_step = (short)shape_step;
+        if (xgl_build.shape_fit >= 0) {
+            cache->shape_most = (short)(xgl_build.shape_fit + 1);
+            cache->shape_step = (short)xgl_build.shape_fit;
+        }
+        if (coarser) xgl_coarsen_frame = r_framecount;
+    }
+    if (cache->detail.vertices && (built || shape_step >= 0)) {
+        /* A brush entity may have queued the old mesh in this frame. A wall
+         * cut along shapes that now shows nothing to cut goes plain. */
         if (cache->detail.queued_frame == r_framecount) XGL_Flush();
         XGL_FreeSurfaceMesh(&cache->detail);
     }
+    if (!built) return;
     cache->detail = mesh;
     cache->detail_used = r_framecount;
 }
@@ -1363,15 +1679,33 @@ static void XGL_SurfaceWillChange(xgl_surface_mesh_t *mesh)
 
 /* Filtered texture colors are sampled once per distinct vertex, over the
  * spacing of the vertices around it, and kept as bytes; later light, style
- * and gamma changes never touch the texture again. */
-static void XGL_SampleMeshMaterials (xgl_surface_mesh_t *mesh, texture_t *texture,
-                                     unsigned int texture_revision)
+ * and gamma changes never touch the texture again. The pieces of a wall cut
+ * along its texture's shapes are not sampled: each has the color the
+ * division gives its node in this texture, which for an animated texture
+ * is the frame now showing. */
+static void XGL_SampleMeshMaterials (xgl_surface_mesh_t *mesh, const msurface_t *surface,
+                                     texture_t *texture, unsigned int texture_revision)
 {
     xgl_cached_vertex_t *vertex;
-    int i;
+    const xgl_shape_tree_t *tree;
+    const byte *colors;
+    int i, node, looked;
+    tree = NULL; colors = NULL; looked = 0;
     for (i = 0, vertex = mesh->data; i < mesh->unique; ++i, ++vertex) {
         if ((i & 255) == 255) XGL_AudioUpdate();
         vertex->material[0] = vertex->material[1] = vertex->material[2] = 128;
+        if (vertex->spacing < 0) {
+            if (!looked) {
+                looked = 1;
+                tree = XGL_SurfaceShapes(surface);
+                colors = XGL_ShapeColors(tree, texture);
+            }
+            node = (int)(-vertex->spacing) - 1;
+            if (colors && node < tree->count) memcpy(vertex->material, colors + 3 * node, 3);
+            /* The division is not to be had: the piece's middle, then. */
+            else XGL_SampleTextureBox(texture->gl_texturenum, vertex->st[0], vertex->st[1], 2, vertex->material);
+            continue;
+        }
         XGL_SampleTextureBox(texture->gl_texturenum, vertex->st[0], vertex->st[1],
                              vertex->spacing * XGL_DETAIL_FILTER, vertex->material);
     }
@@ -1456,7 +1790,7 @@ static void XGL_UpdateSurfaceMesh (xgl_surface_mesh_t *mesh, msurface_t *surface
         return;
     }
     XGL_SurfaceWillChange(mesh);
-    if (texture_changed) XGL_SampleMeshMaterials(mesh, texture, texture_revision);
+    if (texture_changed) XGL_SampleMeshMaterials(mesh, surface, texture, texture_revision);
     XGL_WorldGamma();
     XGL_ColorMesh(mesh, surface, fullbright);
     mesh->lit_current = 0;
@@ -1719,12 +2053,12 @@ static void XGL_PrebuildWorld (void)
         surface = xgl_cached_world->surfaces + i;
         cache = xgl_surfaces + i;
         cache->coarse_attempted = 1;
-        if (XGL_BuildSurfaceMesh(xgl_cached_world, surface, &cache->coarse, 0) <= 0) continue;
+        if (XGL_BuildSurfaceMesh(xgl_cached_world, surface, &cache->coarse, 0, -1) <= 0) continue;
         XGL_SurfaceBounds(xgl_cached_world, surface, cache);
         if (surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB)) continue;
         texture = XGL_SurfaceTexture(surface->texinfo->texture, NULL);
         if (texture && texture->width && texture->height)
-            XGL_SampleMeshMaterials(&cache->coarse, texture,
+            XGL_SampleMeshMaterials(&cache->coarse, surface, texture,
                                     XGL_TextureRevision(texture->gl_texturenum));
     }
 }
@@ -1736,19 +2070,58 @@ static int XGL_BuildSettingsChanged (void)
            xgl_cache_error != xgl_detailerror.value ||
            xgl_cache_face != xgl_detailface.value ||
            xgl_cache_edge != xgl_detailedge.value ||
-           xgl_cache_density != xgl_detaildensity.value;
+           xgl_cache_density != xgl_detaildensity.value ||
+           xgl_cache_shapes != xgl_shapes.value;
 }
 
-void XGL_WorldNewMap (void)
+/* Examine, while the map loads, the texture of every wall that may be
+ * drawn, for the shapes it is to be cut along: that work is then out of
+ * the frames. A texture already examined costs nothing. */
+static void XGL_ExamineModelShapes (model_t *model)
+{
+    msurface_t *surface;
+    int i;
+    for (i = 0, surface = model->surfaces; i < model->numsurfaces; ++i, ++surface) {
+        if ((i & 63) == 63) XGL_AudioUpdate();
+        if (surface->texinfo && surface->texinfo->texture) XGL_SurfaceShapes(surface);
+    }
+}
+
+static void XGL_ExamineShapes (void)
+{
+    model_t *model;
+    double start;
+    int i, before, examined, shaped;
+    if (!xgl_shapes.value) return;
+    XGL_ShapesCount(&before, NULL);
+    start = Sys_FloatTime();
+    XGL_ExamineModelShapes(xgl_cached_world);
+    /* The boxes and other models built as maps are. The map's own doors and
+     * platforms are among its faces. */
+    for (i = 1; i < MAX_MODELS && (model = cl.model_precache[i]) != NULL; ++i)
+        if (model != xgl_cached_world && model->type == mod_brush && model->name[0] != '*')
+            XGL_ExamineModelShapes(model);
+    XGL_ShapesCount(&examined, &shaped);
+    if (examined != before)
+        Con_Printf("XGL: wall textures examined for shapes: %d in %.1f s, %d with shapes\n",
+                   examined, Sys_FloatTime() - start, shaped);
+}
+
+/* Start the cache afresh for the map in hand, with the settings as they
+ * stand. */
+static void XGL_WorldSetup (void)
 {
     size_t bytes, each;
-    XGL_WorldShutdown();
+    XGL_WorldRelease();
     xgl_cached_world = cl.worldmodel;
     xgl_cache_step = xgl_subdivide.value;
     xgl_cache_error = xgl_detailerror.value;
     xgl_cache_face = xgl_detailface.value;
     xgl_cache_edge = xgl_detailedge.value;
     xgl_cache_density = xgl_detaildensity.value;
+    xgl_cache_shapes = xgl_shapes.value;
+    /* The steps of detail worked out for the old settings no longer hold. */
+    ++xgl_shape_key;
     if (!xgl_cached_world || xgl_cached_world->numsurfaces <= 0) return;
     each = sizeof(*xgl_surfaces) + 3 * sizeof(int);
     if ((size_t)xgl_cached_world->numsurfaces > XGL_WORLD_CACHE_BYTES / each) return;
@@ -1768,6 +2141,14 @@ void XGL_WorldNewMap (void)
     }
     if (xgl_surfaces && xgl_world_prebuild) XGL_PrebuildWorld();
     Con_Printf("XGL: sampled BSP cache limited to 8 MiB; detail follows texture and light contrast; complete coarse fallback\n");
+    XGL_ExamineShapes();
+}
+
+void XGL_WorldNewMap (void)
+{
+    /* The textures are the new map's: what was known of the old ones goes. */
+    XGL_ShapesClear();
+    XGL_WorldSetup();
 }
 
 /* Quarter-octave rank of a positive projected-size estimate, read from the
@@ -1789,16 +2170,22 @@ static int XGL_DetailBucket (float priority)
  * estimates, then submit in the original BSP order. This avoids spending the
  * whole allowance on small faces encountered early in the traversal. A face
  * detailed in the previous frame ranks two steps higher, so faces near the
- * cut-off do not flicker between their coarse and detailed colors. */
+ * cut-off do not flicker between their coarse and detailed colors.
+ *
+ * A wall cut along the shapes of its texture looks wrong with one face left
+ * plain. Its faces are therefore taken however small, rank by nearness
+ * alone, so that if the allowance runs out it is the far walls that go
+ * plain and not the small faces of a near one, and may run somewhat over
+ * the allowance before any is dropped. */
 static void XGL_SelectWorldDetail(void)
 {
     static int counts[XGL_DETAIL_BUCKETS];
     xgl_surface_cache_t *cache;
     msurface_t *surface;
     vec3_t delta;
-    float distance, range;
-    int i, index, candidates, bucket, start;
-    candidates = 0;
+    float distance, range, allowance, most;
+    int i, index, candidates, bucket, start, shaped;
+    candidates = shaped = 0;
     memset(counts, 0, sizeof(counts));
     for (i = 0; i < xgl_world_count; ++i) {
         if ((i & 63) == 0) XGL_AudioUpdate();
@@ -1811,7 +2198,7 @@ static void XGL_SelectWorldDetail(void)
         /* Coarse meshes get memory first, preserving cheap complete fallback. */
         if (!cache->coarse_attempted) {
             cache->coarse_attempted = 1;
-            XGL_BuildSurfaceMesh(cl.worldmodel, surface, &cache->coarse, 0);
+            XGL_BuildSurfaceMesh(cl.worldmodel, surface, &cache->coarse, 0, -1);
         }
         if ((surface->flags & SURF_DRAWSKY) || !(xgl_detaildistance.value > 0)) continue;
         XGL_SurfaceBounds(cl.worldmodel, surface, cache);
@@ -1823,15 +2210,21 @@ static void XGL_SelectWorldDetail(void)
             /* Water in range always uses its finer grid, outside the wall
              * allowance: the ripple that needs it fades with distance, so
              * the change of grid at the range cannot be seen. */
-            XGL_TryBuildDetail(cl.worldmodel, surface, cache, 1);
+            XGL_TryBuildDetail(cl.worldmodel, surface, cache, 1, -1);
             if (cache->detail.vertices)
                 cache->detail_frame = cache->detail_used = r_framecount;
             continue;
         }
         if (!(xgl_detailtris.value > 0)) continue;
         cache->detail_want = XGL_DetailWant(cache->area, distance);
-        if (cache->detail_want < XGL_DETAIL_WANT_MIN) continue;
-        bucket += XGL_DetailBucket(cache->area / (distance + 64));
+        cache->shape_need = (short)XGL_SurfaceShapeStep(surface, distance);
+        if (cache->shape_need > 0) {
+            ++shaped;
+            bucket += XGL_DetailBucket(XGL_SHAPE_RANK_AREA / (distance + 64));
+        } else {
+            if (cache->detail_want < XGL_DETAIL_WANT_MIN) continue;
+            bucket += XGL_DetailBucket(cache->area / (distance + 64));
+        }
         cache->bucket = bucket;
         ++counts[bucket];
         xgl_detail_order[candidates++] = index;
@@ -1847,13 +2240,17 @@ static void XGL_SelectWorldDetail(void)
         index = xgl_detail_order[i];
         xgl_detail_sorted[counts[xgl_surfaces[index].bucket]++] = index;
     }
-    for (i = 0; i < candidates && xgl_detail_used < xgl_detailtris.value; ++i) {
+    most = xgl_detailtris.value;
+    if (shaped) most *= XGL_SHAPE_OVER;
+    for (i = 0; i < candidates && xgl_detail_used < most; ++i) {
         if ((i & 63) == 0) XGL_AudioUpdate();
         index = xgl_detail_sorted[i]; cache = xgl_surfaces + index;
+        allowance = cache->shape_need > 0 ? most : xgl_detailtris.value;
+        if (xgl_detail_used >= allowance) continue;
         XGL_TryBuildDetail(cl.worldmodel, cl.worldmodel->surfaces + index, cache,
-                           cache->detail_want);
+                           cache->detail_want, cache->shape_need);
         if (cache->detail.vertices &&
-            xgl_detail_used + cache->detail.count / 3 <= xgl_detailtris.value) {
+            xgl_detail_used + cache->detail.count / 3 <= allowance) {
             cache->detail_frame = cache->detail_used = r_framecount;
             xgl_detail_used += cache->detail.count / 3;
         }
@@ -1918,8 +2315,8 @@ static void XGL_DrawSurface (model_t *model, msurface_t *surface, entity_t *enti
     xgl_cached_vertex_t triangle_data[3];
     texture_t *texture;
     vec3_t a, b, c, center, forward, right, up, worldcenter, delta;
-    float distance, ds, dt, spacing;
-    int index, i, j, axis, lit, detail, special;
+    float distance, ds, dt, spacing, allowance;
+    int index, i, j, axis, lit, detail, special, step;
     texture = XGL_SurfaceTexture(surface->texinfo->texture, entity);
     if (!texture || !texture->width || !texture->height) return;
     special = (surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB)) != 0;
@@ -1938,7 +2335,7 @@ static void XGL_DrawSurface (model_t *model, msurface_t *surface, entity_t *enti
     if (cache) {
         if (!cache->coarse_attempted) {
             cache->coarse_attempted = 1;
-            XGL_BuildSurfaceMesh(model, surface, &cache->coarse, 0);
+            XGL_BuildSurfaceMesh(model, surface, &cache->coarse, 0, -1);
         }
         mesh = &cache->coarse;
         if (entity == &r_worldentity && xgl_world_order) {
@@ -1957,14 +2354,20 @@ static void XGL_DrawSurface (model_t *model, msurface_t *surface, entity_t *enti
             VectorSubtract(worldcenter, r_origin, delta);
             distance = DotProduct(delta, delta);
             detail = xgl_detaildistance.value > 0 && distance < xgl_detaildistance.value * xgl_detaildistance.value;
+            step = -1;
+            allowance = xgl_detailtris.value;
             if (detail) {
                 cache->detail_want = XGL_DetailWant(cache->area, distance);
-                if (cache->detail_want < XGL_DETAIL_WANT_MIN) detail = 0;
+                /* One cut along shapes is taken however small, as a wall's
+                 * faces are, and may run as far over the allowance. */
+                step = XGL_SurfaceShapeStep(surface, distance);
+                if (step > 0) allowance *= XGL_SHAPE_OVER;
+                else if (cache->detail_want < XGL_DETAIL_WANT_MIN) detail = 0;
             }
-            if (detail && xgl_detail_used < xgl_detailtris.value)
-                XGL_TryBuildDetail(model, surface, cache, cache->detail_want);
+            if (detail && xgl_detail_used < allowance)
+                XGL_TryBuildDetail(model, surface, cache, cache->detail_want, step);
             if (detail && cache->detail.vertices &&
-                xgl_detail_used + cache->detail.count / 3 <= xgl_detailtris.value) {
+                xgl_detail_used + cache->detail.count / 3 <= allowance) {
                 mesh = &cache->detail;
                 xgl_detail_used += mesh->count / 3;
             }
@@ -1973,6 +2376,10 @@ static void XGL_DrawSurface (model_t *model, msurface_t *surface, entity_t *enti
             cache->detail_used = r_framecount;
             XGL_ProfileCount(XGL_PROFILE_WORLD_DETAIL_SURFACES, 1);
             XGL_ProfileCount(XGL_PROFILE_WORLD_DETAIL_TRIANGLES, (unsigned long)(mesh->count / 3));
+            if (cache->shape_step > 0) {
+                XGL_ProfileCount(XGL_PROFILE_WORLD_SHAPE_SURFACES, 1);
+                XGL_ProfileCount(XGL_PROFILE_WORLD_SHAPE_TRIANGLES, (unsigned long)(mesh->count / 3));
+            }
         }
         if (mesh->vertices) {
             XGL_ProfileCount(XGL_PROFILE_WORLD_CACHED_SURFACES, 1);
@@ -2133,7 +2540,7 @@ void XGL_DrawWorld (void)
     msurface_t *surface;
     int i;
     double start;
-    if (XGL_BuildSettingsChanged()) XGL_WorldNewMap();
+    if (XGL_BuildSettingsChanged()) XGL_WorldSetup();
     xgl_detail_used = xgl_detail_built = 0;
     xgl_water_count = 0;
     xgl_world_count = 0;

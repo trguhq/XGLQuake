@@ -29,6 +29,7 @@ cvar_t r_dynamic = {"r_dynamic", "1", false, false, 0, NULL};
 cvar_t r_novis = {"r_novis", "0", false, false, 0, NULL};
 extern cvar_t xgl_subdivide, xgl_detailtris, xgl_detaildistance, xgl_detailbuild;
 extern cvar_t xgl_detailerror, xgl_detailface, xgl_detailedge, xgl_detaildensity;
+extern cvar_t xgl_shapes;
 void V_SetContentsColor(int contents);
 
 void R_InitTextures (void)
@@ -92,6 +93,7 @@ void R_Init (void)
     Cvar_RegisterVariable(&xgl_detailface);
     Cvar_RegisterVariable(&xgl_detailedge);
     Cvar_RegisterVariable(&xgl_detaildensity);
+    Cvar_RegisterVariable(&xgl_shapes);
     Cmd_AddCommand("timerefresh", XGL_TimeRefresh_f);
     Cmd_AddCommand("pointfile", R_ReadPointFile_f);
     XGL_TextureInit();

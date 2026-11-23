@@ -156,6 +156,99 @@ qboolean XGL_SampleTextureFiltered(int id, float s, float t,
 /* The mean color of a box of texels about footprint wide around (s, t),
  * all three in texels. Integer averaging of reduced images; no translation. */
 qboolean XGL_SampleTextureBox(int id, float s, float t, float footprint, byte rgb[3]);
+const byte *XGL_TextureTexels(int id, int *width, int *height);
+/* xgl_shapes.c: a wall texture divided into pieces of nearly one color, for
+ * walls drawn as those pieces. The division is a tree: node 0 is the whole
+ * repeat of the texture, and every node that is not a leaf has one straight
+ * cut and a child either side of it. Nodes are in the order their cuts were
+ * found, most telling first, so the first n - 1 cuts give n pieces. */
+#define XGL_SHAPE_PIECES 48
+#define XGL_SHAPE_AXIS 3      /* flags & this: 0 a cut at s = d, 1 at t = d, 2 tilted */
+#define XGL_SHAPE_PAIRED 4    /* this cut and child[1]'s take out a thin band: both or neither */
+#define XGL_SHAPE_SECOND 8    /* the other cut of such a pair */
+#define XGL_SHAPE_THIN_FAR 16 /* child[1] is the thinner of the two parts */
+typedef struct {
+    /* The cut a*s + b*t = d, in texels from the tree's origin and measured
+     * at texel centers. child[1] takes the side where a*s + b*t >= d.
+     * A leaf has child[0] < 0. */
+    float a, b, d;
+    /* gain: the squared color error the cut removes from one repeat of the
+     * texture, for each piece it adds. width: about how many texels across
+     * the thinner of its two parts is. */
+    float gain, width;
+    short child[2];
+    byte flags;
+} xgl_shape_node_t;
+/* The steps of detail a wall cut along such a division can have. */
+#define XGL_SHAPE_STEPS 24
+typedef struct {
+    int width, height;
+    /* The texel the repeat is taken to begin at, so that its border falls
+     * on an edge in the picture where there is one. */
+    int origin[2];
+    int count;
+    xgl_shape_node_t *nodes;
+    /* What each node's part of the texture is drawn in when it is a piece:
+     * three bytes for each node. */
+    byte *colors;
+    /* Not the division's own: what the code that cuts walls along it has
+     * worked out about its steps of detail, kept here to be found again.
+     * steps_key is zero when the division is made. */
+    int steps_key;
+    byte steps[XGL_SHAPE_STEPS];
+} xgl_shape_tree_t;
+/* The division that walls of a texture are cut along, worked out the first
+ * time it is asked for; NULL for a texture with no shapes worth following.
+ * Every frame of an animated texture has the same one: that of the frame
+ * with the most pieces. */
+xgl_shape_tree_t *XGL_TextureShapes(texture_t *texture);
+/* The color of each node of a division, three bytes for each, as a texture
+ * shows it: the texture the division was made from, or another of the same
+ * size laid over it, as the other frames of an animated texture are. NULL
+ * when the texture does not fit the division or there is no memory. */
+const byte *XGL_ShapeColors(const xgl_shape_tree_t *tree, texture_t *texture);
+/* Forget every division: the textures are about to change. */
+void XGL_ShapesClear(void);
+/* How many textures have been examined since the last clear, and how many
+ * of them have shapes. */
+void XGL_ShapesCount(int *examined, int *shaped);
+/* What a wall asks of a cut before it is made: that it be among the first
+ * found, `most` being the last node those can have made; that it gain at
+ * least `worth`; and that neither of its parts be narrower than `thin`
+ * texels. A piece whose cut fails only the last goes on as the wider part,
+ * the narrow one being too small to see. */
+typedef struct {
+    int most;
+    float worth, thin;
+} xgl_shape_terms_t;
+/* How many of a division's cuts such terms make. Terms that ask no more
+ * make every cut that terms asking more do. */
+int XGL_ShapeCuts(const xgl_shape_tree_t *tree, const xgl_shape_terms_t *terms);
+/* The most corners a face or a piece of one may have, and the most
+ * triangles the pieces of one face may come to. */
+#define XGL_SHAPE_CORNERS 96
+#define XGL_SHAPE_TRIANGLES 256
+/* Cut a face, given as the texture coordinates of its corners in order,
+ * into pieces along a division. Pieces longer than `longest` texels are
+ * halved. Returns the number of pieces; 0 when the face shows nothing that
+ * the terms cut; -1 when the pieces are too many for one face or come to
+ * more than XGL_SHAPE_TRIANGLES. */
+int XGL_ShapeCutFace(const xgl_shape_tree_t *tree, const xgl_shape_terms_t *terms,
+                     float (*st)[2], int count, float longest);
+/* One piece of the face cut last. Its corners, in texture coordinates,
+ * include those of its neighbors that lie along its sides. It is drawn as a
+ * fan of triangles from its first corner or, with `center`, from its
+ * middle around all its corners. `width` is about how many texels across
+ * it is. */
+typedef struct {
+    float corner[XGL_SHAPE_CORNERS][2];
+    float middle[2], width;
+    int count, center;
+    /* The node of the division it is: its color is that node's. */
+    int node;
+} xgl_shape_piece_t;
+/* Returns 0 when there is no such piece. */
+int XGL_ShapePiece(int index, xgl_shape_piece_t *piece);
 void XGL_TextureInit(void);
 void XGL_TextureShutdown(void);
 void XGL_MakeAliasModelDisplayLists(model_t *model, aliashdr_t *header);
