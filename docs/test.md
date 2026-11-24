@@ -31,7 +31,9 @@ not, bands, sloping edges, where a repeat begins, and the frames of an
 animated texture. A sign 32 texels square must be divided cut for cut as
 the same picture at twice the size is, and grain, a swell and a glow must
 have no shapes at any size. Of five like bars every step must show all or
-none. They cut faces along the result and check that the pieces
+none. A round lamp must have its four corners cut off at 45
+degrees, and a square lamp, a vein across grain and a lamp too dim to be
+sure of must have none. They cut faces along the result and check that the pieces
 cover the face exactly, have the texture's colors, and share every corner
 that lies along a side. The world tests then draw such walls: their colors
 and baked light, the steps of detail by distance, and the limits; a wall of

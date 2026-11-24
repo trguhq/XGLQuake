@@ -181,6 +181,17 @@ Each wall texture is examined once, while the map loads:
   across the tilted line along its whole length. A part with a tilted side
   is also tried with a cut parallel to that side, since an outline is often
   a thin line of its own color.
+- A round or chamfered shape, once upright and level cuts have boxed it
+  in, has corners of another color. Each corner of a part's box is tried
+  cut off at 45 degrees, 3 to 32 texels a leg, in place of the part's
+  upright cut: a round lamp becomes an octagon and not a square or a
+  staircase. Such a cut is made only where the color steps clearly across
+  it along its whole length and the corner it cuts off is of one color; the
+  corner of a square, or a vein across grain, is left alone.
+- Tilted cuts must not lose what plain ones had. If, with as many pieces as
+  the verdict below looks at, the division with tilts and corners describes
+  the texture worse than upright and level cuts alone, the plain division
+  is used.
 - A piece is drawn in the color of what mostly fills it: the mean of its
   texels without the darkest and the brightest fifth, so that a thin line or
   a few specks not yet cut out do not tint it.

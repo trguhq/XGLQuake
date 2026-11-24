@@ -477,6 +477,85 @@ static void test_steps_keep_like_details(void)
     XGL_ShapesClear();
 }
 
+/* A round lamp with a hard edge, on a dark ground with a strip below it. */
+static int lamp(int x, int y)
+{
+    int dx = 2 * x - 47, dy = 2 * y - 47; /* About (23.5, 23.5), radius 14. */
+    if (y >= 54 && y < 58) return 130;
+    return dx * dx + dy * dy < 28 * 28 ? 230 : 40;
+}
+/* The same, so dim that its edge is no clearer than grain is. */
+static int lamp_dim(int x, int y) { return lamp(x, y) == 230 ? 56 : lamp(x, y); }
+/* A square lamp in a corner of the repeat. */
+static int lamp_square(int x, int y) { return x >= 32 ? 120 : (x < 12 && y < 12 ? 230 : 40); }
+/* Coarse grain, in blocks, with a brighter vein across its corner at 45
+ * degrees, beside two plain panels. */
+static int vein(int x, int y)
+{
+    if (x >= 32) return 20;
+    if (y >= 32) return 235;
+    if (x + y >= 13 && x + y < 16) return 200;
+    return (((x >> 1) ^ (y >> 2)) & 1 ? 215 : 40);
+}
+
+static int corner_cuts(const xgl_shape_tree_t *tree)
+{
+    const xgl_shape_node_t *node;
+    int i, corners = 0;
+    for (i = 0; i < tree->count; ++i) {
+        node = &tree->nodes[i];
+        if (node->child[0] >= 0 && (node->flags & XGL_SHAPE_AXIS) == 2 && fabs(node->a) == 1 && fabs(node->b) == 1) ++corners;
+    }
+    return corners;
+}
+
+/* A round or chamfered shape has its corners cut off at 45 degrees, not
+ * stepped; a cut that does not lie along a clear edge all its length, or
+ * that cuts off no corner of one color, is not made. */
+static void test_corner_cuts(void)
+{
+    xgl_shape_tree_t *tree;
+    int i, tilted;
+    XGL_ShapesClear();
+    tree = XGL_TextureShapes(make(0, 64, 64, lamp));
+    assert(tree);
+    check_tree(tree);
+    /* Boxed in by upright and level cuts, then all four corners. */
+    assert(corner_cuts(tree) == 4);
+    for (i = tilted = 0; i < tree->count; ++i)
+        if (tree->nodes[i].child[0] >= 0 && (tree->nodes[i].flags & XGL_SHAPE_AXIS) == 2) ++tilted;
+    assert(tilted == 4);
+    /* The lamp, its middle and well into each side, is one bright piece; a
+     * texel in each corner of its box is of the ground. */
+    assert(near_value(tree->colors[3 * node_at(tree, 23, 23)], 230));
+    assert(node_at(tree, 23, 12) == node_at(tree, 23, 23) && node_at(tree, 23, 35) == node_at(tree, 23, 23));
+    assert(node_at(tree, 12, 23) == node_at(tree, 23, 23) && node_at(tree, 35, 23) == node_at(tree, 23, 23));
+    assert(near_value(tree->colors[3 * node_at(tree, 11, 11)], 40));
+    assert(near_value(tree->colors[3 * node_at(tree, 36, 11)], 40));
+    assert(near_value(tree->colors[3 * node_at(tree, 11, 36)], 40));
+    assert(near_value(tree->colors[3 * node_at(tree, 36, 36)], 40));
+    /* A cut across the corner of a square lamp would tell bright from dark
+     * better than any upright one, but only part of it lies along an edge. */
+    tree = XGL_TextureShapes(make(1, 64, 64, lamp_square));
+    assert(tree);
+    check_tree(tree);
+    assert(!corner_cuts(tree) && tree->count == 7);
+    assert(near_value(tree->colors[3 * node_at(tree, 0, 0)], 230) && near_value(tree->colors[3 * node_at(tree, 11, 11)], 230));
+    assert(near_value(tree->colors[3 * node_at(tree, 12, 5)], 40) && near_value(tree->colors[3 * node_at(tree, 5, 12)], 40));
+    /* The vein is a clear edge all along, but what lies beyond it is grain
+     * like the rest: no corner of one color. */
+    tree = XGL_TextureShapes(make(2, 64, 64, vein));
+    assert(tree);
+    check_tree(tree);
+    assert(!corner_cuts(tree));
+    /* Too faint an edge to be sure of. */
+    tree = XGL_TextureShapes(make(3, 64, 64, lamp_dim));
+    assert(tree);
+    check_tree(tree);
+    assert(!corner_cuts(tree));
+    XGL_ShapesClear();
+}
+
 static float piece_area(const xgl_shape_piece_t *piece)
 {
     float sum = 0;
@@ -681,6 +760,7 @@ int main(void)
     test_animated_frames();
     test_small_textures();
     test_steps_keep_like_details();
+    test_corner_cuts();
     test_cut_faces();
     puts("XGL texture shape contracts passed");
     return 0;
