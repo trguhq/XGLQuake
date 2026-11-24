@@ -364,12 +364,22 @@ vertices and the middles of the edges between them.
   of the shareware episode the points are 35% of the vertices the commands
   name, and 45% of those named after one subdivision.
 - Light is worked out for the same points. A vertex has the light of its
-  normal in that pose, worked out once for each normal the pose uses; the
-  162 model normals are kept ready for each model scale. The middle of an
+  normal in that pose, worked out once for each normal the pose uses. The
+  model's normals are used as they are stored: they are those of its true
+  shape, and are not adjusted for the scale its vertices are stored at,
+  which bent them badly on the unevenly scaled view weapons. The middle of an
   edge has the mean of its two ends' light. Light therefore runs evenly
   along every edge of the model's own triangles, as it does on a model that
   is not subdivided: subdivision adds detail from the skin and does not
   round the shading.
+- Some models have a face made twice over, once for each side: two
+  triangles on the same three vertices, wound opposite ways and colored
+  from different places on the skin. The nailgun has six such pairs, as
+  view weapon and as item, and five monsters one each. Quake hides the side
+  turned away; the device here hides nothing, and the two sides fought for
+  the same depth. Such pairs are found when a model's mesh is made, and each
+  frame only the side facing the viewer is drawn. A model that has any goes
+  out as separate triangles, not strips.
 - Under native illumination (`xgl_alias_shade 0`) the device needs a normal
   for every point instead. A middle then has the mean of its ends' normals
   brought back to unit length, which is a square root for each middle every

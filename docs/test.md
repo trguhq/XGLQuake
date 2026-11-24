@@ -25,7 +25,9 @@ records of which vertices are one point: on the skin, and in space.
 The entity tests require a model drawn from its kept mesh to match the
 same model drawn by direct recursion, check that each vertex of a model and
 each middle of an edge is placed once, that light at a middle is the mean
-of its ends', and that nothing is kept for a pose.
+of its ends', that nothing is kept for a pose, that a model's normals are
+not bent by its scale, and that of a face made once for each side only the
+side facing the viewer is drawn.
 The shape tests examine made-up textures: which have shapes and which do
 not, bands, sloping edges, where a repeat begins, and the frames of an
 animated texture. A sign 32 texels square must be divided cut for cut as

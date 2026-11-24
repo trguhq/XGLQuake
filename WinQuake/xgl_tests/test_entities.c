@@ -1043,9 +1043,25 @@ static void test_alias_cached_mesh_equivalence(void)
             XGL_DrawAlias(entity); /* cold sampled-color fallback */
             count = captured_count;
             assert(count == 12 * (1 << (2 * depth)));
+            {
+                /* A model's normals are those of its true shape: they are
+                 * turned with the model and not bent by its scale. */
+                vec3_t angles, forward, right, up, want;
+                int found = 0, k;
+                VectorCopy(entity->angles, angles);
+                angles[PITCH] = -angles[PITCH];
+                AngleVectors(angles, forward, right, up);
+                for (k = 0; k < 3; ++k)
+                    want[k] = forward[k] * r_avertexnormals[31][0] - right[k] * r_avertexnormals[31][1] +
+                              up[k] * r_avertexnormals[31][2];
+                for (i = 0; i < count; ++i)
+                    if (fabs(captured[i].normal[0] - want[0]) < 1e-4 && fabs(captured[i].normal[1] - want[1]) < 1e-4 &&
+                        fabs(captured[i].normal[2] - want[2]) < 1e-4) found = 1;
+                assert(found);
+            }
             memcpy(expected, captured, (size_t)count * sizeof(*expected));
             captured_count = 0; xgl_entity_extra_used = 0;
-            XGL_DrawAlias(entity); /* build the topology and the normals for this scale */
+            XGL_DrawAlias(entity); /* build the topology */
             compare_capture(expected, count);
             topology = only_topology();
             assert(topology && profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_MISSES] == 1);
@@ -1059,8 +1075,8 @@ static void test_alias_cached_mesh_equivalence(void)
             XGL_DrawAlias(entity);
             compare_capture(expected, count);
             /* Nothing of a pose is kept. The device is given unit normals,
-             * so each middle's is brought to length; the model's own come
-             * from the table made for its scale. */
+             * so each middle's is brought to length; the model's own are
+             * unit normals as they stand. */
             assert(normalizations == middles);
             assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_HITS] == 1);
             assert(profile_counts[XGL_PROFILE_ALIAS_POINTS] == 2 * (unsigned long)topology->point_count);
@@ -1084,12 +1100,8 @@ static void test_alias_cached_mesh_equivalence(void)
             compare_capture(expected, count);
             material_revision = 1;
 
-            /* Another scale has other normals, made once; zero scale keeps
-             * the fallback's unscaled-normal convention. */
+            /* Another scale has the same normals: nothing is worked out. */
             header->scale[0] = 0; pose[1].lightnormalindex = 4;
-            captured_count = 0; normalizations = 0; xgl_entity_extra_used = 0;
-            XGL_DrawAlias(entity);
-            assert(normalizations == XGL_VERTEX_NORMALS + middles);
             captured_count = 0; normalizations = 0; xgl_entity_extra_used = 0;
             XGL_DrawAlias(entity);
             assert(normalizations == middles);
@@ -1190,6 +1202,61 @@ static aliashdr_t *make_seam(void)
     alias_model.cache.data = header;
     cl_entities[1].model = &alias_model;
     return header;
+}
+
+/* A face made twice over, once for each side, is drawn once: the side that
+ * faces the viewer, whichever side that is. */
+static void test_alias_two_sided_face(void)
+{
+    aliashdr_t *header;
+    xgl_alias_identity_t *identity;
+    xgl_alias_topology_t *topology;
+    trivertx_t *pose;
+    vec3_t ab, ac, normal, eye;
+    float first[3];
+    int *commands, *same;
+    int i, depth, side, count;
+    for (depth = 0; depth <= 1; ++depth) {
+        reset_test();
+        header = make_seam();
+        /* The second triangle is on the first's vertices, the other way round. */
+        pose = (trivertx_t *)((byte *)header + header->posedata);
+        commands = (int *)((byte *)header + header->commands);
+        same = commands + 15 + 6;
+        for (i = 0; i < 3; ++i) { pose[3 + i] = pose[2 - i]; same[3 + i] = 2 - i; }
+        identity = (xgl_alias_identity_t *)((byte *)header + sizeof(*header));
+        identity->hash = XGL_AliasCommandHash(commands, identity->words);
+        assert(XGL_AliasIdentity(header) == identity);
+        xgl_alias_subdivide.value = (float)depth;
+        count = 3 * (1 << (2 * depth));
+        cl_entities[1].origin[0] = cl_entities[1].origin[1] = cl_entities[1].origin[2] = 0;
+        r_origin[0] = 20; r_origin[1] = -10; r_origin[2] = 300;
+        XGL_DrawAlias(&cl_entities[1]); /* by recursion, which knows no pairs */
+        assert(captured_count == 2 * count);
+        first[0] = first[1] = first[2] = 0;
+        for (side = 0; side < 4; ++side) {
+            r_origin[2] = side & 1 ? -300 : 300;
+            captured_count = 0; xgl_entity_extra_used = 0;
+            XGL_DrawAlias(&cl_entities[1]);
+            topology = only_topology();
+            assert(topology && topology->twins && topology->twin_pairs == count / 3);
+            assert(captured_count == count);
+            /* Clockwise as the viewer sees it, every triangle. */
+            for (i = 0; i < count; i += 3) {
+                VectorSubtract(captured[i + 1].position, captured[i].position, ab);
+                VectorSubtract(captured[i + 2].position, captured[i].position, ac);
+                CrossProduct(ab, ac, normal);
+                VectorSubtract(r_origin, captured[i].position, eye);
+                assert(DotProduct(normal, eye) < 0);
+            }
+            /* And the two sides are colored from different places on the skin. */
+            if (side == 0) { VectorCopy(captured[0].color, first); }
+            else if (side & 1) assert(fabs(captured[0].color[0] - first[0]) + fabs(captured[0].color[1] - first[1]) +
+                                      fabs(captured[0].color[2] - first[2]) > 1e-3);
+        }
+        XGL_EntitiesShutdown();
+    }
+    r_origin[0] = r_origin[1] = r_origin[2] = 0;
 }
 
 /* Where the normals of an edge's two ends cancel, its middle takes the
@@ -2187,6 +2254,7 @@ int main(void)
     test_alias_cached_mesh_equivalence();
     test_alias_pose_canceling_normals();
     test_alias_seam_canceling_normals();
+    test_alias_two_sided_face();
     test_alias_mesh_batching_and_limits();
     test_alias_mesh_allocation_failure();
     test_alias_cpu_shading();

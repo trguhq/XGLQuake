@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include "../xgl_entities.c"
 
+vec3_t r_origin;
+
 #define TEST_TRIANGLES 256
 #define TEST_VERTICES (TEST_TRIANGLES * 3)
 #define RESERVE_VERTICES 9
