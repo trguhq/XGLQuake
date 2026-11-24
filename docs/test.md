@@ -50,7 +50,10 @@ first be cut, and beyond the range of detail, then plain at once with its
 cut mesh kept for when it is wanted again; and load a map again to see
 that nothing is examined twice.
 The screen tests cover when an unchanged status bar is left in place, and
-the UI tests that every picture name draws what it did before.
+the UI tests that every picture name draws what it did before with
+`xgl_hudpieces` off, and that with it on a picture is drawn from its pixels:
+rectangles covering just what is not transparent, in the colors of what
+they cover.
 Run from `WinQuake/`:
 
 ```sh

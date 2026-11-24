@@ -45,6 +45,13 @@ enum {
 #define UI_FACE_INVULNERABLE 8
 #define UI_FACE_INVISIBLE 9
 
+/* One rectangle of a picture drawn from its own pixels, in the mean color
+ * of the pixels it covers. */
+typedef struct {
+    short x, y, w, h;
+    float rgb[3];
+} xgl_draw_piece;
+
 typedef struct {
     qpic_t pic;
     char source[MAX_QPATH];
@@ -52,7 +59,21 @@ typedef struct {
     int wad;
     int kind, color, detail;
     char label[MAX_QPATH];
+    /* The picture as rectangles, once it has been divided for the setting
+     * pieces_for; none when it could not be, and the stand-in serves. */
+    xgl_draw_piece *pieces;
+    int piece_count, pieces_for;
 } xgl_draw_pic;
+
+/* The status bar's pictures are drawn from their own pixels, each divided
+ * once into rectangles of one color: whatever the game calls them and
+ * whatever they show. The setting is how many rectangles a picture's
+ * colors may have; its outline, where it has transparent pixels, is
+ * followed besides, up to XGL_DRAW_PIECES in all. 0 draws the stand-ins. */
+static cvar_t xgl_hudpieces = {"xgl_hudpieces", "16", true, false, 0, NULL};
+#define XGL_DRAW_PIECES 64
+#define XGL_DRAW_PIXELS 8192
+#define XGL_DRAW_TRANSPARENT 255
 
 static xgl_draw_pic ui_pics[XGL_DRAW_PICS];
 static int ui_num_pics;
@@ -150,6 +171,152 @@ static void ui_number_digit(float x, float y, float w, float h, char digit, int 
     }
     ui_number[ui_number_length++] = digit;
     ui_number_w += w;
+}
+
+/* A picture's pixels summed from its top left corner, so that the sums over
+ * any rectangle take four lookups: red, green, blue, the squares of all
+ * three, and how many pixels are not transparent. */
+static unsigned int *ui_sums;
+static int ui_sums_width;
+
+static void ui_box_sums(int x0, int y0, int x1, int y1, double *sum)
+{
+    const unsigned int *a, *b, *c, *d;
+    int i, stride;
+    stride = (ui_sums_width + 1) * 5;
+    a = ui_sums + y1 * stride + x1 * 5; b = ui_sums + y0 * stride + x1 * 5;
+    c = ui_sums + y1 * stride + x0 * 5; d = ui_sums + y0 * stride + x0 * 5;
+    for (i = 0; i < 5; ++i) sum[i] = (double)(a[i] - b[i] - c[i] + d[i]);
+}
+
+/* How badly one color, and one answer to "is anything here", describes a
+ * rectangle: the spread of its opaque pixels' colors, and a pixel's worth
+ * of the largest spread there is for each one on the wrong side of that
+ * answer, so that an outline is followed before any shading is. */
+static double ui_box_error(int x0, int y0, int x1, int y1, double *sum)
+{
+    double error, n, clear;
+    ui_box_sums(x0, y0, x1, y1, sum);
+    n = sum[4];
+    clear = (double)(x1 - x0) * (y1 - y0) - n;
+    error = n > 0 ? sum[3] - (sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]) / n : 0;
+    if (error < 0) error = 0;
+    return error + 3.0 * 255 * 255 * n * clear / (n + clear);
+}
+
+typedef struct {
+    short x0, y0, x1, y1;
+    /* What its best cut gains, where that is, and whether it goes across. */
+    double gain;
+    short cut, across;
+    int mixed;
+} xgl_draw_part;
+
+static void ui_part_best(xgl_draw_part *part)
+{
+    double sum[5], whole, gain;
+    int i;
+    whole = ui_box_error(part->x0, part->y0, part->x1, part->y1, sum);
+    part->mixed = sum[4] > 0 && sum[4] < (double)(part->x1 - part->x0) * (part->y1 - part->y0);
+    part->gain = 0; part->cut = 0; part->across = 0;
+    for (i = part->x0 + 1; i < part->x1; ++i) {
+        gain = whole - ui_box_error(part->x0, part->y0, i, part->y1, sum) -
+               ui_box_error(i, part->y0, part->x1, part->y1, sum);
+        if (gain > part->gain) { part->gain = gain; part->cut = (short)i; part->across = 0; }
+    }
+    for (i = part->y0 + 1; i < part->y1; ++i) {
+        gain = whole - ui_box_error(part->x0, part->y0, part->x1, i, sum) -
+               ui_box_error(part->x0, i, part->x1, part->y1, sum);
+        if (gain > part->gain) { part->gain = gain; part->cut = (short)i; part->across = 1; }
+    }
+}
+
+/* Divide a picture into rectangles of one color each, most telling cut
+ * first. While any rectangle is part picture and part nothing, such a one
+ * is cut, up to XGL_DRAW_PIECES rectangles; after that the colors are told
+ * apart until `budget` rectangles show. Those with nothing in them are not
+ * kept, and one still mixed at the end is kept if most of it is picture. */
+static void ui_divide(xgl_draw_pic *asset, const byte *pixels, int budget)
+{
+    static xgl_draw_part parts[XGL_DRAW_PIECES];
+    xgl_draw_part *part, *other;
+    xgl_draw_piece *piece;
+    unsigned int *row, *above;
+    const byte *color;
+    double sum[5];
+    int width, height, x, y, i, count, shown, best, mixed, stride;
+    width = asset->pic.width; height = asset->pic.height;
+    if (width * height > XGL_DRAW_PIXELS) return;
+    stride = (width + 1) * 5;
+    ui_sums = (unsigned int *)calloc((size_t)(height + 1) * stride, sizeof(*ui_sums));
+    if (!ui_sums) return;
+    ui_sums_width = width;
+    for (y = 0; y < height; ++y) {
+        above = ui_sums + y * stride; row = above + stride;
+        for (x = 0; x < width; ++x, row += 5, above += 5) {
+            for (i = 0; i < 5; ++i) row[5 + i] = row[i] + above[5 + i] - above[i];
+            if (pixels[y * width + x] == XGL_DRAW_TRANSPARENT) continue;
+            color = xgl_palette + 3 * pixels[y * width + x];
+            row[5] += color[0]; row[6] += color[1]; row[7] += color[2];
+            row[8] += (unsigned int)(color[0] * color[0] + color[1] * color[1] + color[2] * color[2]);
+            row[9] += 1;
+        }
+    }
+    parts[0].x0 = parts[0].y0 = 0; parts[0].x1 = (short)width; parts[0].y1 = (short)height;
+    ui_part_best(&parts[0]);
+    count = 1;
+    while (count < XGL_DRAW_PIECES) {
+        best = -1; mixed = shown = 0;
+        for (i = 0; i < count; ++i) {
+            ui_box_sums(parts[i].x0, parts[i].y0, parts[i].x1, parts[i].y1, sum);
+            if (sum[4] > 0) ++shown;
+            if (parts[i].mixed) mixed = 1;
+        }
+        for (i = 0; i < count; ++i) {
+            if (!(parts[i].gain > 0) || (mixed && !parts[i].mixed)) continue;
+            if (best < 0 || parts[i].gain > parts[best].gain) best = i;
+        }
+        if (best < 0 || (!mixed && shown >= budget)) break;
+        part = &parts[best]; other = &parts[count++];
+        *other = *part;
+        if (part->across) part->y1 = other->y0 = part->cut;
+        else part->x1 = other->x0 = part->cut;
+        ui_part_best(part); ui_part_best(other);
+    }
+    asset->pieces = (xgl_draw_piece *)malloc((size_t)count * sizeof(*asset->pieces));
+    for (i = 0; asset->pieces && i < count; ++i) {
+        part = &parts[i];
+        ui_box_sums(part->x0, part->y0, part->x1, part->y1, sum);
+        if (!(sum[4] > 0) || 2 * sum[4] < (double)(part->x1 - part->x0) * (part->y1 - part->y0)) continue;
+        piece = &asset->pieces[asset->piece_count++];
+        piece->x = part->x0; piece->y = part->y0;
+        piece->w = (short)(part->x1 - part->x0); piece->h = (short)(part->y1 - part->y0);
+        piece->rgb[0] = (float)(sum[0] / (sum[4] * 255)); piece->rgb[1] = (float)(sum[1] / (sum[4] * 255));
+        piece->rgb[2] = (float)(sum[2] / (sum[4] * 255));
+    }
+    free(ui_sums);
+    ui_sums = NULL;
+}
+
+/* The rectangles a picture is drawn as, or 0 for its stand-in to be drawn:
+ * with the setting off, for a picture that is not one of the status bar's
+ * and the like, or for one too large or with nothing to show. */
+static int ui_pieces(xgl_draw_pic *asset)
+{
+    qpic_t *original;
+    int budget;
+    budget = (int)xgl_hudpieces.value;
+    if (budget > XGL_DRAW_PIECES) budget = XGL_DRAW_PIECES;
+    if (budget < 1 || !asset->wad) return 0;
+    if (asset->pieces_for != budget) {
+        free(asset->pieces);
+        asset->pieces = NULL; asset->piece_count = 0;
+        asset->pieces_for = budget;
+        original = (qpic_t *)W_GetLumpName(asset->source);
+        if (original && original->width == asset->pic.width && original->height == asset->pic.height)
+            ui_divide(asset, original->data, budget);
+    }
+    return asset->piece_count;
 }
 
 /* Handles are the descriptors themselves. */
@@ -377,9 +544,12 @@ qpic_t *Draw_CachePic(char *path)
 
 void Draw_Init(void)
 {
+    int i;
     ui_run_length = 0;
     ui_disc_active = 0;
+    for (i = 0; i < ui_num_pics; ++i) free(ui_pics[i].pieces);
     ui_num_pics = 0;
+    Cvar_RegisterVariable(&xgl_hudpieces);
     /* The lump remains engine-owned. It is never read by our drawing path. */
     draw_chars = (byte *)W_GetLumpName("conchars");
     draw_disc = Draw_PicFromWad("disc");
@@ -512,6 +682,17 @@ static void ui_picture(int ix, int iy, qpic_t *pic, byte *translation)
     ui_flush_text();
     x = (float)ix; y = (float)iy; w = (float)pic->width; h = (float)pic->height;
     asset = ui_find_pic(pic);
+    if (asset && ui_pieces(asset)) {
+        /* Drawn at the size asked for, which is the picture's own unless
+         * the caller has changed it. */
+        ui_flush_number();
+        for (i = 0; i < asset->piece_count; ++i)
+            XGL_UIFillRGB(x + asset->pieces[i].x * w / asset->pic.width,
+                          y + asset->pieces[i].y * h / asset->pic.height,
+                          asset->pieces[i].w * w / asset->pic.width,
+                          asset->pieces[i].h * h / asset->pic.height, asset->pieces[i].rgb, 1);
+        return;
+    }
     color = asset ? asset->color : UI_WHITE;
     switch (asset ? asset->kind : UI_PIC_OTHER) {
     case UI_PIC_MAIN_MENU: ui_menu_rows(x,y,w,main_rows,5); return;

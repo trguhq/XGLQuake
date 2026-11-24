@@ -6,9 +6,10 @@ smooth-shaded triangles; the
 renderer does not upload textures or draw UI image rasters. BSP/PVS
 visibility, brush/model transforms, animation and game collision use the
 existing engine structures and rules. Sky and water use animated sampled
-geometry. Menu, HUD, console and image-based labels use native stroke text
+geometry. Menu, console and image-based labels use native stroke text
 and geometric replacements, so their appearance differs from the original
-pixel artwork; unknown pictures receive a labelled fallback.
+pixel artwork; unknown pictures receive a labelled fallback. The status
+bar's pictures are drawn from their own pixels, as rectangles of color.
 
 Texture detail and sprite cutouts are geometric approximations. The XGL
 renderer does not implement the OpenGL renderer's optional mirrors, projected
@@ -480,6 +481,28 @@ Each picture Quake draws is told apart by its name once, when first asked
 for, and found by its handle after that. A box with an edge is two
 rectangles, the edge color under the fill, not a fill and four strips.
 
+### Status bar pictures
+
+The pictures of the status bar, and the other small pictures the game keeps
+with them (in Quake, those of `gfx.wad`), are drawn from their own pixels.
+Each is divided once, when first drawn, into rectangles of one color: the
+most telling upright or level cut first, then the next. Where a picture has
+transparent pixels its outline is followed first, up to 64 rectangles, so a
+digit has exactly its own shape; after that its colors are told apart until
+`xgl_hudpieces` rectangles show. Each rectangle has the mean color of the
+pixels it covers. Nothing depends on what a picture is called or shows, so
+another game's status bar is drawn from its own art in the same way.
+
+With the shareware pictures a digit takes 8 to 35 rectangles, and at the
+default of 16 a face, a weapon or an ammunition box 16 each, as does either
+bar: recognisable, not detailed. A full bar comes to some 400 to 500
+rectangles, sent in the polygon calls the bar already made, where it had
+about 40 and a dozen pieces of text. Their cost has not been timed on the
+Sun ZX. In a small window the bar is drawn only when it changes; in a large
+one it is drawn every frame, and a lower setting then saves time. 0 draws
+the earlier stand-ins, which the menus and the larger pictures still use:
+those are told apart by name.
+
 ### Status bar
 
 Quake's status bar code already knows when the bar has changed and draws it
@@ -528,6 +551,7 @@ kept at all; a line on the terminal says so.
 | `xgl_lightfalloff` | 2 | How fast a dynamic light fades with distance, clamped to 1–64; 1 is the slowest and brightest. |
 | `xgl_lightrange` | 4 | Distance, in light radii, beyond which geometry is not illuminated by a dynamic light; 0 removes the limit. |
 | `xgl_alias_shade` | 1 | Shade models on the CPU and submit them unlit; 0 uses native illumination. |
+| `xgl_hudpieces` | 16 | Rectangles of color a status-bar picture is drawn in, besides those its outline takes; 0 draws labelled stand-ins instead. |
 | `xgl_keepbar` | -1 | Leave an unchanged status bar in place instead of clearing and redrawing it: -1 in small windows only, 0 never, 1 whenever possible. |
 | `xgl_smp` | -1 | Worker thread for model preparation: -1 automatic, 0 off, 1 on. |
 | `xgl_profile` | 0 | 1 reports graphics timings and native call counts; 2 adds preparation and cache detail. Output goes to the terminal once per second. |
