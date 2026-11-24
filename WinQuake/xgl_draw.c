@@ -7,6 +7,7 @@
  * picture pixels or character atlas are submitted to XGL.
  */
 #include "quakedef.h"
+#include "xgl_version.h"
 #include "xgl_render.h"
 
 #define XGL_DRAW_PICS 512
@@ -608,7 +609,7 @@ void Draw_ConsoleBackground(int lines)
     if (lines > (int)vid.height) lines = (int)vid.height;
     ui_fill(0,0,(float)vid.width,(float)lines,UI_DARK,1);
     ui_fill(0,(float)lines-2,(float)vid.width,2,UI_EDGE,1);
-    sprintf(version,"XGLQuake %4.2f",(double)VERSION);
+    sprintf(version,"%4.2f (XGLQuake " XGL_VERSION ")",(double)VERSION);
     if (lines >= 12)
         ui_text((float)vid.width-8-6*(float)strlen(version), (float)lines-12,
                 version,UI_GOLD,6,8);

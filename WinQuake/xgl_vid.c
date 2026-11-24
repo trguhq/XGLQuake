@@ -21,6 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 /* XGL window and input driver. Based on the Solaris X11 input conventions;
  * the software framebuffer and OpenGL drivers remain separate targets. */
 #include "quakedef.h"
+#include "xgl_version.h"
 #include "xgl_render.h"
 #include "xgl_backend.h"
 #include "xgl_smp.h"
@@ -402,7 +403,7 @@ void VID_Init(unsigned char *palette)
     vid_menukeyfn = XGL_VideoMenuKey;
     VID_SetPalette(palette);
     XGLB_Init(xgl_display, xgl_window, xgl_width, xgl_height);
-    Con_Printf("XGLQuake: %dx%d TrueColor window; native text/geometry UI\n", xgl_width, xgl_height);
+    Con_Printf("XGLQuake " XGL_VERSION ": %dx%d TrueColor window; native text/geometry UI\n", xgl_width, xgl_height);
 }
 
 void VID_Shutdown(void)
