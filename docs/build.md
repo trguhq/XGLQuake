@@ -49,3 +49,12 @@ When updating from a build without `-ffast-math`, run
 `make -f Makefile.XGL clean` once before rebuilding so every object uses the
 new flags. Host regression tests also enable `-ffast-math` by default.
 
+
+### Version
+
+XGLQuake has its own version in `WinQuake/xgl_version.h`, starting at
+0.1.0. The console shows it after the WinQuake version, as
+`1.09 (XGLQuake 0.1.0)`, and the startup line that reports the window
+carries it too. The last part goes up by one before every push to the
+repository; after 99 it returns to 0 and the middle part goes up, so 0.1.99
+is followed by 0.2.0.
