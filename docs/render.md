@@ -226,12 +226,18 @@ are made depends on a step of detail that follows the distance:
   steps, where the count alone did at 215, for about the same triangles.
 - A wall is cut alike all over. Faces in one plane, facing one way, with
   one texture laid one way, that are joined by their edges are one wall,
-  found when the map loads. Each face asks for the step of its own
-  distance, and every face of the wall in view is cut at the finest step
-  any of them asks for, so that the pattern runs unbroken across them. Left
-  to their own distances, more than half of the neighbouring faces of such
-  walls were cut differently. The far end of a long wall is in consequence
-  cut finer than its distance alone would have it.
+  found when the map loads. The whole wall is cut at the step its nearest
+  face asks for, so that the pattern runs unbroken across it. Left to their
+  own distances, more than half of the neighbouring faces of such walls
+  were cut differently. The far end of a long wall is in consequence cut
+  finer than its distance alone would have it.
+- The nearest face is the nearest from where the viewer stands, in view or
+  not. Turning the head, which takes the near end of a wall out of view and
+  brings it back, therefore changes nothing: only walking does. Counting
+  only the faces in view, the rest of a wall went coarser or plain when its
+  near end left the view, and was built finer again when it came back. In
+  replays of walks through `e1m1`, `e1m5` and `start` this costs 2 to 4%
+  more wall triangles and builds up to a fifth fewer meshes.
 - A repeat of a small texture gets the pieces that one of 64 texels square
   would. By its own texels a sign 32 texels square would have fewer than
   two pieces from 200 units and stay plain; it is cut out to about 385, as
@@ -251,10 +257,12 @@ are made depends on a step of detail that follows the distance:
   other mesh in the frame. A wall that is plain where it should be cut
   shows more than one a step too coarse, and walking into a room of such
   walls a third of them used to wait their turn, plain, for some frames.
-- A face that is cut stays cut until it is about 1.4 times as far off as
-  where it would first be cut, and stays in range of detail as far beyond
-  `xgl_detaildistance`. Stepping back and forth across either distance
-  then changes nothing.
+- A wall that is cut stays cut until its nearest face is about 1.4 times
+  as far off as where it would first be cut, and a cut face stays in range
+  of detail as far beyond `xgl_detaildistance`. Stepping back and forth
+  across either distance then changes nothing. Beyond that the wall goes
+  plain all at once; the cut meshes it had wait in the cache, and serve
+  again if it is cut again before their memory is wanted.
 - One face has at most 256 triangles. A large face of a busy texture is cut
   at the finest step that fits; that is found out the first time and
   remembered.

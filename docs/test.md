@@ -38,10 +38,13 @@ and baked light, the steps of detail by distance, and the limits; a wall of
 a small texture cut from as far as one of the same picture at full size; a
 face too small to be allowed any ordinary triangle cut like the rest of its
 wall; faces joined into walls and a wall cut at one step all over, made
-coarser all together; a face with no cut mesh built before any other; a
-cut face kept cut a margin beyond where it would first be cut, and beyond
-the range of detail; and load a map again to see that nothing is examined
-twice.
+coarser all together; a wall cut by its nearest face whether the view
+reaches that face or not, so that turning toward it builds that face and
+changes no other; a face with no cut mesh built before any other; a cut
+wall, and a box drawn as an entity, kept cut a margin beyond where it would
+first be cut, and beyond the range of detail, then plain at once with its
+cut mesh kept for when it is wanted again; and load a map again to see
+that nothing is examined twice.
 The screen tests cover when an unchanged status bar is left in place, and
 the UI tests that every picture name draws what it did before.
 Run from `WinQuake/`:
