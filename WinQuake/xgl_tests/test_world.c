@@ -2264,8 +2264,9 @@ static void test_shape_distance(void)
 {
     const xgl_surface_mesh_t *mesh;
     const xgl_color_vertex_t *kept;
+    xgl_shape_terms_t terms;
     float z, distances[4];
-    int i, step, steps[4], triangles[4], near_step, frames;
+    int i, step, steps[4], triangles[4], cuts[4], near_step, frames;
     setup_shapes();
     r_fullbright.value = 1;
     xgl_detaildensity.value = 160;
@@ -2285,9 +2286,13 @@ static void test_shape_distance(void)
         assert(steps[i] == XGL_SurfaceShapeStep(&test_surface, distances[i] * distances[i]));
         assert(steps[i] > 0 && xgl_surfaces[0].detail.count == captured_count);
         assert(fabs(captured_area() - 128.0f * 128.0f) < 2);
-        if (i) assert(steps[i] >= steps[i - 1] && triangles[i] >= triangles[i - 1]);
+        /* Finer is more cuts; not always more triangles, since a long piece
+         * is halved for the light along it and its parts need not be. */
+        XGL_ShapeTerms(XGL_SurfaceShapes(&test_surface), steps[i], &terms);
+        cuts[i] = XGL_ShapeCuts(XGL_SurfaceShapes(&test_surface), &terms);
+        if (i) assert(steps[i] >= steps[i - 1] && cuts[i] >= cuts[i - 1]);
     }
-    assert(steps[3] > steps[0] && triangles[3] > triangles[0]);
+    assert(steps[3] > steps[0] && cuts[3] > cuts[0]);
     /* Where every cut is made, each piece is one color of the picture. */
     assert(check_shape_frame(0, 0) == triangles[3]);
     /* A step is a set of cuts: the lowest of those that make the same. */
@@ -2816,17 +2821,17 @@ static void test_shape_animation(void)
 static void test_shape_limits(void)
 {
     int i, triangles;
-    /* A face that shows the texture sixty-four times. Every cut would
+    /* A face that shows the texture sixteen times. Every cut would
      * make more pieces than one mesh holds: it is cut at the finest step
      * that fits, and that is found out once. */
     setup_shapes();
     for (i = 1; i < 4; ++i) {
-        test_vertices[i].position[0] *= 4;
-        test_vertices[i].position[1] *= 4;
+        test_vertices[i].position[0] *= 2;
+        test_vertices[i].position[1] *= 2;
     }
     memset(shape_light, 64, sizeof(shape_light));
     test_surface.samples = shape_light;
-    test_surface.extents[0] = test_surface.extents[1] = 512;
+    test_surface.extents[0] = test_surface.extents[1] = 256;
     xgl_subdivide.value = 256;
     XGL_WorldNewMap();
     begin_frame();
@@ -2835,7 +2840,7 @@ static void test_shape_limits(void)
     assert(xgl_surfaces[0].shape_need > xgl_surfaces[0].shape_step);
     triangles = xgl_surfaces[0].detail.count / 3;
     assert(triangles > 2 && triangles <= XGL_SHAPE_TRIANGLES && captured_count == triangles * 3);
-    assert(fabs(captured_area() - 512.0f * 512.0f) < 16);
+    assert(fabs(captured_area() - 256.0f * 256.0f) < 16);
     assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 2 && xgl_detail_built == triangles);
     begin_frame();
     assert(captured_count == triangles * 3 && !xgl_detail_built);

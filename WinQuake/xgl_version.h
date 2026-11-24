@@ -6,6 +6,6 @@
 #ifndef XGL_VERSION_H
 #define XGL_VERSION_H
 
-#define XGL_VERSION "0.1.3"
+#define XGL_VERSION "0.1.4"
 
 #endif

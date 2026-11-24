@@ -403,6 +403,80 @@ static void test_small_textures(void)
     XGL_ShapesClear();
 }
 
+/* A light of five like bars on a dark ground, and a strip of another tone
+ * below them. */
+static int bars(int x, int y)
+{
+    if (y >= 50 && y < 54) return 120;
+    if (y >= 8 && y < 40 && x >= 4 && x < 56 && (x - 4) % 12 < 4) return 220;
+    return 40;
+}
+
+/* The node whose piece holds a texel when the cuts made are the first so
+ * many: those whose children are nodes up to `most`. */
+static int node_under(const xgl_shape_tree_t *tree, int most, int x, int y)
+{
+    const xgl_shape_node_t *node;
+    float s, t;
+    int index;
+    s = (float)((x - tree->origin[0] + tree->width) % tree->width) + .5f;
+    t = (float)((y - tree->origin[1] + tree->height) % tree->height) + .5f;
+    for (index = 0;;) {
+        node = &tree->nodes[index];
+        if (node->child[0] < 0 || node->child[1] > most) return index;
+        if ((node->flags & XGL_SHAPE_PAIRED) && tree->nodes[node->child[1]].child[1] > most) return index;
+        index = node->child[node->a * s + node->b * t >= node->d];
+    }
+}
+
+/* A step of detail shows like details all or none: it ends where a run of
+ * cuts worth about the same ends, never among them. */
+static void test_steps_keep_like_details(void)
+{
+    xgl_shape_tree_t *tree;
+    float gain[XGL_SHAPE_PIECES], least, rest;
+    int i, k, pieces, cuts, shown, total, all_shown, none_shown, between;
+    XGL_ShapesClear();
+    tree = XGL_TextureShapes(make(0, 64, 64, bars));
+    assert(tree);
+    check_tree(tree);
+    total = (tree->count - 1) / 2;
+    /* Every cut made, each bar is a piece of its own. */
+    for (i = 0; i < 5; ++i) assert(near_value(tree->colors[3 * node_at(tree, 6 + 12 * i, 20)], 220));
+    assert(near_value(tree->colors[3 * node_at(tree, 12, 20)], 40));
+    assert(tree->cuts[0] == 0 && tree->cuts[1] == 0 && tree->cuts[XGL_SHAPE_PIECES] == total);
+    memset(gain, 0, sizeof(gain));
+    for (i = 0; i < tree->count; ++i)
+        if (tree->nodes[i].child[0] > 0) gain[(tree->nodes[i].child[0] - 1) / 2] = tree->nodes[i].gain;
+    all_shown = none_shown = between = 0;
+    for (pieces = 1; pieces <= XGL_SHAPE_PIECES; ++pieces) {
+        cuts = tree->cuts[pieces];
+        /* More pieces paid for, no fewer cuts; never more than twice the
+         * pieces; and what is made is worth clearly more than what is not. */
+        assert(cuts >= tree->cuts[pieces - 1] && cuts <= total && cuts + 1 <= 2 * pieces);
+        least = 1e30f; rest = 0;
+        for (k = 0; k < total; ++k) {
+            if (k < cuts) { if (gain[k] < least) least = gain[k]; }
+            else if (gain[k] > rest) rest = gain[k];
+        }
+        if (cuts && cuts < total) assert(least >= 1.5f * rest);
+        /* The bars: all of them pieces of their own, or none. */
+        shown = 0;
+        for (i = 0; i < 5; ++i)
+            if (abs(tree->colors[3 * node_under(tree, 2 * cuts, 6 + 12 * i, 20)] - 220) <= 3) ++shown;
+        assert(shown == 0 || shown == 5);
+        if (shown) ++all_shown; else ++none_shown;
+        /* A count of pieces that would have stopped among the bars. */
+        shown = 0;
+        for (i = 0; i < 5; ++i)
+            if (pieces - 1 <= total && abs(tree->colors[3 * node_under(tree, 2 * (pieces - 1), 6 + 12 * i, 20)] - 220) <= 3) ++shown;
+        if (shown > 0 && shown < 5) ++between;
+    }
+    /* Both happen, and stopping by the count alone would have parted them. */
+    assert(all_shown > 0 && none_shown > 0 && between >= 2);
+    XGL_ShapesClear();
+}
+
 static float piece_area(const xgl_shape_piece_t *piece)
 {
     float sum = 0;
@@ -606,6 +680,7 @@ int main(void)
     test_bands_origin_and_slopes();
     test_animated_frames();
     test_small_textures();
+    test_steps_keep_like_details();
     test_cut_faces();
     puts("XGL texture shape contracts passed");
     return 0;

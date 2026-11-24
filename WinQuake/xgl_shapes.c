@@ -91,6 +91,11 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define XGL_SHAPE_EDGE_AGREE .35
 /* How far in from a tilted side a parallel cut is looked for. */
 #define XGL_SHAPE_SIDE_REACH 20
+/* A step of detail ends only where every cut it makes is worth this many
+ * times any it leaves out, and may make cuts for up to twice the pieces it
+ * pays for to reach such a place. */
+#define XGL_SHAPE_RUN 1.5f
+#define XGL_SHAPE_RUN_OVER 2
 /* The share of a piece's darkest and of its brightest texels left out of
  * its color. */
 #define XGL_SHAPE_TRIM .2
@@ -1036,6 +1041,46 @@ static xgl_shape_node_t *XGL_ShapeAnalyse (const byte *texels, int width, int he
     return nodes;
 }
 
+/* Where the steps of detail may end among a division's cuts: see `cuts` in
+ * xgl_shape_tree_t. A number of cuts is a place to stop when the least
+ * telling of them is worth XGL_SHAPE_RUN times the most telling of the
+ * rest; a step that pays for n pieces stops at the place whose pieces are
+ * nearest n in proportion, and no more than XGL_SHAPE_RUN_OVER times n.
+ * The two sides of a band are worth the same and so are never parted. */
+static void XGL_ShapeRuns (xgl_shape_tree_t *tree)
+{
+    float gain[XGL_SHAPE_PIECES], rest[XGL_SHAPE_PIECES + 1], least, off, nearest;
+    byte stop[XGL_SHAPE_PIECES + 1];
+    int cuts, i, k, pieces, best;
+    cuts = (tree->count - 1) / 2;
+    if (cuts > XGL_SHAPE_PIECES - 1) cuts = XGL_SHAPE_PIECES - 1;
+    memset(gain, 0, sizeof(gain));
+    /* A node's cut is the k-th made when its children are nodes 2k - 1
+     * and 2k. */
+    for (i = 0; i < tree->count; ++i) {
+        k = (tree->nodes[i].child[0] - 1) / 2;
+        if (tree->nodes[i].child[0] > 0 && k < cuts) gain[k] = tree->nodes[i].gain;
+    }
+    rest[cuts] = 0;
+    for (k = cuts - 1; k >= 0; --k) rest[k] = gain[k] > rest[k + 1] ? gain[k] : rest[k + 1];
+    stop[0] = 1; least = 0;
+    for (k = 1; k <= cuts; ++k) {
+        if (k == 1 || gain[k - 1] < least) least = gain[k - 1];
+        stop[k] = (byte)(k == cuts || least >= XGL_SHAPE_RUN * rest[k]);
+    }
+    tree->cuts[0] = 0;
+    for (pieces = 1; pieces <= XGL_SHAPE_PIECES; ++pieces) {
+        best = 0; nearest = 0;
+        for (k = 0; k <= cuts && k + 1 <= XGL_SHAPE_RUN_OVER * pieces; ++k) {
+            if (!stop[k]) continue;
+            /* How far from the pieces paid for, as a proportion either way. */
+            off = k + 1 > pieces ? (float)(k + 1) / pieces : (float)pieces / (k + 1);
+            if (!k || off < nearest) { nearest = off; best = k; }
+        }
+        tree->cuts[pieces] = (byte)best;
+    }
+}
+
 /* A division is going away: nothing may point at it any longer. Which
  * division each animated texture is cut along is worked out again. */
 static void XGL_ShapeForget (xgl_shape_entry_t *entry)
@@ -1144,6 +1189,7 @@ static xgl_shape_entry_t *XGL_ShapeEntry (texture_t *texture)
     }
     tree->width = width; tree->height = height;
     tree->area = XGL_ShapeArea(width, height);
+    XGL_ShapeRuns(tree);
     entry->tree = tree;
     ++xgl_shape_found;
     return entry;

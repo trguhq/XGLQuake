@@ -1103,7 +1103,9 @@ static void XGL_ShapeTerms (const xgl_shape_tree_t *tree, int step, xgl_shape_te
     float threshold, edge, distance, nearness;
     int level;
     level = xgl_shape_levels[step];
-    terms->most = 2 * ((level < XGL_SHAPE_PIECES ? level : XGL_SHAPE_PIECES) - 1);
+    /* The cuts made are the first found, as many as that many pieces pay
+     * for, or a few more or fewer where that would part like details. */
+    terms->most = 2 * tree->cuts[level < XGL_SHAPE_PIECES ? level : XGL_SHAPE_PIECES];
     /* The squared distance the step is judged from. With no density every
      * wall in range is as if at the viewer's feet. */
     distance = 0;

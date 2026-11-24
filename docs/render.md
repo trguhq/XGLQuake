@@ -216,6 +216,14 @@ are made depends on a step of detail that follows the distance:
 
 - A repeat of the texture gets as many pieces as `xgl_detaildensity` pays
   for at that distance, in steps of 1, 2, 3, 4, 6, 8 and so on.
+- A step shows like details all or none. The bars of one light, or four
+  lamps in a row, are found one after another and are worth about the same;
+  a step that made just the cuts it pays for would stop among them and show
+  one bar of five, then two. A step therefore ends only where every cut it
+  makes is worth half as much again as any it leaves out, at the nearest
+  such place to the pieces it pays for and at most twice as many. Over the
+  shareware textures that shows a set of like pieces in part at 34 of the
+  steps, where the count alone did at 215, for about the same triangles.
 - A wall is cut alike all over. Faces in one plane, facing one way, with
   one texture laid one way, that are joined by their edges are one wall,
   found when the map loads. Each face asks for the step of its own

@@ -180,6 +180,13 @@ typedef struct {
     /* What each node's part of the texture is drawn in when it is a piece:
      * three bytes for each node. */
     byte *colors;
+    /* How many of the cuts, first found first, a step of detail makes that
+     * pays for a number of pieces: cuts[n] for n pieces. Not always n - 1.
+     * Like details, the bars of one light, are found one after another and
+     * are worth about the same, and a step that stopped among them would
+     * show some of them and not the rest; it stops before them all or
+     * after them all, whichever is nearer what it pays for. */
+    byte cuts[XGL_SHAPE_PIECES + 1];
     /* Not the division's own: what the code that cuts walls along it has
      * worked out about its steps of detail, kept here to be found again.
      * steps_key is zero when the division is made. */
