@@ -215,9 +215,15 @@ halved so that baked light is still sampled along it. How many of the cuts
 are made depends on a step of detail that follows the distance:
 
 - A repeat of the texture gets as many pieces as `xgl_detaildensity` pays
-  for at that distance, in steps of 1, 2, 3, 4, 6, 8 and so on. The step
-  depends on the texture and the distance alone, so every face of a wall is
-  cut alike and its pattern runs unbroken across them.
+  for at that distance, in steps of 1, 2, 3, 4, 6, 8 and so on.
+- A wall is cut alike all over. Faces in one plane, facing one way, with
+  one texture laid one way, that are joined by their edges are one wall,
+  found when the map loads. Each face asks for the step of its own
+  distance, and every face of the wall in view is cut at the finest step
+  any of them asks for, so that the pattern runs unbroken across them. Left
+  to their own distances, more than half of the neighbouring faces of such
+  walls were cut differently. The far end of a long wall is in consequence
+  cut finer than its distance alone would have it.
 - A repeat of a small texture gets the pieces that one of 64 texels square
   would. By its own texels a sign 32 texels square would have fewer than
   two pieces from 200 units and stay plain; it is cut out to about 385, as
@@ -228,10 +234,19 @@ are made depends on a step of detail that follows the distance:
   less. A small texture's cut is weighed as the same cut at full size would
   be. A part that would be narrower than a pixel and a half is not cut off,
   whatever the size of the texture: it would only flicker.
-- A wall is made finer in the frame it is called for, but coarser only when
-  the distance asks for half the pieces or fewer, and then one wall every
-  four frames. A step that would make the same cuts as the mesh a wall has
+- A wall is made finer as soon as the frame's building allows, but coarser
+  only when it asks for half the pieces or fewer, and then one wall every
+  four frames, all its faces following one another so that it is not long
+  cut two ways. A step that would make the same cuts as the mesh a wall has
   does not build it again.
+- A face that should be cut and has no cut mesh at all is built before any
+  other mesh in the frame. A wall that is plain where it should be cut
+  shows more than one a step too coarse, and walking into a room of such
+  walls a third of them used to wait their turn, plain, for some frames.
+- A face that is cut stays cut until it is about 1.4 times as far off as
+  where it would first be cut, and stays in range of detail as far beyond
+  `xgl_detaildistance`. Stepping back and forth across either distance
+  then changes nothing.
 - One face has at most 256 triangles. A large face of a busy texture is cut
   at the finest step that fits; that is found out the first time and
   remembered.
@@ -462,7 +477,7 @@ kept at all; a line on the terminal says so.
 | `xgl_detailedge` | 16 | Edges of this many texels or less are never split, clamped to 4–64; smaller is finer. |
 | `xgl_detailface` | 192 | Most triangles in one face's detailed mesh, clamped to 4–1024. |
 | `xgl_detaildensity` | 160 | Triangles a face may have for its apparent size: this times its area over its squared distance, up to `xgl_detailface`. Larger gives near faces their limit sooner; 0 gives every face `xgl_detailface`. |
-| `xgl_detailtris` | 2048 | Detailed wall and brush-entity triangles per frame; faces beyond the allowance draw their coarse mesh. |
+| `xgl_detailtris` | 3072 | Detailed wall and brush-entity triangles per frame; faces beyond the allowance draw their coarse mesh. |
 | `xgl_detaildistance` | 512 | Distance within which faces are considered for detail and water uses its finer grid. |
 | `xgl_detailbuild` | 128 | Detailed-mesh triangles built per frame; one mesh is always allowed, 0 removes the limit. |
 | `xgl_shapes` | 1 | Cut walls along the shapes of their textures where a texture has them; 0 draws every wall as a smooth mesh. See [texture shapes](#texture-shapes). |

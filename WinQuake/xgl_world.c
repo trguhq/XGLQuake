@@ -116,6 +116,11 @@ typedef struct {
      * finest step that fits one mesh, once a finer has been found not to;
      * zero until then. */
     short shape_step, shape_need, shape_most;
+    /* The wall the face is part of: the number of the first face of it. And
+     * for that first face, on the wall's behalf: the finest step any of its
+     * faces in view asks for in the frame wall_frame. */
+    short wall_step;
+    int wall, wall_frame;
 } xgl_surface_cache_t;
 
 typedef struct {
@@ -168,6 +173,10 @@ static int xgl_pvs_novis;
 /* The settings the cached meshes were built with. */
 static float xgl_cache_step, xgl_cache_error, xgl_cache_face, xgl_cache_edge, xgl_cache_density;
 static float xgl_cache_shapes;
+/* The wall cut along shapes whose turn it is to be made coarser, and the
+ * frame its turn began in. */
+static int xgl_coarsen_frame = -1;
+static const void *xgl_coarsen_wall;
 static xgl_water_surface_t xgl_water[XGL_WATER_QUEUE];
 static int xgl_water_count;
 static xgl_brush_cache_t xgl_brush_cache[XGL_BRUSH_CACHE_MODELS];
@@ -199,7 +208,7 @@ static struct {
 } xgl_basis;
 
 cvar_t xgl_subdivide = {"xgl_subdivide", "128", false, false, 0, NULL};
-cvar_t xgl_detailtris = {"xgl_detailtris", "2048", false, false, 0, NULL};
+cvar_t xgl_detailtris = {"xgl_detailtris", "3072", false, false, 0, NULL};
 cvar_t xgl_detaildistance = {"xgl_detaildistance", "512", false, false, 0, NULL};
 cvar_t xgl_detailbuild = {"xgl_detailbuild", "128", false, false, 0, NULL};
 cvar_t xgl_detailerror = {"xgl_detailerror", "16", false, false, 0, NULL};
@@ -274,6 +283,8 @@ static void XGL_WorldRelease (void)
     xgl_water_count = 0;
     xgl_evict_hand = 0;
     xgl_lit_retry = 0;
+    xgl_coarsen_wall = NULL;
+    xgl_coarsen_frame = -1;
     xgl_pvs_world = NULL;
     xgl_pvs_leaf = NULL;
     xgl_basis.valid = 0;
@@ -1061,6 +1072,12 @@ static float XGL_Setting (float value, float low, float high)
 #define XGL_SHAPE_RANK_AREA 16384.0f
 /* Frames between two meshes made coarser because the viewer moved away. */
 #define XGL_SHAPE_COARSEN 4
+/* A face that is cut stays cut until it is this much farther off than where
+ * it would first be cut, and in range of detail as much longer: a pace back
+ * and forth across either distance changes nothing. The first is of the
+ * squared distance. */
+#define XGL_SHAPE_KEEP .5f
+#define XGL_SHAPE_KEEP_RANGE 1.41421356f
 
 /* The pieces a repeat of the texture may have at each step: steps, so that
  * faces a little nearer or farther agree. Past the most pieces a division
@@ -1071,7 +1088,6 @@ static const short xgl_shape_levels[XGL_SHAPE_STEPS] = {
 };
 /* Changes whenever the settings the steps depend on may have. */
 static int xgl_shape_key = 1;
-static int xgl_coarsen_frame = -1;
 
 /* The division of a wall's texture, or NULL for a wall drawn the ordinary
  * way. An animated texture has one division for all its frames. */
@@ -1158,6 +1174,43 @@ static int XGL_SurfaceShapeStep (const msurface_t *surface, float distance_squar
 {
     xgl_shape_tree_t *tree = XGL_SurfaceShapes(surface);
     return tree ? XGL_ShapeStep(tree, distance_squared) : -1;
+}
+
+/* Whether a face has a mesh cut along shapes. */
+static int XGL_SurfaceIsCut (const xgl_surface_cache_t *cache)
+{
+    return cache->shape_step > 0 && cache->detail.vertices != NULL;
+}
+
+/* Whether it had one in use in the frame before: drawn, or kept ready
+ * outside the view. Asked before this frame has used it. */
+static int XGL_SurfaceWasCut (const xgl_surface_cache_t *cache)
+{
+    return XGL_SurfaceIsCut(cache) && cache->detail_used >= r_framecount - 1;
+}
+
+/* The step a face asks for on its own account: that of its distance, but a
+ * face that is cut goes on asking for the lowest step that cuts its texture
+ * until it is well beyond where it would first be cut. */
+static int XGL_SurfaceShapeNeed (const msurface_t *surface, const xgl_surface_cache_t *cache,
+                                 float distance_squared)
+{
+    xgl_shape_tree_t *tree = XGL_SurfaceShapes(surface);
+    const byte *steps;
+    int need, i;
+    if (!tree) return -1;
+    need = XGL_ShapeStep(tree, distance_squared);
+    if (need || !XGL_SurfaceWasCut(cache) || !XGL_ShapeStep(tree, distance_squared * XGL_SHAPE_KEEP)) return need;
+    steps = XGL_ShapeSteps(tree);
+    for (i = 1; i < XGL_SHAPE_STEPS; ++i) if (steps[i]) return steps[i];
+    return 0;
+}
+
+/* How far off a face is still considered for detail: one that is cut, a
+ * margin beyond the others. */
+static float XGL_DetailRange (const xgl_surface_cache_t *cache)
+{
+    return XGL_SurfaceWasCut(cache) ? xgl_detaildistance.value * XGL_SHAPE_KEEP_RANGE : xgl_detaildistance.value;
 }
 
 /* A scratch vertex of a piece. Its recorded coordinates are the piece's
@@ -1360,6 +1413,35 @@ static int XGL_DetailWant (float area, float distance_squared)
     return (int)(want < limit ? want : limit);
 }
 
+/* The wall a face is part of, as the cache entry of its first face. A face
+ * of a model that keeps meshes of its own is a wall to itself. */
+static const xgl_surface_cache_t *XGL_WallOf (const xgl_surface_cache_t *cache)
+{
+    if (xgl_surfaces && cache >= xgl_surfaces && cache < xgl_surfaces + xgl_surface_count)
+        return xgl_surfaces + cache->wall;
+    return cache;
+}
+
+/* Whether a face may be made coarser now: its wall has the turn, taken
+ * within the last few frames, or no wall has taken this frame's and it is
+ * a frame in which one may. */
+static int XGL_CoarsenTurn (const xgl_surface_cache_t *cache)
+{
+    if (XGL_WallOf(cache) == xgl_coarsen_wall && r_framecount - xgl_coarsen_frame < XGL_SHAPE_COARSEN &&
+        r_framecount >= xgl_coarsen_frame) return 1;
+    return !(r_framecount % XGL_SHAPE_COARSEN) && xgl_coarsen_frame != r_framecount;
+}
+
+/* A face has been made coarser: its wall has the turn from now, unless it
+ * had it already. */
+static void XGL_CoarsenTaken (const xgl_surface_cache_t *cache)
+{
+    if (XGL_WallOf(cache) == xgl_coarsen_wall && r_framecount - xgl_coarsen_frame < XGL_SHAPE_COARSEN &&
+        r_framecount >= xgl_coarsen_frame) return;
+    xgl_coarsen_wall = XGL_WallOf(cache);
+    xgl_coarsen_frame = r_framecount;
+}
+
 /* Build a face's detailed mesh if this frame's build allowance permits.
  * A capped or memory-starved build is simply tried again in a later frame;
  * the face draws its coarse mesh meanwhile. A face that has nothing to show
@@ -1390,9 +1472,10 @@ static void XGL_TryBuildDetail (model_t *model, msurface_t *surface,
         else change = shape_step > cache->shape_step ||
                       xgl_shape_levels[shape_step] * 2 <= xgl_shape_levels[cache->shape_step];
         coarser = change && shape_step < cache->shape_step;
-        /* Making a mesh coarser is never urgent: one in every few frames. */
-        if (coarser && xgl_detailbuild.value > 0 &&
-            (r_framecount % XGL_SHAPE_COARSEN || xgl_coarsen_frame == r_framecount)) change = 0;
+        /* Making a wall coarser is never urgent: every few frames one wall
+         * has its turn, and its faces follow one another as building
+         * allows, so that it is not long cut two ways. */
+        if (coarser && xgl_detailbuild.value > 0 && !XGL_CoarsenTurn(cache)) change = 0;
         /* A build that found no memory waits its turn like any other. */
         if (!change || (cache->detail_retry && r_framecount < cache->detail_retry)) return;
         if (!shape_step) {
@@ -1400,7 +1483,7 @@ static void XGL_TryBuildDetail (model_t *model, msurface_t *surface,
             if (cache->detail.vertices) {
                 if (cache->detail.queued_frame == r_framecount) XGL_Flush();
                 XGL_FreeSurfaceMesh(&cache->detail);
-                xgl_coarsen_frame = r_framecount;
+                XGL_CoarsenTaken(cache);
             }
             cache->shape_step = 0;
             cache->detail_retry = 0;
@@ -1434,7 +1517,7 @@ static void XGL_TryBuildDetail (model_t *model, msurface_t *surface,
             cache->shape_most = (short)(xgl_build.shape_fit + 1);
             cache->shape_step = (short)xgl_build.shape_fit;
         }
-        if (coarser) xgl_coarsen_frame = r_framecount;
+        if (coarser) XGL_CoarsenTaken(cache);
     }
     if (cache->detail.vertices && (built || shape_step >= 0)) {
         /* A brush entity may have queued the old mesh in this frame. A wall
@@ -2102,6 +2185,45 @@ static int XGL_BuildSettingsChanged (void)
            xgl_cache_shapes != xgl_shapes.value;
 }
 
+/* Which faces make up each wall: those in one plane, facing one way, with
+ * one texture laid one way, that are joined by shared edges. Each face is
+ * given the number of the first face of its wall. Without memory to find
+ * them every face is a wall of its own. */
+static void XGL_FindWalls (void)
+{
+    model_t *model = xgl_cached_world;
+    msurface_t *surface, *other;
+    int *edge_face;
+    int i, j, k, edge, a, b;
+    for (i = 0; i < xgl_surface_count; ++i) xgl_surfaces[i].wall = i;
+    if (model->numedges <= 0 || !model->edges || !model->surfedges) return;
+    edge_face = (int *)malloc((size_t)model->numedges * sizeof(*edge_face));
+    if (!edge_face) return;
+    for (i = 0; i < model->numedges; ++i) edge_face[i] = -1;
+    for (i = 0, surface = model->surfaces; i < xgl_surface_count; ++i, ++surface) {
+        if ((i & 255) == 255) XGL_AudioUpdate();
+        if (!surface->texinfo || (surface->flags & (SURF_DRAWSKY | SURF_DRAWTURB))) continue;
+        for (k = 0; k < surface->numedges; ++k) {
+            edge = model->surfedges[surface->firstedge + k];
+            if (edge < 0) edge = -edge;
+            if (edge >= model->numedges) continue;
+            j = edge_face[edge];
+            if (j < 0) { edge_face[edge] = i; continue; }
+            other = model->surfaces + j;
+            if (other->plane != surface->plane || other->texinfo != surface->texinfo ||
+                ((other->flags ^ surface->flags) & SURF_PLANEBACK)) continue;
+            /* One wall: the lower of their two first faces is the first. */
+            for (a = i; xgl_surfaces[a].wall != a; a = xgl_surfaces[a].wall) {}
+            for (b = j; xgl_surfaces[b].wall != b; b = xgl_surfaces[b].wall) {}
+            if (a < b) xgl_surfaces[b].wall = a; else xgl_surfaces[a].wall = b;
+        }
+    }
+    free(edge_face);
+    /* A first face has a lower number than any other of its wall, so one
+     * pass upward leaves every face naming it. */
+    for (i = 0; i < xgl_surface_count; ++i) xgl_surfaces[i].wall = xgl_surfaces[xgl_surfaces[i].wall].wall;
+}
+
 /* Examine, while the map loads, the texture of every wall that may be
  * drawn, for the shapes it is to be cut along: that work is then out of
  * the frames. A texture already examined costs nothing. */
@@ -2168,6 +2290,7 @@ static void XGL_WorldSetup (void)
             xgl_surfaces = NULL; xgl_world_order = NULL;
         }
     }
+    if (xgl_surfaces) XGL_FindWalls();
     if (xgl_surfaces && xgl_world_prebuild) XGL_PrebuildWorld();
     Con_Printf("XGL: sampled BSP cache limited to 8 MiB; detail follows texture and light contrast; complete coarse fallback\n");
     XGL_ExamineShapes();
@@ -2202,10 +2325,15 @@ static int XGL_DetailBucket (float priority)
  * coarse mesh if it has none yet, water's finer grid, and for a wall in
  * range what detail it asks for. Returns 1 for a wall that is a candidate
  * for the allowance, with its rank in cache->bucket. A face outside the
- * view is prepared in the same way but is not marked as drawn. */
-static int XGL_ConsiderDetail (int index, int shown, int *shaped)
+ * view is prepared in the same way but is not marked as drawn.
+ *
+ * A face of a texture with shapes is a candidate for now, with what it asks
+ * for on its own account in cache->shape_need: what it gets depends on the
+ * rest of its wall, which XGL_SettleShaped decides once every face in view
+ * has been seen. */
+static int XGL_ConsiderDetail (int index, int shown)
 {
-    xgl_surface_cache_t *cache;
+    xgl_surface_cache_t *cache, *wall;
     msurface_t *surface;
     vec3_t delta;
     float distance, range;
@@ -2224,7 +2352,7 @@ static int XGL_ConsiderDetail (int index, int shown, int *shaped)
     XGL_SurfaceBounds(cl.worldmodel, surface, cache);
     VectorSubtract(cache->center, r_origin, delta);
     distance = DotProduct(delta, delta);
-    range = xgl_detaildistance.value + cache->radius;
+    range = XGL_DetailRange(cache) + cache->radius;
     if (distance >= range * range) return 0;
     if (surface->flags & SURF_DRAWTURB) {
         /* Water in range always uses its finer grid, outside the wall
@@ -2239,15 +2367,46 @@ static int XGL_ConsiderDetail (int index, int shown, int *shaped)
     }
     if (!(xgl_detailtris.value > 0)) return 0;
     cache->detail_want = XGL_DetailWant(cache->area, distance);
-    cache->shape_need = (short)XGL_SurfaceShapeStep(surface, distance);
+    cache->shape_need = (short)XGL_SurfaceShapeNeed(surface, cache, distance);
+    cache->bucket = bucket;
+    if (cache->shape_need >= 0) {
+        /* The finest step a face in view asks for is its wall's. */
+        if (shown && cache->shape_need > 0) {
+            wall = xgl_surfaces + cache->wall;
+            if (wall->wall_frame != r_framecount) { wall->wall_frame = r_framecount; wall->wall_step = 0; }
+            if (cache->shape_need > wall->wall_step) wall->wall_step = cache->shape_need;
+        }
+        return 1;
+    }
+    if (cache->detail_want < XGL_DETAIL_WANT_MIN) return 0;
+    cache->bucket += XGL_DetailBucket(cache->area / (distance + 64));
+    return 1;
+}
+
+/* A candidate face of a texture with shapes, now that the finest step each
+ * wall in view asks for is known: the face takes its wall's step, so that
+ * the whole wall is cut alike and the pattern runs unbroken across it, and
+ * is ranked. A wall none of whose faces in view asks to be cut leaves each
+ * face what it asked. Returns 0 for a face that turns out no candidate. */
+static int XGL_SettleShaped (int index, int *shaped)
+{
+    xgl_surface_cache_t *cache, *wall;
+    vec3_t delta;
+    float distance;
+    cache = xgl_surfaces + index;
+    if (cache->shape_need < 0) return 1;
+    wall = xgl_surfaces + cache->wall;
+    if (wall->wall_frame == r_framecount && wall->wall_step > cache->shape_need)
+        cache->shape_need = wall->wall_step;
+    VectorSubtract(cache->center, r_origin, delta);
+    distance = DotProduct(delta, delta);
     if (cache->shape_need > 0) {
         ++*shaped;
-        bucket += XGL_DetailBucket(XGL_SHAPE_RANK_AREA / (distance + 64));
-    } else {
-        if (cache->detail_want < XGL_DETAIL_WANT_MIN) return 0;
-        bucket += XGL_DetailBucket(cache->area / (distance + 64));
+        cache->bucket += XGL_DetailBucket(XGL_SHAPE_RANK_AREA / (distance + 64));
+        return 1;
     }
-    cache->bucket = bucket;
+    if (cache->detail_want < XGL_DETAIL_WANT_MIN) return 0;
+    cache->bucket += XGL_DetailBucket(cache->area / (distance + 64));
     return 1;
 }
 
@@ -2282,7 +2441,11 @@ static void XGL_SortDetail (int first, int count)
  * plain. Its faces are therefore taken however small, rank by nearness
  * alone, so that if the allowance runs out it is the far walls that go
  * plain and not the small faces of a near one, and may run somewhat over
- * the allowance before any is dropped.
+ * the allowance before any is dropped. Every face of it in view is cut at
+ * one step, the finest any of them asks for. And those of its faces that
+ * have no cut mesh yet are built before anything else this frame: a wall
+ * that is plain where it should be cut shows more than one that is cut a
+ * step too coarsely.
  *
  * The faces outside the view take nothing from the allowance, which is for
  * what is drawn. But a turn of the head brings them into view, and they
@@ -2293,21 +2456,38 @@ static void XGL_SelectWorldDetail(void)
 {
     xgl_surface_cache_t *cache;
     float allowance, most, planned;
-    int i, index, candidates, hidden, shaped, hidden_shaped;
-    candidates = shaped = 0;
+    int i, index, considered, candidates, hidden, shaped, hidden_shaped;
+    considered = 0;
     for (i = 0; i < xgl_world_count; ++i) {
         if ((i & 63) == 0) XGL_AudioUpdate();
         index = xgl_world_order[i];
-        if (XGL_ConsiderDetail(index, 1, &shaped)) xgl_detail_order[candidates++] = index;
+        if (XGL_ConsiderDetail(index, 1)) xgl_detail_order[considered++] = index;
     }
-    hidden = hidden_shaped = 0;
+    hidden = 0;
     for (i = 0; i < xgl_hidden_count; ++i) {
         if ((i & 63) == 0) XGL_AudioUpdate();
         index = xgl_world_order[xgl_surface_count - 1 - i];
-        if (XGL_ConsiderDetail(index, 0, &hidden_shaped)) xgl_detail_order[candidates + hidden++] = index;
+        if (XGL_ConsiderDetail(index, 0)) xgl_detail_order[considered + hidden++] = index;
     }
+    /* Each wall's step is known now: settle its faces, those in view first
+     * and then, after them in the list, those outside it. */
+    candidates = shaped = hidden_shaped = 0;
+    for (i = 0; i < considered; ++i)
+        if (XGL_SettleShaped(xgl_detail_order[i], &shaped)) xgl_detail_order[candidates++] = xgl_detail_order[i];
+    index = candidates;
+    for (i = considered; i < considered + hidden; ++i)
+        if (XGL_SettleShaped(xgl_detail_order[i], &hidden_shaped)) xgl_detail_order[index++] = xgl_detail_order[i];
+    hidden = index - candidates;
     XGL_SortDetail(0, candidates);
     XGL_SortDetail(candidates, hidden);
+    /* The faces in view that should be cut and are not, nearest first. */
+    for (i = 0; shaped && i < candidates; ++i) {
+        if (xgl_detailbuild.value > 0 && xgl_detail_built >= xgl_detailbuild.value) break;
+        index = xgl_detail_sorted[i]; cache = xgl_surfaces + index;
+        if (cache->shape_need <= 0 || XGL_SurfaceIsCut(cache)) continue;
+        XGL_TryBuildDetail(cl.worldmodel, cl.worldmodel->surfaces + index, cache,
+                           cache->detail_want, cache->shape_need);
+    }
     most = xgl_detailtris.value;
     if (shaped) most *= XGL_SHAPE_OVER;
     for (i = 0; i < candidates && xgl_detail_used < most; ++i) {
@@ -2437,14 +2617,14 @@ static void XGL_DrawSurface (model_t *model, msurface_t *surface, entity_t *enti
             } else VectorCopy(center, worldcenter);
             VectorSubtract(worldcenter, r_origin, delta);
             distance = DotProduct(delta, delta);
-            detail = xgl_detaildistance.value > 0 && distance < xgl_detaildistance.value * xgl_detaildistance.value;
+            detail = xgl_detaildistance.value > 0 && distance < XGL_DetailRange(cache) * XGL_DetailRange(cache);
             step = -1;
             allowance = xgl_detailtris.value;
             if (detail) {
                 cache->detail_want = XGL_DetailWant(cache->area, distance);
                 /* One cut along shapes is taken however small, as a wall's
                  * faces are, and may run as far over the allowance. */
-                step = XGL_SurfaceShapeStep(surface, distance);
+                step = XGL_SurfaceShapeNeed(surface, cache, distance);
                 if (step > 0) allowance *= XGL_SHAPE_OVER;
                 else if (cache->detail_want < XGL_DETAIL_WANT_MIN) detail = 0;
             }
