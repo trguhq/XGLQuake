@@ -68,7 +68,7 @@ requires builds and readback checks against those installed SDKs/runtimes.
 
 ## Run
 
-Version 0.9.5 defaults to the **quick** profile at **320x240**, with a one-minute
+Version 0.9.6 defaults to the **quick** profile at **320x240**, with a one-minute
 elapsed-time limit:
 
 ```sh
@@ -220,6 +220,7 @@ Options:
 | `-csv PATH` | Save machine-readable results as well as the terminal report. |
 | `-display DISPLAY` | Select an X display. Local DGA is the intended path. |
 | `-allow-fallback` | Permit a software/non-DGA configuration for diagnosis. |
+| `-no-error-detection` | Leave XGL's own argument checking off for the run; see [XGL error detection](#xgl-error-detection). |
 | `-list` | List selected case names without opening a display. |
 | `-help` | Print usage without opening a display. |
 
@@ -499,6 +500,23 @@ the trials of the other way disagree about the length, both answers follow in
 brackets. These are fits through the medians of a few short trials: read them
 with the `trial-mean range` of each row, and repeat the run before relying on
 a difference of one triangle.
+
+### XGL error detection
+
+The game, and this benchmark by default, switch on
+`XGL_SYS_ST_ERROR_DETECTION`, which asks XGL to check the arguments of its
+calls. XGL leaves it off unless asked. `-no-error-detection` leaves it off
+for the run, so that what the checking costs can be seen; the benchmark's
+own readback checks stay, and the report's header says which way the run
+was made. Run the mesh probe both ways, one after the other:
+
+```sh
+./xglbench -medium -repeats 3 -winsize 320 240 -test probe/mesh -csv zx-errors-on.csv >zx-errors-on.txt 2>&1
+./xglbench -medium -repeats 3 -winsize 320 240 -test probe/mesh -no-error-detection -csv zx-errors-off.csv >zx-errors-off.txt 2>&1
+```
+
+and compare the `render_ms` and the `CPU ... ms/frame` of the same rows. A
+difference smaller than a row's `trial-mean range` is not one.
 
 Run the probes with the existing cases they are compared against:
 

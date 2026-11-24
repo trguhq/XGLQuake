@@ -66,7 +66,8 @@ static void usage(FILE *f)
         "  -csv PATH          Write machine-readable per-trial and summary results\n"
         "  -test TEXT[,TEXT]  Select names containing any TEXT from the complete registry\n"
         "  -display DISPLAY   X display (default DISPLAY environment variable)\n"
-        "  -allow-fallback    Permit non-DGA/software/single-buffer investigation\n");
+        "  -allow-fallback    Permit non-DGA/software/single-buffer investigation\n"
+        "  -no-error-detection  Leave XGL's argument checking off, to time what it costs\n");
     fprintf(f,
         "  -list              List selected cases without opening XGL\n"
         "  -help              Show this help\n"
@@ -132,6 +133,8 @@ static int options(int argc, char **argv, xb_options *o)
             o->list_only = 1;
         } else if (!strcmp(argv[i], "-allow-fallback")) {
             o->allow_fallback = 1;
+        } else if (!strcmp(argv[i], "-no-error-detection")) {
+            o->no_error_detection = 1;
         } else if (!strcmp(argv[i], "-winsize")) {
             if (i + 2 >= argc || !parse_long(argv[i + 1], 128, 4096, &o->width) ||
                 !parse_long(argv[i + 2], 64, 4096, &o->height)) goto invalid;

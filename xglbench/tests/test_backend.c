@@ -19,6 +19,7 @@ static double test_mesh_cost[3];
 
 static int test_width;
 static int test_height;
+static int test_error_detection = 1;
 static size_t test_triangles;
 static size_t test_strip_calls;
 static unsigned long test_draws;
@@ -114,7 +115,7 @@ static void test_log(const char *operation, int width, int height)
 int xb_backend_open(const xb_options *options, int width, int height)
 {
     const char *draw, *delay, *drain, *light;
-    (void)options;
+    test_error_detection = !options->no_error_detection;
     test_width = width;
     test_height = height;
     test_draws = 0;
@@ -199,6 +200,7 @@ void xb_backend_info(FILE *out)
     fprintf(out, "TEST DOUBLE: NO GRAPHICS, NO VALID HARDWARE PERFORMANCE DATA\n");
     fprintf(out, "Portable scheduling/report tests only; window=%dx%d\n",
             test_width, test_height);
+    fprintf(out, "XGL error detection: %s.\n", test_error_detection ? "on" : "off");
 }
 
 int xb_backend_validate(enum xb_method method, char *reason, size_t size)

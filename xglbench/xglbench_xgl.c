@@ -83,6 +83,7 @@ typedef struct {
     enum xb_method method;
     int batch, perspective, errors, fatal;
     int shading, hardware_lighting, allow_fallback, light_count, cull;
+    int error_detection;
     Xgl_light lights[XB_MAX_LIGHTS + 1];
     xb_light_state light_state;
     xb_native_slot stream[XB_MAX_QUEUE];
@@ -907,6 +908,7 @@ int xb_backend_open(const xb_options *options, int width, int height)
         return 0;
     }
     b.allow_fallback = options->allow_fallback;
+    b.error_detection = !options->no_error_detection;
     b.display = XOpenDisplay(options->display);
     if (!b.display) {
         fail("cannot open X display; run in the local OpenWindows desktop");
@@ -917,8 +919,12 @@ int xb_backend_open(const xb_options *options, int width, int height)
     b.system = xgl_open((Xgl_attribute)NULL);
     if (!b.system) { fail("xgl_open failed"); return 0; }
     if (xb_cancel_requested()) return 0;
+    /* The notification function reports whatever XGL finds either way. With
+     * detection on, XGL also checks the arguments of its calls, which the
+     * game does too; -no-error-detection leaves that off, as XGL does when
+     * it is not asked, so that the two can be timed against each other. */
     xgl_object_set(b.system, XGL_SYS_ST_ERROR_NOTIFICATION_FUNCTION, xgl_error,
-                   XGL_SYS_ST_ERROR_DETECTION, TRUE, 0);
+                   XGL_SYS_ST_ERROR_DETECTION, b.error_detection ? TRUE : FALSE, 0);
     if (b.errors || xb_cancel_requested()) return 0;
     version = NULL;
     xgl_object_get(b.system, XGL_SYS_ST_VERSION, &version);
@@ -1136,6 +1142,9 @@ void xb_backend_info(FILE *out)
 #else
     fprintf(out, "Refresh rate: not queried or assumed; probe/swap reports the measured switch period.\n");
 #endif
+    fprintf(out, "XGL error detection: %s.\n", b.error_detection ?
+            "on (XGL_SYS_ST_ERROR_DETECTION TRUE, as the game sets it)" :
+            "off (-no-error-detection; XGL's own default); readback checks remain");
     fprintf(out, "Default state: flat facet RGB; illumination off; no textures; culling off; "
                  "six clipping planes; deferred submission; volatile geometry "
                  "except retained-array and pipeline cases.\n");

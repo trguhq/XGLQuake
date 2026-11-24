@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define XB_VERSION "0.9.5"
+#define XB_VERSION "0.9.6"
 #define XB_MAX_QUEUE 8
 #define XB_MAX_LIGHTS 4
 #define XB_STYLE_LAYERS 4
@@ -95,6 +95,8 @@ typedef struct {
 typedef struct {
     int width, height, force_size;
     int repeats, base_triangles, allow_fallback, list_only, queue, custom_timing, sim_fps;
+    /* Leave XGL_SYS_ST_ERROR_DETECTION at FALSE, XGL's own default. */
+    int no_error_detection;
     enum xb_profile profile;
     double seconds, warmup, pause;
     const char *csv_path, *filter, *display;

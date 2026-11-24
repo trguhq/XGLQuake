@@ -1051,6 +1051,17 @@ awk -F, '
 ' "$test_dir/mesh.csv" || fail "mesh probe cases lost their submission method, batch or call count"
 grep '^  Mesh probe, render microseconds a triangle (medians of the trials): polygons ' \
     "$test_dir/output" >/dev/null || fail "mesh probe results were not read together"
+# The game switches XGL's argument checking on; -no-error-detection leaves it
+# off for the run, and the report says which it was.
+run_bench -winsize 320 240 -test probe/mesh/strips-4 -seconds .001 -warmup 0 -repeats 1 \
+    >"$test_dir/output" 2>&1 || fail "default error detection run failed"
+grep -x 'XGL error detection: on.' "$test_dir/output" >/dev/null || fail "error detection is not on by default"
+run_bench -no-error-detection -winsize 320 240 -test probe/mesh/strips-4 -seconds .001 -warmup 0 \
+    -repeats 1 >"$test_dir/output" 2>&1 || fail "-no-error-detection run failed"
+grep -x 'XGL error detection: off.' "$test_dir/output" >/dev/null || fail "-no-error-detection was not passed on"
+"$bench" -help >"$test_dir/output" 2>&1 || true
+grep -e '-no-error-detection' "$test_dir/output" >/dev/null || fail "help omits -no-error-detection"
+
 # One strip length alone gives no call cost and no length to send strips from.
 run_bench -winsize 320 240 -test probe/mesh/strips-4,probe/mesh/polygons -seconds .001 \
     -warmup 0 -repeats 1 >"$test_dir/output" 2>&1 || fail "a partial mesh probe failed"
