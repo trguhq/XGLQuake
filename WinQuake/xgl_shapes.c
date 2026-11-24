@@ -63,8 +63,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  * least one level of color less, for the texture to be drawn as pieces. */
 #define XGL_SHAPE_BETTER .85
 #define XGL_SHAPE_MARGIN 1.0
-/* Tilted cuts are tried only if upright and level ones come this close. */
-#define XGL_SHAPE_HOPE .95
+/* Tilted cuts are tried only if upright and level ones come this close. On
+ * the shareware maps tilting never brings a texture more than four
+ * hundredths nearer, so none that begins above this gets under the mark. */
+#define XGL_SHAPE_HOPE .90
 /* A thin band is at most this many texels across. */
 #define XGL_SHAPE_BAND 12
 /* A tilted cut must gain this much more than the best upright one, lie at
@@ -169,29 +171,45 @@ static double XGL_ShapeError (const double *sum, int n)
     return sum[3] - (sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]) / n;
 }
 
+/* The sums of every column and of every row of a texture, color by color
+ * and of the squares, in one pass. A line of 256 texels comes to less than
+ * fifty million, so whole numbers hold them exactly. */
+static unsigned int xgl_shape_columns[XGL_SHAPE_SIDE][4], xgl_shape_rows[XGL_SHAPE_SIDE][4];
+
+static void XGL_ShapeLines (const byte *texels, int width, int height)
+{
+    const byte *color;
+    unsigned int red, green, blue, squares, sum[4], *column;
+    int x, y;
+    memset(xgl_shape_columns, 0, (size_t)width * sizeof(xgl_shape_columns[0]));
+    for (y = 0; y < height; ++y) {
+        sum[0] = sum[1] = sum[2] = sum[3] = 0;
+        column = xgl_shape_columns[0];
+        for (x = 0; x < width; ++x, column += 4) {
+            color = xgl_palette + 3 * *texels++;
+            red = color[0]; green = color[1]; blue = color[2];
+            squares = red * red + green * green + blue * blue;
+            sum[0] += red; sum[1] += green; sum[2] += blue; sum[3] += squares;
+            column[0] += red; column[1] += green; column[2] += blue; column[3] += squares;
+        }
+        memcpy(xgl_shape_rows[y], sum, sizeof(sum));
+    }
+}
+
 /* Where the repeat should begin along one axis. A repeating pattern has no
  * natural edge, and a border through the middle of a shape would cut it in
- * two for nothing. Finds the pair of cuts that best divides the ring of
- * columns (axis 0) or rows into two runs and begins at one of them; zero
- * when no pair explains even a fiftieth of the texture. */
-static int XGL_ShapeOrigin (const byte *texels, int width, int height, int axis)
+ * two for nothing. Given the sums of the `length` lines that lie across the
+ * axis, each of `across` texels, finds the pair of cuts that best divides
+ * the ring of them into two runs and begins at one of them; zero when no
+ * pair explains even a fiftieth of the texture. */
+static int XGL_ShapeOrigin (unsigned int (*sums)[4], int length, int across)
 {
     static double line[XGL_SHAPE_SIDE + 1][4];
     double total[4], part[4], rest[4], whole, best, gain;
-    const byte *color;
-    int length, across, i, j, c, n1, n2, origin, other, step, pass, from, to, low, high;
-    length = axis ? height : width; across = axis ? width : height;
+    int i, j, c, n1, n2, origin, other, step, pass, from, to, low, high;
     for (c = 0; c < 4; ++c) line[0][c] = 0;
-    for (i = 0; i < length; ++i) {
-        for (c = 0; c < 4; ++c) line[i + 1][c] = line[i][c];
-        for (j = 0; j < across; ++j) {
-            color = xgl_palette + 3 * (axis ? texels[i * width + j] : texels[j * width + i]);
-            for (c = 0; c < 3; ++c) {
-                line[i + 1][c] += color[c];
-                line[i + 1][3] += (double)color[c] * color[c];
-            }
-        }
-    }
+    for (i = 0; i < length; ++i)
+        for (c = 0; c < 4; ++c) line[i + 1][c] = line[i][c] + sums[i][c];
     for (c = 0; c < 4; ++c) total[c] = line[length][c];
     whole = XGL_ShapeError(total, length * across);
     if (!(whole > 0)) return 0;
@@ -229,6 +247,9 @@ static int XGL_ShapeOrigin (const byte *texels, int width, int height, int axis)
 static double XGL_ShapeSmooth (void)
 {
     static float grid[17][17][3];
+    /* Where each column lies among the grid's: the same for every row. */
+    static float along[XGL_SHAPE_SIDE];
+    static short column[XGL_SHAPE_SIDE][2];
     const unsigned int *texel;
     double sum[4], part[4], error;
     float fx, fy, value, difference;
@@ -267,6 +288,12 @@ static double XGL_ShapeSmooth (void)
             x0 = 2 * half < w ? 2 * half : w; y0 = 2 * half < h ? 2 * half : h;
             for (c = 0; c < 3; ++c) grid[gy][gx][c] = (float)(sum[c] / (x0 * y0));
         }
+    for (x = 0; x < w; ++x) {
+        fx = (float)x * gw / w;
+        gx = (int)fx;
+        along[x] = fx - gx;
+        column[x][0] = (short)gx; column[x][1] = (short)((gx + 1) % gw);
+    }
     error = 0; taken = 0;
     skip = w >= 32 && h >= 32 ? 2 : 1;
     for (y = 0; y < h; ++y) {
@@ -274,8 +301,7 @@ static double XGL_ShapeSmooth (void)
         fy = (float)y * gh / h;
         gy = (int)fy; fy -= gy; ny = (gy + 1) % gh;
         for (x = skip == 2 ? (y & 1) : 0; x < w; x += skip, ++taken) {
-            fx = (float)x * gw / w;
-            gx = (int)fx; fx -= gx; nx = (gx + 1) % gw;
+            fx = along[x]; gx = column[x][0]; nx = column[x][1];
             texel = XGL_SHAPE_TEXEL(x, y);
             for (c = 0; c < 3; ++c) {
                 value = (grid[gy][gx][c] * (1 - fx) + grid[gy][nx][c] * fx) * (1 - fy) +
@@ -503,6 +529,7 @@ static void XGL_ShapeProfiles (int index, int ya, int yb, int xa, int xb)
  * high: the best single cut, and the best pair with a thin band between. */
 static void XGL_ShapeFamily (int family, int low, int high, xgl_shape_cut_t *single, xgl_shape_cut_t *band)
 {
+    static double far_error[XGL_SHAPE_SIDE + 2];
     double (*far_sum)[4] = xgl_shape.far_sum[family];
     const int *far_n = xgl_shape.far_n[family];
     double near_sum[4], middle[4], whole, gain, near_error;
@@ -512,11 +539,14 @@ static void XGL_ShapeFamily (int family, int low, int high, xgl_shape_cut_t *sin
     n = far_n[low];
     if (n < 4 * XGL_SHAPE_LEAST) return;
     whole = XGL_ShapeError(far_sum[low], n);
+    /* Every band that ends at a place asks for the error beyond it. */
+    for (c = low + XGL_SHAPE_LEAST; c <= high - XGL_SHAPE_LEAST; ++c)
+        far_error[c] = XGL_ShapeError(far_sum[c], far_n[c]);
     for (c = low + XGL_SHAPE_LEAST; c <= high - XGL_SHAPE_LEAST; ++c) {
         if (far_n[c] < 2 * XGL_SHAPE_LEAST || n - far_n[c] < 2 * XGL_SHAPE_LEAST) continue;
         for (k = 0; k < 4; ++k) near_sum[k] = far_sum[low][k] - far_sum[c][k];
         near_error = XGL_ShapeError(near_sum, n - far_n[c]);
-        gain = whole - near_error - XGL_ShapeError(far_sum[c], far_n[c]);
+        gain = whole - near_error - far_error[c];
         if (gain > single->total) { single->total = single->gain = gain; single->d = (float)c; }
         for (w = 2; w <= XGL_SHAPE_BAND; ++w) {
             other = c + w;
@@ -524,7 +554,7 @@ static void XGL_ShapeFamily (int family, int low, int high, xgl_shape_cut_t *sin
             if (far_n[other] < 2 * XGL_SHAPE_LEAST || far_n[c] - far_n[other] < 2) continue;
             for (k = 0; k < 4; ++k) middle[k] = far_sum[c][k] - far_sum[other][k];
             gain = whole - near_error - XGL_ShapeError(middle, far_n[c] - far_n[other]) -
-                   XGL_ShapeError(far_sum[other], far_n[other]);
+                   far_error[other];
             if (gain > band->total) {
                 band->total = gain; band->gain = gain * .5;
                 band->d = (float)c; band->d2 = (float)other;
@@ -885,7 +915,7 @@ static xgl_shape_node_t *XGL_ShapeAnalyse (const byte *texels, int width, int he
     xgl_shape_node_t *nodes, *node;
     const byte *color;
     unsigned int *texel, *row;
-    double *table, *above, run[4];
+    double *table, *above;
     void *memory;
     float near_width, far_width;
     size_t texel_bytes, row_bytes, table_bytes, span_bytes;
@@ -902,8 +932,9 @@ static xgl_shape_node_t *XGL_ShapeAnalyse (const byte *texels, int width, int he
     xgl_shape.row = (unsigned int (*)[4])((byte *)memory + table_bytes + texel_bytes);
     xgl_shape.span = (short (*)[2])((byte *)memory + table_bytes + texel_bytes + row_bytes);
     xgl_shape.width = width; xgl_shape.height = height;
-    origin[0] = XGL_ShapeOrigin(texels, width, height, 0);
-    origin[1] = XGL_ShapeOrigin(texels, width, height, 1);
+    XGL_ShapeLines(texels, width, height);
+    origin[0] = XGL_ShapeOrigin(xgl_shape_columns, width, height);
+    origin[1] = XGL_ShapeOrigin(xgl_shape_rows, height, width);
     part = &xgl_shape.part[0];
     memset(part, 0, sizeof(*part));
     table = XGL_SHAPE_TABLE(0, 0);
@@ -913,23 +944,25 @@ static xgl_shape_node_t *XGL_ShapeAnalyse (const byte *texels, int width, int he
         sy = (y + origin[1]) % height;
         texel = XGL_SHAPE_TEXEL(0, y); row = XGL_SHAPE_ROW(0, y);
         table = XGL_SHAPE_TABLE(0, y + 1); above = XGL_SHAPE_TABLE(0, y);
-        run[0] = run[1] = run[2] = run[3] = 0;
         row[0] = row[1] = row[2] = row[3] = 0;
         table[0] = table[1] = table[2] = table[3] = 0;
+        sx = origin[0];
         for (x = 0; x < width; ++x, texel += 4, row += 4, table += 4, above += 4) {
-            sx = (x + origin[0]) % width;
             color = xgl_palette + 3 * texels[sy * width + sx];
+            if (++sx == width) sx = 0;
             texel[0] = color[0]; texel[1] = color[1]; texel[2] = color[2];
             texel[3] = (unsigned int)color[0] * color[0] + (unsigned int)color[1] * color[1] +
                        (unsigned int)color[2] * color[2];
+            /* The row so far is a whole number; the table adds it to the
+             * rows above. */
             for (c = 0; c < 4; ++c) {
                 row[4 + c] = row[c] + texel[c];
-                run[c] += texel[c];
-                table[4 + c] = above[4 + c] + run[c];
+                table[4 + c] = above[4 + c] + row[4 + c];
             }
         }
         XGL_SHAPE_SPANS(0)[y][0] = 0; XGL_SHAPE_SPANS(0)[y][1] = (short)width;
-        for (c = 0; c < 4; ++c) part->sum[c] += run[c];
+        /* row has come to the whole row's sums. */
+        for (c = 0; c < 4; ++c) part->sum[c] += row[c];
     }
     part->n = width * height;
     part->x1 = width; part->y1 = height; part->rect = 1;

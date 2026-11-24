@@ -217,12 +217,14 @@ frame with the most pieces, and each piece takes the color it has in the
 frame showing. The mesh is not built again as the texture changes.
 
 Examining the textures adds to the time a map takes to load, and the engine
-reports how long it took. No timing from the target machine is available
-yet: scaled from a development host, the estimate is 2 to 7 seconds for a
-map of the shareware episode on the SM61. Replayed off the machine on the
-same maps, walls cut this way cost about what they cost before: in views
-of `e1m1`, 1725 wall triangles a frame against 1785, with the mean color
-error against the full textures down from 9.9 to 9.4 of 255.
+reports how long it took. On the SM61 the 72 textures of `e1m3` and its
+item boxes, the map of `demo1`, took 5.3 seconds. The examination has since
+been made to do 43% less work for that map, and 35% less over the whole
+shareware episode, with the same result for every texture; that is counted
+on a development host and not yet timed again on the machine. Replayed off
+the machine on the same maps, walls cut this way cost about what they cost
+before: in views of `e1m1`, 1725 wall triangles a frame against 1785, with
+the mean color error against the full textures down from 9.9 to 9.4 of 255.
 
 ### Frame order
 
