@@ -4,6 +4,7 @@
  * GNU GPL version 2 or (at your option) any later version.
  */
 #include "quakedef.h"
+#include "xgl_render.h"
 #include "xgl_audio.h"
 #include "xgl_profile.h"
 #include "xgl_smp.h"
@@ -28,7 +29,8 @@ cvar_t r_wateralpha = {"r_wateralpha", "1", false, false, 0, NULL};
 cvar_t r_dynamic = {"r_dynamic", "1", false, false, 0, NULL};
 cvar_t r_novis = {"r_novis", "0", false, false, 0, NULL};
 extern cvar_t xgl_subdivide, xgl_detailtris, xgl_detaildistance, xgl_detailbuild;
-extern cvar_t xgl_detailerror, xgl_detailface, xgl_detailedge;
+extern cvar_t xgl_detailerror, xgl_detailface, xgl_detailedge, xgl_detaildensity;
+extern cvar_t xgl_shapes;
 void V_SetContentsColor(int contents);
 
 void R_InitTextures (void)
@@ -67,6 +69,8 @@ static void XGL_TimeRefresh_f (void)
     }
     elapsed = Sys_FloatTime() - start;
     r_refdef.viewangles[1] = angle;
+    /* Those frames cleared the status bar away without drawing one. */
+    Sbar_Changed();
     if (elapsed > 0) Con_Printf("%f seconds (%f fps)\n", elapsed, 128 / elapsed);
 }
 
@@ -89,6 +93,8 @@ void R_Init (void)
     Cvar_RegisterVariable(&xgl_detailerror);
     Cvar_RegisterVariable(&xgl_detailface);
     Cvar_RegisterVariable(&xgl_detailedge);
+    Cvar_RegisterVariable(&xgl_detaildensity);
+    Cvar_RegisterVariable(&xgl_shapes);
     Cmd_AddCommand("timerefresh", XGL_TimeRefresh_f);
     Cmd_AddCommand("pointfile", R_ReadPointFile_f);
     XGL_TextureInit();
@@ -221,5 +227,7 @@ void R_RenderView (void)
 void D_FlushCaches (void)
 {
     XGL_AliasFinishFrame();
-    XGL_WorldShutdown();
+    /* The map's faces are about to go. What is known of its textures stays
+     * for the next map, which may have them too. */
+    XGL_WorldFlush();
 }

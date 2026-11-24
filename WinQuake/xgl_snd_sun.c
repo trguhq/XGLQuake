@@ -29,6 +29,7 @@ slow graphics frames do not impose the original 1024-byte write limit.
 #include <errno.h>
 #include <string.h>
 #include "quakedef.h"
+#include "xgl_render.h"
 #include "xgl_audio.h"
 #include "xgl_profile.h"
 

@@ -19,7 +19,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 /* xgl_texture.c: bounded CPU indexed materials, never XGL texture objects. */
 #include "quakedef.h"
-#include "xgl_local.h"
+#include "xgl_render.h"
 #include "xgl_audio.h"
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +33,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 typedef struct {
     char name[XGL_MATERIAL_NAME];
     int width, height;
-    qboolean alpha, has_alpha, map_owned;
+    /* map_owned: loaded for the map, not for a model that outlives it.
+     * map_stale: of a map that is going, and not asked for again yet. */
+    qboolean alpha, has_alpha, map_owned, map_stale;
     byte *pixels, *filtered;
     size_t filter_bytes, filter_offset[XGL_FILTER_LEVELS];
     int filter_levels, filter_attempted;
@@ -47,6 +49,7 @@ static unsigned int xgl_material_revision;
 /* Called by the model loader; alias/cache and startup materials remain live. */
 void XGL_TextureMarkMap (int id);
 void XGL_TextureClearMap (void);
+void XGL_TextureSweepMap (void);
 
 void XGL_TextureInit (void)
 {
@@ -67,24 +70,50 @@ void XGL_TextureShutdown (void)
 
 void XGL_TextureMarkMap (int id)
 {
-    if (id > 0 && id <= XGL_MAX_MATERIALS && xgl_materials[id-1].pixels)
+    if (id > 0 && id <= XGL_MAX_MATERIALS && xgl_materials[id-1].pixels) {
         xgl_materials[id-1].map_owned = true;
+        xgl_materials[id-1].map_stale = false;
+    }
 }
 
+/* A map is going. Its materials are kept while the next one loads: one
+ * that is asked for again, the same texels under the same name, stays as
+ * it is, with its reduced images and its revision, so that whatever was
+ * worked out from it still holds. Most of a map's textures are the last
+ * map's too, and all of them when it is the same map again. */
 void XGL_TextureClearMap (void)
 {
     int i;
+    for (i = 0; i < XGL_MAX_MATERIALS; ++i)
+        if (xgl_materials[i].pixels && xgl_materials[i].map_owned)
+            xgl_materials[i].map_stale = true;
+}
+
+/* Release the going map's materials that were not asked for again, all but
+ * `keep`: when the new map has loaded, or sooner if their room or their
+ * places are wanted. Returns how many went. */
+static int XGL_ReleaseStaleMaterials (const xgl_material_t *keep)
+{
     xgl_material_t *material;
+    int i, released;
+    released = 0;
     for (i = 0; i < XGL_MAX_MATERIALS; ++i)
     {
         material = &xgl_materials[i];
-        if (!material->pixels || !material->map_owned)
+        if (!material->pixels || !material->map_owned || !material->map_stale || material == keep)
             continue;
         xgl_material_bytes -= (size_t)material->width * material->height + material->filter_bytes;
         free (material->pixels);
         free (material->filtered);
         memset (material, 0, sizeof(*material));
+        ++released;
     }
+    return released;
+}
+
+void XGL_TextureSweepMap (void)
+{
+    XGL_ReleaseStaleMaterials (NULL);
 }
 
 /* Filtering is an optional cache. Indexed assets always have priority within
@@ -134,16 +163,27 @@ int XGL_LoadTexture (char *identifier, int width, int height, byte *data,
             break;
         }
     }
+    if (slot < 0 && XGL_ReleaseStaleMaterials (NULL))
+    {
+        /* The going map's leftovers held every place. */
+        for (i = 0; i < XGL_MAX_MATERIALS && slot < 0; ++i)
+            if (!xgl_materials[i].pixels) slot = i;
+    }
     if (slot < 0)
     {
         Sys_Error ("XGL_LoadTexture: %d CPU material slots exhausted", XGL_MAX_MATERIALS);
         return 0;
     }
     material = &xgl_materials[slot];
+    /* Whoever asks for a material has it: the map's loader says so again
+     * for its own, and nobody else's is released with a map. */
+    material->map_owned = material->map_stale = false;
     previous = material->pixels ? (size_t)material->width * material->height : 0;
     if (previous == pixels && material->width == width && material->height == height &&
         material->alpha == alpha && !memcmp(material->pixels, data, pixels))
         return slot + 1;
+    if (xgl_material_bytes - previous - material->filter_bytes > XGL_MATERIAL_BYTES - pixels)
+        XGL_ReleaseStaleMaterials (material);
     if (xgl_material_bytes - previous - material->filter_bytes > XGL_MATERIAL_BYTES - pixels)
         XGL_ClearTextureFilters();
     if (xgl_material_bytes - previous - material->filter_bytes > XGL_MATERIAL_BYTES - pixels)
@@ -234,6 +274,21 @@ qboolean XGL_TextureHasAlpha(int id)
     return xgl_materials[id-1].has_alpha;
 }
 
+/* The palette indices of a material's texels, top row first, with its size;
+ * NULL when there is no such material or it has transparent texels. For
+ * work that reads every texel. They stay valid until the material is next
+ * loaded or released. */
+const byte *XGL_TextureTexels(int id, int *width, int *height)
+{
+    xgl_material_t *material;
+    if (id <= 0 || id > XGL_MAX_MATERIALS) return NULL;
+    material = &xgl_materials[id-1];
+    if (!material->pixels || material->has_alpha) return NULL;
+    if (width) *width = material->width;
+    if (height) *height = material->height;
+    return material->pixels;
+}
+
 /* RGB averages never interpolate palette indices. Every level covers the
  * complete repeating image; odd final rows/columns are included. */
 static void XGL_BuildTextureFilter(xgl_material_t *material)
@@ -242,8 +297,8 @@ static void XGL_BuildTextureFilter(xgl_material_t *material)
     int width, height, next_width, next_height, level, x, y, c;
     int sx, sy, x0, x1, y0, y1, count, index, block, weight, wx, wy;
     unsigned int sum;
-    const byte *source;
-    byte *target;
+    const byte *source, *first, *second;
+    byte *target, *out;
     if (material->filter_attempted) return;
     material->filter_attempted = 1;
     width = material->width; height = material->height;
@@ -265,6 +320,38 @@ static void XGL_BuildTextureFilter(xgl_material_t *material)
         block = 1 << level;
         offset = material->filter_offset[level];
         target = material->filtered + offset;
+        if (!(width & 1) && !(height & 1) &&
+            width * block == material->width && height * block == material->height) {
+            /* Every cell here stands for as many texels as every other, and
+             * each new cell takes four whole ones: their plain mean is the
+             * weighted one, rounded the same way. All but the last levels
+             * of an ordinary texture are made here. */
+            first = source; out = target;
+            for (y = 0; y < next_height; ++y) {
+                if ((y & 31) == 0) XGL_AudioUpdate();
+                if (level) {
+                    second = first + (size_t)width * 3;
+                    for (x = 0; x < next_width; ++x, first += 6, second += 6, out += 3) {
+                        out[0] = (byte)((first[0] + first[3] + second[0] + second[3] + 2) >> 2);
+                        out[1] = (byte)((first[1] + first[4] + second[1] + second[4] + 2) >> 2);
+                        out[2] = (byte)((first[2] + first[5] + second[2] + second[5] + 2) >> 2);
+                    }
+                    first = second;
+                } else {
+                    second = first + width;
+                    for (x = 0; x < next_width; ++x, first += 2, second += 2, out += 3) {
+                        const byte *a = xgl_palette + first[0] * 3, *b = xgl_palette + first[1] * 3;
+                        const byte *c2 = xgl_palette + second[0] * 3, *d = xgl_palette + second[1] * 3;
+                        out[0] = (byte)((a[0] + b[0] + c2[0] + d[0] + 2) >> 2);
+                        out[1] = (byte)((a[1] + b[1] + c2[1] + d[1] + 2) >> 2);
+                        out[2] = (byte)((a[2] + b[2] + c2[2] + d[2] + 2) >> 2);
+                    }
+                    first = second;
+                }
+            }
+            source = target; width = next_width; height = next_height;
+            continue;
+        }
         for (y = 0; y < next_height; ++y) {
             if ((y & 31) == 0) XGL_AudioUpdate();
             y0 = y * 2; y1 = y0 + 2; if (y1 > height) y1 = height;

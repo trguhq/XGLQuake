@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "quakedef.h"
+#include "xgl_render.h"
 #include "xgl_profile.h"
 #include "xgl_smp.h"
 

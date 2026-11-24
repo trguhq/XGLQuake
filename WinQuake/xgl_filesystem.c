@@ -1,5 +1,6 @@
 /* Shareware data compatibility for XGLQuake. GPL-2.0-or-later. */
 #include "quakedef.h"
+#include "xgl_render.h"
 
 int XGL_CheckPackDirectory(const char *path, int count, unsigned short crc)
 {

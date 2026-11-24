@@ -68,7 +68,7 @@ requires builds and readback checks against those installed SDKs/runtimes.
 
 ## Run
 
-Version 0.9.3 defaults to the **quick** profile at **320x240**, with a one-minute
+Version 0.9.6 defaults to the **quick** profile at **320x240**, with a one-minute
 elapsed-time limit:
 
 ```sh
@@ -220,6 +220,7 @@ Options:
 | `-csv PATH` | Save machine-readable results as well as the terminal report. |
 | `-display DISPLAY` | Select an X display. Local DGA is the intended path. |
 | `-allow-fallback` | Permit a software/non-DGA configuration for diagnosis. |
+| `-no-error-detection` | Leave XGL's own argument checking off for the run; see [XGL error detection](#xgl-error-detection). |
 | `-list` | List selected case names without opening a display. |
 | `-help` | Print usage without opening a display. |
 
@@ -433,6 +434,11 @@ selected only by `-test` or `-extralong`. Each prints its finding on the
 | `probe/lighting/lit-lights-off-1`, `-4` | What does per-vertex illumination cost with only ambient light, and does the number of allocated but switched-off lights matter? | Compare with `unlit-normal-points` and with each other. |
 | `probe/lighting/lit-directional-1`, `lit-point-1`, `lit-point-4` | Cost of static directional and positional lights. | Compare with `lit-lights-off-*`. |
 | `probe/state/lit-unlit-grouped`, `-alternating` | Price of changing between lit and unlit state within a frame. | Both draw half the batches unlit. The `render_ms` difference divided by the difference in state changes (in the notes) is the cost of one change. |
+| `probe/mesh/polygons` | Baseline for the mesh rows below: a mesh of 2,048 small triangles shaded between vertex colors, each triangle on its own, 256 to a call. This is how the renderer submits triangles. | Reference `render_ms`. All eight draw the same triangles with the same colors. |
+| `probe/mesh/triangle-list` | Is one `xgl_triangle_list` of independent triangles per 256 quicker than 256 polygons? | Compare with `polygons`. The point data is the same size. |
+| `probe/mesh/strips-8`, `strips-32` | Do triangle strips pay? Strips of at most 8 and 32 triangles; a strip of n triangles sends n+2 points instead of 3n. | Compare with `polygons`. The note gives the points and calls per frame. |
+| `probe/mesh/polygons-8`, `triangle-list-8` | What does a call cost in itself? The same polygons and the same list, 8 triangles to a call: 256 calls a frame instead of 8, with the same points. | Compare each with its row at 256 to a call. The difference is the price of 248 more calls. |
+| `probe/mesh/strips-2`, `strips-4` | How short may a strip be and still pay? Strips of 2 and 4 triangles: 1,024 and 512 calls a frame, and 2 and 1.5 points a triangle. | Compare with `polygons`, and with the longer strips to see what a strip call costs. |
 | `probe/persist/depth-only-clear` | Does an undrawn region survive buffer switches when frames clear only Z? | PASS means it did, on both buffers. Timed work is a Z-only clear. |
 | `probe/persist/viewport-clear` | Do geometry and a color+Z clear stay inside a reduced DC viewport? | PASS means both did. Timed work is the clear within the 80% viewport; compare with `overhead/color-depth-clear`. A validation failure names the first check that failed. |
 | `probe/swap/interval` | How long is a buffer switch, and where is the delay? | The note gives the period between 200 consecutive switches (the retrace period if switches wait for retrace) and the median time in the switch call and in the following completion wait. |
@@ -453,6 +459,64 @@ If that fails to compile in `xglbench_xgl.c`, rebuild with plain `make`.
 
 The two switch probes clear both buffers first, so the window stays black
 instead of flickering between leftover images.
+
+The mesh probes shade strips and triangle lists between vertex colors, which
+no other case does. Each first passes the usual single-triangle readback of
+a mixture of three corner colors, then draws its mesh once as independent
+polygons and once its own way and reads both pictures back at the same 48
+pixels. A device that takes the call differently fails validation, naming
+the first pixel that differs, and is not timed. Run them on their own: about
+four seconds of drawing in all, and about thirty seconds with the usual rests
+between cases:
+
+```sh
+./xglbench -medium -winsize 320 240 -test probe/mesh -csv zx-mesh.csv >zx-mesh.txt 2>&1
+```
+
+After the table, the findings read the mesh rows together:
+
+```text
+  Mesh probe, render microseconds a triangle (medians of the trials): polygons ..., strips-32 ....
+  A polygon call costs about ... microseconds beyond its triangles (8 against 256 to a call).
+  A triangle-list call costs about ... microseconds beyond its triangles (8 against 256 to a call).
+  A strip call costs about ... microseconds beyond its triangles (strips of 2 against strips of 4), and about ... among longer strips (8 against 32).
+  Strips are quicker than polygons, 256 to a call, from ... triangles to a strip.
+  Strips are quicker than a triangle list, 256 to a call, from ... triangles to a strip.
+```
+
+The first line is each row's `render_ms` divided by its 2,048 triangles. The
+rest take the time of a triangle sent k to a call to be a fixed part plus the
+call's own cost shared among the k, so that two rows of one kind give both
+parts. A strip call's cost includes the two points it repeats. If the two
+figures for a strip call differ much, the short strips are held up by the
+calls and the long ones by something else, usually the device.
+
+The last two lines give the shortest strip that is quicker than sending its
+triangles the other way, which is what a renderer needs in order to decide
+when a run of connected triangles is worth a strip call. Lengths that were
+not measured are read between the nearest two that were; a strip of one
+triangle is carried down from strips of 2 and 4, and the report says so. Where
+the trials of the other way disagree about the length, both answers follow in
+brackets. These are fits through the medians of a few short trials: read them
+with the `trial-mean range` of each row, and repeat the run before relying on
+a difference of one triangle.
+
+### XGL error detection
+
+The game, and this benchmark by default, switch on
+`XGL_SYS_ST_ERROR_DETECTION`, which asks XGL to check the arguments of its
+calls. XGL leaves it off unless asked. `-no-error-detection` leaves it off
+for the run, so that what the checking costs can be seen; the benchmark's
+own readback checks stay, and the report's header says which way the run
+was made. Run the mesh probe both ways, one after the other:
+
+```sh
+./xglbench -medium -repeats 3 -winsize 320 240 -test probe/mesh -csv zx-errors-on.csv >zx-errors-on.txt 2>&1
+./xglbench -medium -repeats 3 -winsize 320 240 -test probe/mesh -no-error-detection -csv zx-errors-off.csv >zx-errors-off.txt 2>&1
+```
+
+and compare the `render_ms` and the `CPU ... ms/frame` of the same rows. A
+difference smaller than a row's `trial-mean range` is not one.
 
 Run the probes with the existing cases they are compared against:
 
@@ -989,7 +1053,9 @@ results cannot be labeled with the old dimensions.
 A separate `build/xglbench-profile-test` uses a simulated clock to check all
 profile selections, mandatory idle scheduling, fixed limits despite option
 overrides, and rejection of interrupted results without waiting through full
-runs. Watchdog tests exercise real alarm delivery, the ten-second grace timer,
+runs. The same clock is charged pretended costs for a point and a call, so
+that what the findings make of the mesh probes can be checked against known
+answers. Watchdog tests exercise real alarm delivery, the ten-second grace timer,
 and forced process exit even when standard error is a full, unread pipe.
 
 On a modern development host, `make syntax-check` checks C syntax and selected
@@ -1008,6 +1074,10 @@ rejection of setup or rendering failures, without allowing UI raster copies.
 A scalar
 color/depth model also injects clear, blending, depth and readback faults to
 verify that the new correctness gates reject them and restore drawing state.
+A model device that keeps the triangles it is given checks that the mesh
+probes submit the strips, lists and calls they report, and that one which draws a
+strip as separate triangles, a list as a strip, without interpolation, or
+not at all is rejected.
 This separate target uses GNU-compatible
 section garbage collection to link only the tested backend functions; it
 does not require or emulate the XGL runtime and is not a Solaris build target.

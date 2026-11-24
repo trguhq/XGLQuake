@@ -4,13 +4,21 @@ XGLQuake ports WinQuake 1.06 to Sun XGL on Solaris, targeting a SPARCstation
 10 with a 60 MHz SM61 processor, 64 MB RAM, and Sun ZX (Leo) graphics. It
 approximates textures with sampled-color polygons and draws the HUD and menus
 with native XGL text and geometry. A similar approach can be seen at
-[testglobe.dev](https://testglobe.dev/web).
+[testglobe.dev](https://testglobe.dev/web). XGLQuake originated as a port
+specifically for the ZX graphics card, so texture mapping is not supported yet 
+but it will be added for Sun hardware that supports it.
+
+The approximation done on the ZX with smooth-shaded polygons is very imperfect
+compared to true texture mapping. This is inevitable to a degree but is being refined.
+The intent here is provide software demonstrating 3D hardware that has very little
+other software available. That it runs in a playable manner would be a bonus. It
+does achieve approximately 15 FPS at 640x480 on the test system.
 
 ## Quick start
 
 ### Build
 
-Install GNU make, GCC (for example [tgcware](https://jupiterrise.com/tgcware/sunos5.6_sparc/stable/)), the [Sun XGL SDK](https://archive.org/details/xgl-solaris2.6), and OpenWindows development files.
+Install GNU make (tested on 3.8.2), GCC (tested on 4.3.6, for example from [tgcware](https://jupiterrise.com/tgcware/sunos5.6_sparc/stable/)), the [Sun XGL SDK](https://archive.org/details/xgl-solaris2.6), and OpenWindows development files.
 From the repository root:
 
 ```sh
@@ -47,9 +55,13 @@ locations and shareware restrictions.
 | `-winsize 640 480` | Set the window size. |
 | `+_snd_mixahead 0.3` | Buffer 0.3 seconds of audio; see [audio](#solaris-audio-and-hardware-interfaces). |
 | `+xgl_alias_subdivide 0` | Keep original model triangles without extra subdivision. |
+| `+xgl_alias_strips 0` | Send every model triangle separately. By default runs of four and more go out as triangle strips. |
 | `+xgl_smp 0` | Select serial vertex preparation. The default detects multiple CPUs. Use 1 to request a helper. |
 | `+xgl_detailtris 2048` | Set the detailed world triangle allowance; complete coarse faces remain. |
 | `+xgl_detailerror 16` | Set how much a texture or shadow must differ before it is given more triangles; larger is coarser. |
+| `+xgl_detaildensity 160` | Set how many triangles a face may have for its apparent size; 0 gives every face the same limit. |
+| `+xgl_shapes 0` | Draw every wall as a smooth mesh. By default walls whose textures have clear shapes are cut along them; see [texture shapes](docs/render.md#texture-shapes). |
+| `+xgl_keepbar 0` | Clear and redraw the status bar every frame. By default an unchanged bar is left in place in small windows. |
 | `+xgl_profile 0` | Disable profiling for FPS measurements. Use 1 for summary timings or 2 for detail. |
 
 More detail draws more triangles and costs frame rate: a larger
@@ -92,16 +104,23 @@ on the Sun ZX, and how the renderer uses it, is in
 The existing Solaris main allocates a 16 MiB engine heap. World geometry
 cache storage is capped at another 8 MiB, CPU material pixels and optional
 filter levels at another 8 MiB, and alias color caches at 1 MiB. The alias
-normal/topology cache, its fixed entry table and reusable work array together
-are capped at another 1 MiB. The XGL audio ring is 32 KiB, building world
-meshes uses about 0.35 MiB of fixed scratch space, and a multiprocessor
-worker adds about 0.75 MiB.
+mesh cache, its fixed entry table, the normal tables and the reusable work
+array together are capped at another 1 MiB. The XGL audio ring is 32 KiB,
+building world meshes uses about 0.35 MiB of fixed scratch space, and a
+multiprocessor worker adds about 0.75 MiB. Cutting walls along
+[texture shapes](docs/render.md#texture-shapes) uses another 0.25 MiB of
+fixed scratch space and keeps about 3 KiB for each texture that has shapes;
+examining a texture borrows memory while a map loads, 0.3 MiB for one of 64
+texels square and about 4 MiB for the largest examined, 256 square.
 Native contexts, window buffers, program data and
 library allocations are additional. These limits are not a measurement of
 total process memory.
 A full world cache releases detailed meshes that have not been drawn recently
 and otherwise falls back to complete coarse faces; exceeding the CPU material
-limit reports an error rather than silently dropping assets.
+limit reports an error rather than silently dropping assets. While a map
+loads, the textures of the map before are still held within that limit, so
+that those both maps have need not be prepared twice; they are released
+first if the limit is reached.
 
 ### Solaris audio and hardware interfaces
 
@@ -118,9 +137,6 @@ the mixer during rendering and cache preparation, at most every 25 ms. Its
 default 0.3-second lookahead trades some sound latency for tolerance of long
 frames. A single blocking graphics call longer than the queued audio can
 still cause a gap; this is not an independent audio thread.
-
-An existing `config.cfg` may restore `_snd_mixahead 0.1`. The commands in
-this document pass `+_snd_mixahead 0.3` so that a run does not depend on it.
 
 ## More documentation
 

@@ -33,6 +33,13 @@ static float test_ambient;
 static byte material_pixels[16 * 16];
 static xgl_native_vertex_t reserved_vertices[XGL_ENTITY_BATCH_VERTICES];
 static int reserved_count, reserved_lit, reserve_calls, prepare_calls;
+/* Records submitted without normals are captured with a zero normal and
+ * flagged; plain_capture marks the capture in progress as such. */
+static xgl_color_vertex_t reserved_plain[XGL_ENTITY_BATCH_VERTICES];
+static byte captured_plain[4096];
+static int reserved_plain_count, plain_capture, plain_submissions;
+/* Triangle strips as submitted: how many, their points, and each one's. */
+static int strip_calls, strip_points, strip_log[64];
 static int reserve_limit = XGL_ENTITY_BATCH_VERTICES;
 static void capture_reserved(void);
 static unsigned long profile_counts[XGL_PROFILE_COUNTER_COUNT];
@@ -221,7 +228,9 @@ void XGL_DrawTriangles(const xgl_vertex_t *vertices, int count, int lit,
     }
     ++draw_calls;
     for (i = 0; i < count; ++i) {
-        assert(fabs(DotProduct(vertices[i].normal, vertices[i].normal) - 1) < .0001);
+        if (plain_capture) assert(!lit && !DotProduct(vertices[i].normal, vertices[i].normal));
+        else assert(fabs(DotProduct(vertices[i].normal, vertices[i].normal) - 1) < .0001);
+        captured_plain[captured_count] = (byte)plain_capture;
         captured[captured_count++] = vertices[i];
     }
 }
@@ -237,6 +246,20 @@ static void capture_reserved(void)
 {
     xgl_vertex_t vertices[XGL_ENTITY_BATCH_VERTICES];
     int i, count;
+    count = reserved_plain_count;
+    if (count) {
+        assert(!reserved_count);
+        reserved_plain_count = 0;
+        memset(vertices, 0, sizeof(vertices));
+        for (i = 0; i < count; ++i) {
+            VectorCopy(reserved_plain[i].position, vertices[i].position);
+            VectorCopy(reserved_plain[i].color.rgb, vertices[i].color);
+        }
+        plain_capture = 1;
+        XGL_DrawTriangles(vertices, count, 0, 1, 1);
+        plain_capture = 0;
+        return;
+    }
     count = reserved_count;
     if (!count) return;
     reserved_count = 0;
@@ -246,6 +269,17 @@ static void capture_reserved(void)
         VectorCopy(reserved_vertices[i].color.rgb, vertices[i].color);
     }
     XGL_DrawTriangles(vertices, count, reserved_lit, 1, 1);
+}
+
+xgl_color_vertex_t *XGL_ReserveColorTriangles(int *count, float opacity, int zwrite)
+{
+    capture_reserved();
+    assert(*count > 0 && *count % 3 == 0 && opacity == 1 && zwrite == 1);
+    if (expect_alias_lock) assert(audio_lock_depth > 0);
+    if (*count > reserve_limit) *count = reserve_limit;
+    reserved_plain_count = *count;
+    ++reserve_calls;
+    return reserved_plain;
 }
 
 xgl_native_vertex_t *XGL_ReserveTriangles(int *count, int lit, float opacity, int zwrite)
@@ -307,6 +341,46 @@ void XGL_DrawNativeTriangles(const xgl_native_vertex_t *vertices, int count,
     ++native_submissions;
 }
 
+void XGL_DrawColorTriangles(const xgl_color_vertex_t *vertices, int count,
+                            float opacity, int zwrite)
+{
+    int i;
+    assert(!worker_running && count > 0 && count % 3 == 0);
+    assert(opacity == 1 && zwrite == 1);
+    capture_reserved();
+    assert(captured_count + count <= 4096);
+    for (i = 0; i < count; ++i) {
+        memset(&captured[captured_count], 0, sizeof(captured[0]));
+        VectorCopy(vertices[i].position, captured[captured_count].position);
+        VectorCopy(vertices[i].color.rgb, captured[captured_count].color);
+        captured_plain[captured_count++] = 1;
+    }
+    native_lit = 0;
+    ++native_submissions; ++plain_submissions;
+}
+
+/* A strip is captured as the triangles it draws: each point after the
+ * second with the two before it. */
+void XGL_DrawColorStrip(const xgl_color_vertex_t *points, int count,
+                        float opacity, int zwrite)
+{
+    int i, j;
+    assert(!worker_running && count >= 3 && count <= XGL_ALIAS_STRIP_POINTS);
+    assert(opacity == 1 && zwrite == 1);
+    capture_reserved();
+    assert(captured_count + 3 * (count - 2) <= 4096);
+    for (i = 0; i + 2 < count; ++i)
+        for (j = 0; j < 3; ++j) {
+            memset(&captured[captured_count], 0, sizeof(captured[0]));
+            VectorCopy(points[i + j].position, captured[captured_count].position);
+            VectorCopy(points[i + j].color.rgb, captured[captured_count].color);
+            captured_plain[captured_count++] = 1;
+        }
+    if (strip_calls < 64) strip_log[strip_calls] = count;
+    ++strip_calls; strip_points += count;
+    native_lit = 0;
+}
+
 static void reset_test(void)
 {
     int i;
@@ -335,6 +409,9 @@ static void reset_test(void)
     /* Most contracts were written against native illumination, which also
      * outputs the world normals they check. CPU shading has its own test. */
     xgl_alias_shade.value = 0;
+    /* Models go out as separate triangles except in the tests of strips. */
+    xgl_alias_strips.value = 0;
+    strip_calls = strip_points = 0;
     test_ambient = 1; r_dynamic.value = 1;
     memset(cl_dlights, 0, sizeof(cl_dlights));
     prepared_draws = brush_lights = brush_draws = 0;
@@ -346,8 +423,8 @@ static void reset_test(void)
     xgl_entity_extra_used = 0;
     captured_count = native_lit = material_seen = coverage_mode = 0;
     sample_calls = draw_calls = normalizations = 0; test_light = 128; material_revision = 1;
-    assert(!reserved_count);
-    reserved_lit = reserve_calls = prepare_calls = 0;
+    assert(!reserved_count && !reserved_plain_count);
+    reserved_lit = reserve_calls = prepare_calls = plain_submissions = 0;
     reserve_limit = XGL_ENTITY_BATCH_VERTICES;
     memset(profile_counts, 0, sizeof(profile_counts));
     assert(!profile_draw_active && !profile_draw_depth);
@@ -922,14 +999,29 @@ static void compare_capture(const xgl_vertex_t *expected, int count)
     }
 }
 
-static void test_alias_pose_cache_equivalence(void)
+/* The one topology a test has made, if it has made one. */
+static xgl_alias_topology_t *only_topology(void)
+{
+    xgl_alias_topology_t *found;
+    int i;
+    found = NULL;
+    for (i = 0; i < XGL_ALIAS_TOPOLOGY_SLOTS; ++i) {
+        if (!xgl_alias_topologies[i].indices) continue;
+        assert(!found);
+        found = &xgl_alias_topologies[i];
+    }
+    return found;
+}
+
+static void test_alias_cached_mesh_equivalence(void)
 {
     xgl_vertex_t expected[192];
     aliashdr_t *header;
     trivertx_t *pose;
     entity_t *entity;
+    xgl_alias_topology_t *topology;
     unsigned long hits;
-    int i, depth, fan, count;
+    int i, depth, fan, count, middles;
     for (fan = 0; fan < 2; ++fan) {
         for (depth = 0; depth <= 2; ++depth) {
             reset_test();
@@ -953,35 +1045,54 @@ static void test_alias_pose_cache_equivalence(void)
             assert(count == 12 * (1 << (2 * depth)));
             memcpy(expected, captured, (size_t)count * sizeof(*expected));
             captured_count = 0; xgl_entity_extra_used = 0;
-            XGL_DrawAlias(entity); /* build normal/topology cache */
+            XGL_DrawAlias(entity); /* build the topology and the normals for this scale */
             compare_capture(expected, count);
+            topology = only_topology();
+            assert(topology && profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_MISSES] == 1);
+            /* The commands of a strip or fan name every vertex once; each
+             * edge has one middle, whichever of its two triangles asks. */
+            assert(topology->base_points == 6 && topology->point_count <= topology->vertex_count);
+            middles = topology->point_count - topology->base_points;
+            if (depth == 0) assert(middles == 0);
+            if (depth == 1) assert(middles == 9);
             captured_count = 0; normalizations = 0; xgl_entity_extra_used = 0;
             XGL_DrawAlias(entity);
             compare_capture(expected, count);
-            assert(!normalizations && profile_counts[XGL_PROFILE_ALIAS_POSE_HITS] == 1);
+            /* Nothing of a pose is kept. The device is given unit normals,
+             * so each middle's is brought to length; the model's own come
+             * from the table made for its scale. */
+            assert(normalizations == middles);
+            assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_HITS] == 1);
+            assert(profile_counts[XGL_PROFILE_ALIAS_POINTS] == 2 * (unsigned long)topology->point_count);
 
-            /* Reuse across live position bytes, origins, rotations and model
-             * offsets. Neither the key nor cached geometry owns positions. */
-            hits = profile_counts[XGL_PROFILE_ALIAS_POSE_HITS];
+            /* The same mesh for any position bytes, normals, origin, rotation
+             * and model offset: it owns none of them. */
+            hits = profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_HITS];
             pose[0].v[0] += 17;
+            pose[2].lightnormalindex = 77;
             header->scale_origin[2] += 9;
             entity->origin[1] += 33; entity->angles[1] += 81;
             captured_count = 0; normalizations = 0; xgl_entity_extra_used = 0;
             test_light = 73;
             XGL_DrawAlias(entity);
-            assert(!normalizations && profile_counts[XGL_PROFILE_ALIAS_POSE_HITS] == hits + 1);
+            assert(normalizations == middles && only_topology() == topology);
+            assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_HITS] == hits + 1);
+            assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_MISSES] == 1);
             memcpy(expected, captured, (size_t)count * sizeof(*expected));
             captured_count = 0; xgl_entity_extra_used = 0; material_revision = 0;
             XGL_DrawAlias(entity); /* independent recursive reference */
             compare_capture(expected, count);
             material_revision = 1;
 
-            /* Scale and changed normal indices must invalidate the entry;
-             * zero scale keeps the fallback's unscaled-normal convention. */
+            /* Another scale has other normals, made once; zero scale keeps
+             * the fallback's unscaled-normal convention. */
             header->scale[0] = 0; pose[1].lightnormalindex = 4;
             captured_count = 0; normalizations = 0; xgl_entity_extra_used = 0;
             XGL_DrawAlias(entity);
-            assert(normalizations > 0);
+            assert(normalizations == XGL_VERTEX_NORMALS + middles);
+            captured_count = 0; normalizations = 0; xgl_entity_extra_used = 0;
+            XGL_DrawAlias(entity);
+            assert(normalizations == middles);
             memcpy(expected, captured, (size_t)count * sizeof(*expected));
             captured_count = 0; xgl_entity_extra_used = 0; material_revision = 0;
             XGL_DrawAlias(entity);
@@ -1019,20 +1130,135 @@ static void test_alias_pose_canceling_normals(void)
     captured_count = 0; xgl_entity_extra_used = 0;
     XGL_DrawAlias(&cl_entities[1]);
     compare_capture(expected, 48);
-    captured_count = normalizations = 0; xgl_entity_extra_used = 0;
+    captured_count = 0; xgl_entity_extra_used = 0;
     XGL_DrawAlias(&cl_entities[1]);
     compare_capture(expected, 48);
-    assert(!normalizations);
     XGL_EntitiesShutdown();
 }
 
-static void test_alias_pose_cache_batching_and_limits(void)
+/* Two triangles on one edge of the model, which the skin has at two places:
+ * the commands name its ends twice, and the second time they lie the other
+ * way round on the skin. */
+static aliashdr_t *make_seam(void)
+{
+    static const float uv[6][2] = {{.1f, .5f}, {.3f, .5f}, {.2f, .8f}, {.7f, .5f}, {.9f, .5f}, {.8f, .2f}};
+    static const int model_vertex[6] = {0, 1, 2, 1, 0, 3};
+    static const byte place[4][3] = {{0, 0, 0}, {40, 0, 0}, {20, 30, 0}, {20, 0, 30}};
+    xgl_alias_identity_t *identity;
+    aliashdr_t *header;
+    trivertx_t *poses;
+    int *commands, *weld, *same;
+    int i, j;
+    memset(&alias_storage, 0, sizeof(alias_storage));
+    memset(&alias_model, 0, sizeof(alias_model));
+    header = (aliashdr_t *)alias_storage.bytes;
+    header->scale[0] = header->scale[1] = header->scale[2] = 1;
+    header->numposes = 1;
+    header->poseverts = 6;
+    header->numtris = 2;
+    header->numframes = header->numskins = 1;
+    header->frames[0].firstpose = 0;
+    header->frames[0].numposes = 1;
+    header->gl_texturenum[0][0] = header->gl_texturenum[0][1] = 10;
+    header->gl_texturenum[0][2] = header->gl_texturenum[0][3] = 10;
+    identity = (xgl_alias_identity_t *)((byte *)header + sizeof(*header));
+    header->commands = sizeof(*header) + sizeof(*identity);
+    commands = (int *)(identity + 1);
+    weld = commands + 15;
+    same = weld + 6;
+    header->posedata = header->commands + (15 + 12) * (int)sizeof(int);
+    poses = (trivertx_t *)((byte *)header + header->posedata);
+    commands[0] = commands[7] = 3;
+    commands[14] = 0;
+    for (i = 0; i < 6; ++i) {
+        memcpy(&commands[(i < 3 ? 1 : 8) + 2 * (i % 3)], uv[i], sizeof(uv[i]));
+        memcpy(poses[i].v, place[model_vertex[i]], 3);
+        poses[i].lightnormalindex = 5;
+        /* No two are at one place on the skin; four are two of the model's. */
+        weld[i] = i;
+        for (j = 0; model_vertex[j] != model_vertex[i]; ++j) {}
+        same[i] = j;
+    }
+    identity->magic = XGL_ALIAS_IDENTITY_MAGIC;
+    identity->generation = 78;
+    identity->words = 15 + 12;
+    identity->hash = XGL_AliasCommandHash(commands, identity->words);
+    assert(XGL_AliasIdentity(header) == identity);
+    strcpy(alias_model.name, "progs/soldier.mdl");
+    alias_model.type = mod_alias;
+    alias_model.radius = 400;
+    alias_model.cache.data = header;
+    cl_entities[1].model = &alias_model;
+    return header;
+}
+
+/* Where the normals of an edge's two ends cancel, its middle takes the
+ * normal of the end that is the earlier vertex of the model, from whichever
+ * triangle and by whichever way of drawing: here the two triangles on the
+ * edge have its ends in opposite orders on the skin. */
+static void test_alias_seam_canceling_normals(void)
+{
+    xgl_vertex_t expected[96];
+    aliashdr_t *header;
+    trivertx_t *pose;
+    xgl_alias_topology_t *topology;
+    vec3_t first, middle, delta;
+    int i, j, depth, opposite, count, found;
+    opposite = -1;
+    for (i = 0; i < XGL_VERTEX_NORMALS; ++i) {
+        if (r_avertexnormals[i][0] == -r_avertexnormals[0][0] &&
+            r_avertexnormals[i][1] == -r_avertexnormals[0][1] &&
+            r_avertexnormals[i][2] == -r_avertexnormals[0][2]) opposite = i;
+    }
+    assert(opposite >= 0);
+    for (depth = 1; depth <= 2; ++depth) {
+        reset_test();
+        header = make_seam();
+        pose = (trivertx_t *)((byte *)header + header->posedata);
+        pose[0].lightnormalindex = pose[4].lightnormalindex = 0;
+        pose[1].lightnormalindex = pose[3].lightnormalindex = (byte)opposite;
+        cl_entities[1].angles[0] = 71; cl_entities[1].angles[1] = 32;
+        xgl_alias_subdivide.value = (float)depth;
+        XGL_DrawAlias(&cl_entities[1]); /* by recursion */
+        count = 6 * (1 << (2 * depth));
+        assert(captured_count == count);
+        memcpy(expected, captured, (size_t)count * sizeof(expected[0]));
+        /* The first corner drawn is the model's first vertex, and the
+         * second lies along the edge: at its middle, or at depth 2 half way
+         * there. Every corner at the middle has the first vertex's normal:
+         * three from each triangle. */
+        VectorCopy(expected[0].normal, first);
+        for (j = 0; j < 3; ++j)
+            middle[j] = expected[0].position[j] + (expected[1].position[j] - expected[0].position[j]) * depth;
+        found = 0;
+        for (i = 0; i < count; ++i) {
+            VectorSubtract(expected[i].position, middle, delta);
+            if (DotProduct(delta, delta) > 1e-6) continue;
+            ++found;
+            for (j = 0; j < 3; ++j) assert(fabs(expected[i].normal[j] - first[j]) < 1e-5);
+        }
+        assert(found == 6);
+        for (i = 0; i < 2; ++i) {
+            captured_count = 0; xgl_entity_extra_used = 0;
+            XGL_DrawAlias(&cl_entities[1]); /* from the mesh */
+            compare_capture(expected, count);
+        }
+        /* Four vertices of the model, and the five edges between them. */
+        topology = only_topology();
+        assert(topology && topology->base_points == 4);
+        if (depth == 1) assert(topology->point_count == 9);
+        XGL_EntitiesShutdown();
+    }
+}
+
+static void test_alias_mesh_batching_and_limits(void)
 {
     aliashdr_t *header;
     trivertx_t *pose;
-    xgl_alias_pose_cache_t *cached_pose;
+    xgl_alias_topology_t *topology;
     xgl_alias_cache_t *colors;
-    int i, entries, calls, count;
+    size_t bytes;
+    int i, calls, count, middles;
     reset_test();
     header = make_alias(320);
     header->frames[0].numposes = 1;
@@ -1046,40 +1272,47 @@ static void test_alias_pose_cache_batching_and_limits(void)
     captured_count = draw_calls = 0; xgl_entity_extra_used = 0;
     XGL_DrawAlias(&cl_entities[1]);
     assert(captured_count == count && draw_calls == calls);
+    topology = only_topology();
+    /* A strip of 318 triangles has 637 edges, each with one middle, where
+     * the triangles between them name 954. */
+    assert(topology && topology->base_points == 320 && topology->vertex_count == 320 + 954);
+    middles = topology->point_count - topology->base_points;
+    assert(middles == 637);
     captured_count = draw_calls = normalizations = 0; xgl_entity_extra_used = 0;
     XGL_DrawAlias(&cl_entities[1]);
-    assert(captured_count == count && draw_calls == calls && !normalizations);
+    assert(captured_count == count && draw_calls == calls && normalizations == middles);
 
-    /* Shared topology now lets this model fill all pose slots within the
-     * byte budget. Changing position alone deliberately does not add poses. */
+    /* No pose adds anything to what is kept. */
+    bytes = xgl_alias_topology_bytes;
     pose = (trivertx_t *)((byte *)header + header->posedata);
-    for (i = 0; i < XGL_ALIAS_POSE_SLOTS + 4; ++i) {
+    for (i = 0; i < 40; ++i) {
         pose[0].lightnormalindex = (byte)i;
+        pose[i].v[1] = (byte)(i * 5);
         captured_count = 0; xgl_entity_extra_used = 0;
         XGL_DrawAlias(&cl_entities[1]);
-        assert(captured_count == count && xgl_alias_pose_bytes <= XGL_ALIAS_POSE_BYTES);
+        assert(captured_count == count && xgl_alias_topology_bytes == bytes);
     }
-    entries = 0;
-    for (i = 0; i < XGL_ALIAS_POSE_SLOTS; ++i)
-        if (xgl_alias_poses[i].normals) ++entries;
-    assert(entries == XGL_ALIAS_POSE_SLOTS);
-    assert(profile_counts[XGL_PROFILE_ALIAS_POSE_SLOT_EVICTIONS] > 0);
-    assert(profile_counts[XGL_PROFILE_ALIAS_POSE_BYTE_EVICTIONS] == 0);
+    assert(only_topology() == topology);
+    assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_MISSES] == 1);
+    assert(!profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_EVICTIONS]);
 
     /* A valid larger subdivision exceeds the fixed workspace. Decline it
      * without touching old cache storage; rendering uses its batched fallback. */
     colors = XGL_AliasColors(header, 10, 2, NULL);
     assert(colors);
-    cached_pose = XGL_AliasPose(header, pose, colors);
-    assert(!cached_pose);
+    assert(!XGL_AliasTopology(header, colors, 1));
+    assert(only_topology() == topology && xgl_alias_topology_bytes == bytes);
     XGL_EntitiesShutdown();
-    assert(xgl_alias_pose_bytes == XGL_ALIAS_FIXED_BYTES);
+    assert(xgl_alias_topology_bytes == XGL_ALIAS_FIXED_BYTES);
 }
 
-static void test_alias_pose_cache_allocation_failure(void)
+/* A topology is all there or not there at all, whichever of its requests
+ * for memory is refused; the model is drawn the long way meanwhile. */
+static void test_alias_mesh_allocation_failure(void)
 {
-    int failure;
-    for (failure = 0; failure < 5; ++failure) {
+    int failure, refused, built;
+    refused = built = 0;
+    for (failure = 0; failure < 14; ++failure) {
         reset_test();
         make_alias(3);
         xgl_alias_subdivide.value = 1;
@@ -1088,18 +1321,25 @@ static void test_alias_pose_cache_allocation_failure(void)
         captured_count = normalizations = sample_calls = 0; xgl_entity_extra_used = 0;
         XGL_DrawAlias(&cl_entities[1]);
         assert(captured_count == 12 && sample_calls == 0 && normalizations > 0);
-        assert(xgl_alias_pose_bytes >= XGL_ALIAS_FIXED_BYTES);
-        assert(xgl_alias_pose_bytes <= XGL_ALIAS_POSE_BYTES);
-        if (failure < 3) assert(xgl_alias_pose_bytes == XGL_ALIAS_FIXED_BYTES);
-        else assert(xgl_alias_pose_bytes > XGL_ALIAS_FIXED_BYTES);
+        assert(xgl_alias_topology_bytes <= XGL_ALIAS_TOPOLOGY_BYTES);
+        if (xgl_alias_topology_bytes == XGL_ALIAS_FIXED_BYTES) {
+            assert(!only_topology() && !built);
+            ++refused;
+        } else {
+            assert(only_topology() && only_topology()->point_vertex && only_topology()->point_parents);
+            ++built;
+        }
         allocation_fail_after = -1;
         captured_count = 0; xgl_entity_extra_used = 0;
         XGL_DrawAlias(&cl_entities[1]);
         captured_count = normalizations = 0; xgl_entity_extra_used = 0;
         XGL_DrawAlias(&cl_entities[1]);
-        assert(captured_count == 12 && !normalizations);
+        /* Warm: only the three middles' normals are brought to length. */
+        assert(captured_count == 12 && normalizations == 3 && only_topology());
         XGL_EntitiesShutdown();
+        assert(xgl_alias_topology_bytes == XGL_ALIAS_FIXED_BYTES);
     }
+    assert(refused >= 9 && built >= 1);
 }
 
 static void test_alias_shared_topology(void)
@@ -1107,10 +1347,8 @@ static void test_alias_shared_topology(void)
     aliashdr_t *header;
     trivertx_t *pose;
     xgl_alias_cache_t *colors;
-    xgl_alias_pose_cache_t *first, *second;
-    xgl_alias_topology_t *topology;
+    xgl_alias_topology_t *topology, *second;
     size_t first_bytes;
-    unsigned int second_hash;
     int *commands;
     int i, entries;
     reset_test();
@@ -1118,77 +1356,75 @@ static void test_alias_shared_topology(void)
     pose = (trivertx_t *)((byte *)header + header->posedata);
     colors = XGL_AliasColors(header, 10, 1, NULL);
     assert(colors);
-    first = XGL_AliasPose(header, pose, colors);
-    assert(first);
-    topology = first->topology;
-    first_bytes = xgl_alias_pose_bytes;
+    topology = XGL_AliasTopology(header, colors, 1);
+    assert(topology);
+    first_bytes = xgl_alias_topology_bytes;
+    /* Every pose of the model has the one topology. */
     pose[0].lightnormalindex = 31;
-    second = XGL_AliasPose(header, pose, colors);
-    assert(second && second != first && second->topology == topology);
-    assert(xgl_alias_pose_bytes - first_bytes ==
-           (size_t)header->poseverts + (size_t)topology->vertex_count * sizeof(vec3_t));
+    assert(XGL_AliasTopology(header, colors, 1) == topology);
+    assert(xgl_alias_topology_bytes == first_bytes);
     assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_MISSES] == 1);
+    assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_HITS] == 1);
+    /* Asking without leave to build finds it, and counts nothing. */
+    assert(XGL_AliasTopology(header, colors, 0) == topology);
     assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_HITS] == 1);
 
     /* Hashes only reject mismatches: equal hashes still require exact data. */
-    second_hash = second->normal_hash;
-    first->normal_hash = second_hash;
-    assert(XGL_AliasPose(header, pose, colors) == second);
     commands = (int *)((byte *)header + header->commands);
     ++commands[1];
     colors = XGL_AliasColors(header, 10, 1, NULL);
     assert(colors);
+    assert(!XGL_AliasTopology(header, colors, 0));
     topology->command_hash = colors->command_hash;
-    second = XGL_AliasPose(header, pose, colors);
-    assert(second && second->topology != topology);
+    assert(!XGL_AliasTopology(header, colors, 0));
+    second = XGL_AliasTopology(header, colors, 1);
+    assert(second && second != topology);
 
-    /* Replace topology slots and ensure no surviving pose references an
-     * evicted command stream, even when the slot address is reused. */
+    /* More command streams than there are places: the least lately used
+     * make way, and the cap holds. */
     for (i = 0; i < XGL_ALIAS_TOPOLOGY_SLOTS + 4; ++i) {
         ++commands[1];
         colors = XGL_AliasColors(header, 10, 1, NULL);
-        assert(colors && XGL_AliasPose(header, pose, colors));
-        assert(xgl_alias_pose_bytes <= XGL_ALIAS_POSE_BYTES);
+        assert(colors && XGL_AliasTopology(header, colors, 1));
+        assert(xgl_alias_topology_bytes <= XGL_ALIAS_TOPOLOGY_BYTES);
+    }
+    entries = 0;
+    for (i = 0; i < XGL_ALIAS_TOPOLOGY_SLOTS; ++i)
+        if (xgl_alias_topologies[i].indices) {
+            ++entries;
+            assert(xgl_alias_topologies[i].parents && xgl_alias_topologies[i].point_vertex);
+        }
+    assert(entries == XGL_ALIAS_TOPOLOGY_SLOTS);
+    assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_EVICTIONS] == 6);
+    XGL_EntitiesShutdown();
+    assert(xgl_alias_topology_bytes == XGL_ALIAS_FIXED_BYTES);
+}
+
+static void test_alias_topology_byte_limit(void)
+{
+    aliashdr_t *header;
+    xgl_alias_cache_t *colors;
+    int *commands;
+    int i, entries;
+    reset_test();
+    header = make_alias(1000);
+    commands = (int *)((byte *)header + header->commands);
+    /* Each of these is some sixty kilobytes: the cap is reached before
+     * the places run out. */
+    for (i = 0; i < XGL_ALIAS_TOPOLOGY_SLOTS; ++i) {
+        ++commands[1];
+        colors = XGL_AliasColors(header, 10, 1, NULL);
+        assert(colors && XGL_AliasTopology(header, colors, 1));
+        assert(xgl_alias_topology_bytes <= XGL_ALIAS_TOPOLOGY_BYTES);
     }
     entries = 0;
     for (i = 0; i < XGL_ALIAS_TOPOLOGY_SLOTS; ++i)
         if (xgl_alias_topologies[i].indices) ++entries;
-    assert(entries == XGL_ALIAS_TOPOLOGY_SLOTS);
-    for (i = 0; i < XGL_ALIAS_POSE_SLOTS; ++i) {
-        if (!xgl_alias_poses[i].normals) continue;
-        assert(xgl_alias_poses[i].topology->indices);
-        assert(xgl_alias_poses[i].topology->parents);
-    }
-    assert(profile_counts[XGL_PROFILE_ALIAS_POSE_SLOT_EVICTIONS] > 0);
+    assert(entries > 0 && entries < XGL_ALIAS_TOPOLOGY_SLOTS);
+    assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_EVICTIONS] > 0);
+    assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_MISSES] == XGL_ALIAS_TOPOLOGY_SLOTS);
     XGL_EntitiesShutdown();
-    assert(xgl_alias_pose_bytes == XGL_ALIAS_FIXED_BYTES);
-}
-
-static void test_alias_pose_byte_limit(void)
-{
-    aliashdr_t *header;
-    trivertx_t *pose;
-    xgl_alias_cache_t *colors;
-    int i, entries;
-    reset_test();
-    header = make_alias(1000);
-    pose = (trivertx_t *)((byte *)header + header->posedata);
-    colors = XGL_AliasColors(header, 10, 1, NULL);
-    assert(colors);
-    for (i = 0; i < XGL_ALIAS_POSE_SLOTS + 4; ++i) {
-        pose[0].lightnormalindex = (byte)i;
-        assert(XGL_AliasPose(header, pose, colors));
-        assert(xgl_alias_pose_bytes <= XGL_ALIAS_POSE_BYTES);
-    }
-    entries = 0;
-    for (i = 0; i < XGL_ALIAS_POSE_SLOTS; ++i)
-        if (xgl_alias_poses[i].normals) ++entries;
-    assert(entries > 0 && entries < XGL_ALIAS_POSE_SLOTS);
-    assert(profile_counts[XGL_PROFILE_ALIAS_POSE_BYTE_EVICTIONS] > 0);
-    assert(profile_counts[XGL_PROFILE_ALIAS_POSE_SLOT_EVICTIONS] == 0);
-    assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_MISSES] == 1);
-    XGL_EntitiesShutdown();
-    assert(xgl_alias_pose_bytes == XGL_ALIAS_FIXED_BYTES);
+    assert(xgl_alias_topology_bytes == XGL_ALIAS_FIXED_BYTES);
 }
 
 static void test_alias_direct_partial_batches(void)
@@ -1328,7 +1564,8 @@ static void test_alias_identity_fast_path(void)
     captured_count = sample_calls = normalizations = 0; xgl_entity_extra_used = 0;
     memset(profile_counts, 0, sizeof(profile_counts));
     XGL_DrawAlias(&cl_entities[1]);
-    assert(!sample_calls && !normalizations && captured_count == 48);
+    /* Only the nine middles' normals, for the device, are brought to length. */
+    assert(!sample_calls && normalizations == 9 && captured_count == 48);
     assert(profile_counts[XGL_PROFILE_ALIAS_COLOR_HITS] == 1);
     assert(profile_counts[XGL_PROFILE_ALIAS_TOPOLOGY_HITS] == 1);
     memcpy(commands + 1, &saved_uv, sizeof(saved_uv));
@@ -1338,7 +1575,7 @@ static void test_alias_identity_fast_path(void)
     identity->generation = 8;
     captured_count = sample_calls = normalizations = 0; xgl_entity_extra_used = 0;
     XGL_DrawAlias(&cl_entities[1]);
-    assert(!sample_calls && !normalizations && captured_count == 48);
+    assert(!sample_calls && normalizations == 9 && captured_count == 48);
     assert(only_color_entry()->generation == 8);
 
     /* A different model in the same slot: new generation, new commands and
@@ -1436,16 +1673,23 @@ static void test_alias_state_order(void)
 
 /* With xgl_alias_shade the CPU computes what the device used to: the
  * prepared color times (ambient/2 + max(0, N.L)/2), from the same normals,
- * and every model is submitted unlit. */
+ * and every model is submitted unlit. That is at the model's own vertices;
+ * the middle of an edge has the mean of its two ends' light, which is what
+ * the device shows there when the edge is not divided. */
 static void test_alias_cpu_shading(void)
 {
     static model_t flame_model;
+    /* Where the three corners of each triangle and the middles of its
+     * edges ab, bc and ca come among the twelve corners it is divided into. */
+    static const int ends[12][2] = {{0, 0}, {0, 4}, {8, 0}, {0, 4}, {4, 4}, {4, 8},
+                                    {8, 0}, {4, 8}, {8, 8}, {0, 4}, {4, 8}, {8, 0}};
     xgl_vertex_t native[192], shaded[192];
+    float lights[192];
     aliashdr_t *header;
     trivertx_t *pose;
     entity_t *entity;
     float dot, shade, dim;
-    int i, j, depth, count, stage, lit_corners;
+    int i, j, depth, count, stage, lit_corners, group;
     for (depth = 0; depth <= 1; ++depth) {
         reset_test();
         header = make_alias(6);
@@ -1478,7 +1722,7 @@ static void test_alias_cpu_shading(void)
         memcpy(native, captured, (size_t)count * sizeof(*native));
         XGL_EntitiesShutdown();
         xgl_alias_shade.value = 1;
-        /* Cold fallback, cache build, then the cached pose: all the same. */
+        /* Cold fallback, cache build, then the kept mesh: all the same. */
         for (stage = 0; stage < 3; ++stage) {
             captured_count = 0; xgl_entity_extra_used = 0; normalizations = 0;
             XGL_DrawAlias(entity);
@@ -1489,20 +1733,27 @@ static void test_alias_cpu_shading(void)
             lit_corners = 0;
             for (i = 0; i < count; ++i) {
                 dot = (native[i].normal[0] + native[i].normal[1] + native[i].normal[2]) * .577350269f;
-                shade = .5f * test_ambient + (dot > 0 ? .5f * dot : 0);
+                lights[i] = .5f * test_ambient + (dot > 0 ? .5f * dot : 0);
                 if (dot > 0) ++lit_corners;
+            }
+            for (i = 0; i < count; ++i) {
+                shade = lights[i];
+                if (depth) {
+                    group = i - i % 12;
+                    shade = (lights[group + ends[i % 12][0]] + lights[group + ends[i % 12][1]]) * .5f;
+                }
                 for (j = 0; j < 3; ++j) {
                     assert(fabs(captured[i].position[j] - native[i].position[j]) < .0001);
                     assert(fabs(captured[i].color[j] - native[i].color[j] * shade) < .0001);
                 }
-                /* The cached path leaves each record's normal as the last
-                 * (here native) draw wrote it: valid, and never read. */
-                if (stage) assert(VectorCompare(captured[i].normal, native[i].normal));
+                /* Only the cold draw, which streams the model's own
+                 * records, still passes normals; they are not read. */
+                assert(captured_plain[i] == (stage != 0));
             }
             assert(lit_corners > 0 && lit_corners < count);
         }
         memcpy(shaded, captured, (size_t)count * sizeof(*shaded));
-        /* A worker prepares the same colors and writes no normals. */
+        /* A worker prepares the same colors, in records without normals. */
         cl_visedicts[0] = entity; cl_numvisedicts = 1;
         smp_active = 1;
         captured_count = executed_jobs = 0; xgl_entity_extra_used = 0;
@@ -1510,8 +1761,9 @@ static void test_alias_cpu_shading(void)
         assert(pending_jobs == 1 && xgl_alias_frame->jobs[0].lit == 0);
         draw_entities();
         assert(executed_jobs == 1 && captured_count == count && native_lit == 0);
+        assert(plain_submissions == 1);
         for (i = 0; i < count; ++i) {
-            assert(captured[i].normal[0] == 0 && captured[i].normal[2] == 1);
+            assert(captured_plain[i]);
             for (j = 0; j < 3; ++j) {
                 assert(captured[i].position[j] == shaded[i].position[j]);
                 assert(captured[i].color[j] == shaded[i].color[j]);
@@ -1550,6 +1802,7 @@ static void test_alias_cpu_shading(void)
         captured_count = 0; xgl_entity_extra_used = 0;
         XGL_DrawAlias(entity);
         assert(native_lit == 2 && fabs(captured[0].color[1] * .5f * test_ambient - dim) < .0001 * 2);
+        assert(!captured_plain[0] && !captured_plain[count - 1]);
 
         /* Torches are final as sampled in either mode: no shade, no light. */
         flame_model = alias_model;
@@ -1560,6 +1813,7 @@ static void test_alias_cpu_shading(void)
             captured_count = 0; xgl_entity_extra_used = 0;
             XGL_DrawAlias(entity);
             assert(captured_count == count && native_lit == 0);
+            assert(captured_plain[0] && captured_plain[count - 1]);
             if (stage) for (i = 0; i < count; ++i)
                 for (j = 0; j < 3; ++j) assert(captured[i].color[j] == shaded[i].color[j]);
             memcpy(shaded, captured, (size_t)count * sizeof(*shaded));
@@ -1675,6 +1929,241 @@ static void test_smp_alias_frame(void)
     cl_numvisedicts = 0;
 }
 
+/* A sheet of quads, every quad a command of its own: a fan of two
+ * triangles. As loaded models do, it can say after its commands which
+ * command vertices are one model vertex, in two lists: by place on the skin
+ * and by place in space, which for a sheet are the same. welds: 0 for
+ * neither list, 1 for the true ones, 2 for a first list that makes no
+ * sense, 3 for a second that makes none. */
+static aliashdr_t *make_sheet(int columns, int rows, int welds)
+{
+    static const int corner[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+    xgl_alias_identity_t *identity;
+    aliashdr_t *header;
+    trivertx_t *poses;
+    int *commands, *weld, *same;
+    int first[32][32];
+    int quads, vertices, words, q, c, i, j, k;
+    float uv[2];
+    assert(columns < 31 && rows < 31);
+    memset(&alias_storage, 0, sizeof(alias_storage));
+    memset(&alias_model, 0, sizeof(alias_model));
+    header = (aliashdr_t *)alias_storage.bytes;
+    header->scale[0] = header->scale[1] = header->scale[2] = 1;
+    quads = columns * rows; vertices = 4 * quads;
+    header->numposes = 1;
+    header->poseverts = vertices;
+    header->numtris = 2 * quads;
+    header->numframes = header->numskins = 1;
+    header->frames[0].firstpose = 0;
+    header->frames[0].numposes = 1;
+    header->gl_texturenum[0][0] = header->gl_texturenum[0][1] = 10;
+    header->gl_texturenum[0][2] = header->gl_texturenum[0][3] = 10;
+    identity = (xgl_alias_identity_t *)((byte *)header + sizeof(*header));
+    header->commands = sizeof(*header) + sizeof(*identity);
+    commands = (int *)(identity + 1);
+    words = 9 * quads + 1;
+    weld = commands + words;
+    same = weld + vertices;
+    header->posedata = header->commands + (words + (welds ? 2 * vertices : 0)) * (int)sizeof(int);
+    poses = (trivertx_t *)((byte *)header + header->posedata);
+    assert((byte *)(poses + vertices) <= alias_storage.bytes + sizeof(alias_storage.bytes));
+    memset(first, 0xff, sizeof(first));
+    for (q = 0; q < quads; ++q) {
+        commands[9 * q] = -4;
+        for (c = 0; c < 4; ++c) {
+            i = q % columns + corner[c][0]; j = q / columns + corner[c][1];
+            k = 4 * q + c;
+            uv[0] = (i + .5f) / (columns + 1); uv[1] = (j + .5f) / (rows + 1);
+            memcpy(&commands[9 * q + 1 + 2 * c], uv, sizeof(uv));
+            poses[k].v[0] = (byte)(10 * i); poses[k].v[1] = (byte)(7 * j);
+            poses[k].v[2] = (byte)(i * j);
+            poses[k].lightnormalindex = (byte)((i * 37 + j * 11) % 162);
+            if (first[i][j] < 0) first[i][j] = k;
+            if (welds) {
+                weld[k] = welds == 2 && k == 5 ? 6 : first[i][j];
+                same[k] = welds == 3 && k == 5 ? 6 : first[i][j];
+            }
+        }
+    }
+    commands[9 * quads] = 0;
+    identity->magic = XGL_ALIAS_IDENTITY_MAGIC;
+    identity->generation = 77;
+    identity->words = words + (welds ? 2 * vertices : 0);
+    identity->hash = XGL_AliasCommandHash(commands, identity->words);
+    assert(XGL_AliasIdentity(header) == identity);
+    strcpy(alias_model.name, "progs/soldier.mdl");
+    alias_model.type = mod_alias;
+    alias_model.radius = 400;
+    alias_model.cache.data = header;
+    cl_entities[1].model = &alias_model;
+    return header;
+}
+
+/* Put the corners of every captured triangle, and then the triangles, in
+ * one fixed order: what was drawn, however it was sent. */
+static int vertex_order(const void *a, const void *b)
+{
+    return memcmp(a, b, sizeof(xgl_vertex_t));
+}
+static int triangle_order(const void *a, const void *b)
+{
+    return memcmp(a, b, 3 * sizeof(xgl_vertex_t));
+}
+static void sort_capture(void)
+{
+    int i;
+    assert(captured_count % 3 == 0);
+    for (i = 0; i < captured_count; i += 3) qsort(&captured[i], 3, sizeof(captured[0]), vertex_order);
+    qsort(captured, (size_t)(captured_count / 3), 3 * sizeof(captured[0]), triangle_order);
+}
+
+static void test_alias_strips(void)
+{
+    static xgl_vertex_t expected[2304];
+    xgl_alias_topology_t *topology;
+    aliashdr_t *header;
+    entity_t *entity;
+    int depth, i, count, triangles, failure, calls, points;
+    for (depth = 0; depth <= 1; ++depth) {
+        reset_test();
+        header = make_sheet(3, 2, 1);
+        triangles = header->numtris << (2 * depth);
+        entity = &cl_entities[1];
+        entity->angles[0] = 11; entity->angles[1] = 47; entity->angles[2] = -5;
+        entity->origin[0] = 100; entity->origin[1] = -20; entity->origin[2] = 30;
+        xgl_alias_shade.value = 1;
+        xgl_alias_subdivide.value = (float)depth;
+        test_light = 100;
+        test_gamma = 1;
+        for (i = 0; i < 256; ++i) gamma_output[i] = (float)sqrt(i / 255.0);
+        /* As separate triangles: what the model is. */
+        for (i = 0; i < 3; ++i) {
+            captured_count = 0; xgl_entity_extra_used = 0;
+            XGL_DrawAlias(entity);
+        }
+        capture_reserved();
+        count = captured_count;
+        assert(count == 3 * triangles && !strip_calls);
+        sort_capture();
+        memcpy(expected, captured, (size_t)count * sizeof(expected[0]));
+        /* Its triangles were joined into strips when the mesh was made:
+         * each row of quads is one. Every triangle is in exactly one. */
+        topology = &xgl_alias_topologies[0];
+        assert(topology->indices && topology->triangle_count == triangles);
+        /* Twenty-four vertices in the commands are the twelve of the
+         * sheet, and its twenty-three edges have a middle each. */
+        assert(topology->base_count == 24 && topology->base_points == 12);
+        assert(topology->point_count == (depth ? 12 + 23 : 12));
+        assert(topology->strip_count > 0 && topology->strip_count < triangles / 2);
+        points = 0;
+        for (i = 0; i < topology->strip_count; ++i) {
+            assert(topology->strip_lengths[i] >= 3 && topology->strip_lengths[i] <= XGL_ALIAS_STRIP_POINTS);
+            if (i) assert(topology->strip_lengths[i] <= topology->strip_lengths[i - 1]);
+            points += topology->strip_lengths[i];
+        }
+        assert(points - 2 * topology->strip_count == triangles && points < 2 * triangles);
+        if (!depth) assert(topology->strip_count == 2 && topology->strip_lengths[1] == 8);
+        /* Sent as strips, it is the same triangles in fewer points. */
+        xgl_alias_strips.value = 2;
+        captured_count = 0; xgl_entity_extra_used = 0;
+        XGL_DrawAlias(entity);
+        capture_reserved();
+        assert(captured_count == count && strip_calls > 0);
+        calls = strip_calls; points = strip_points;
+        assert(points - 2 * calls <= triangles && points < 2 * triangles);
+        sort_capture();
+        assert(!memcmp(captured, expected, (size_t)count * sizeof(expected[0])));
+        /* Runs shorter than asked go out as separate triangles; when every
+         * run is shorter, the model is sent as it was before. */
+        xgl_alias_strips.value = (float)(strip_log[0] - 2);
+        strip_calls = strip_points = 0;
+        captured_count = 0; xgl_entity_extra_used = 0;
+        XGL_DrawAlias(entity);
+        capture_reserved();
+        assert(strip_calls > 0 && strip_calls <= calls && captured_count == count);
+        for (i = 0; i < strip_calls && i < 64; ++i) assert(strip_log[i] == strip_log[0]);
+        sort_capture();
+        assert(!memcmp(captured, expected, (size_t)count * sizeof(expected[0])));
+        xgl_alias_strips.value = (float)(strip_log[0] - 1);
+        strip_calls = strip_points = 0;
+        captured_count = 0; xgl_entity_extra_used = 0;
+        XGL_DrawAlias(entity);
+        capture_reserved();
+        assert(!strip_calls && captured_count == count);
+        sort_capture();
+        assert(!memcmp(captured, expected, (size_t)count * sizeof(expected[0])));
+        /* A full native batch splits the leftover triangles, not a strip. */
+        xgl_alias_strips.value = depth ? 9 : 2;
+        reserve_limit = 9;
+        strip_calls = strip_points = 0;
+        captured_count = 0; xgl_entity_extra_used = 0;
+        XGL_DrawAlias(entity);
+        capture_reserved();
+        reserve_limit = XGL_ENTITY_BATCH_VERTICES;
+        assert(captured_count == count);
+        sort_capture();
+        assert(!memcmp(captured, expected, (size_t)count * sizeof(expected[0])));
+        /* The worker writes the same strips; they are sent from its output. */
+        xgl_alias_strips.value = 2;
+        cl_visedicts[0] = entity; cl_numvisedicts = 1;
+        smp_active = 1;
+        strip_calls = strip_points = 0;
+        captured_count = executed_jobs = 0; xgl_entity_extra_used = 0;
+        XGL_AliasPrepareFrame();
+        assert(pending_jobs == 1);
+        draw_entities();
+        XGL_AliasFinishFrame();
+        assert(executed_jobs == 1 && strip_calls == calls && strip_points == points);
+        assert(captured_count == count);
+        sort_capture();
+        assert(!memcmp(captured, expected, (size_t)count * sizeof(expected[0])));
+        smp_active = 0; cl_numvisedicts = 0;
+        /* A model the device illuminates needs normals: no strips. */
+        xgl_alias_shade.value = 0;
+        strip_calls = 0;
+        for (i = 0; i < 2; ++i) {
+            captured_count = 0; xgl_entity_extra_used = 0;
+            XGL_DrawAlias(entity);
+        }
+        capture_reserved();
+        assert(!strip_calls && captured_count == count);
+        XGL_EntitiesShutdown();
+        assert(xgl_alias_topology_bytes == XGL_ALIAS_FIXED_BYTES);
+        assert(xgl_alias_cache_bytes == sizeof(xgl_alias_cache));
+    }
+    /* Without the loader's lists, or with a first one that makes no sense,
+     * a model has no strips and is drawn all the same. So it is when there
+     * is no memory to join them with. A second list that makes no sense
+     * costs it only the sharing of points. */
+    for (failure = -3; failure < 16; ++failure) {
+        reset_test();
+        header = make_sheet(3, 2, failure == -3 ? 0 : (failure == -2 ? 2 : (failure == -1 ? 3 : 1)));
+        entity = &cl_entities[1];
+        xgl_alias_shade.value = 1;
+        xgl_alias_strips.value = 2;
+        XGL_DrawAlias(entity); /* The colors first. */
+        if (failure >= 0) allocation_fail_after = failure;
+        captured_count = 0;
+        XGL_DrawAlias(entity);
+        capture_reserved();
+        allocation_fail_after = -1;
+        assert(captured_count == 3 * header->numtris);
+        topology = &xgl_alias_topologies[0];
+        if (failure == -3) assert(!strip_calls && !topology->strip_count && topology->base_points == 24);
+        if (failure == -2) assert(!strip_calls && !topology->strip_count && topology->base_points == 12);
+        if (failure == -1) assert(strip_calls == 2 && topology->base_points == 13);
+        /* Four allocations make the mesh and five its points; one is
+         * scratch for the strips and four more keep them. */
+        if (failure >= 0 && failure < 9) assert(!strip_calls && !topology->indices);
+        if (failure >= 9 && failure < 14) assert(!strip_calls && topology->indices && !topology->strip_count);
+        if (failure >= 14) assert(strip_calls == 2 && topology->base_points == 12);
+        assert(xgl_alias_topology_bytes <= XGL_ALIAS_TOPOLOGY_BYTES);
+        XGL_EntitiesShutdown();
+        assert(xgl_alias_topology_bytes == XGL_ALIAS_FIXED_BYTES);
+    }
+}
+
 int main(void)
 {
     test_alias_pose_transform_translation();
@@ -1689,17 +2178,19 @@ int main(void)
     test_alias_cache_coverage_and_capacity();
     test_alias_cache_allocation_failure();
     test_alias_shared_topology();
-    test_alias_pose_byte_limit();
+    test_alias_topology_byte_limit();
     test_alias_direct_partial_batches();
     test_alias_audio_lock_cleanup();
     test_smp_alias_frame();
     test_alias_identity_fast_path();
     test_alias_state_order();
-    test_alias_pose_cache_equivalence();
+    test_alias_cached_mesh_equivalence();
     test_alias_pose_canceling_normals();
-    test_alias_pose_cache_batching_and_limits();
-    test_alias_pose_cache_allocation_failure();
+    test_alias_seam_canceling_normals();
+    test_alias_mesh_batching_and_limits();
+    test_alias_mesh_allocation_failure();
     test_alias_cpu_shading();
+    test_alias_strips();
     test_brush_entity_passes();
     puts("XGL entity contracts passed (CPU geometry; no native rendering)");
     return 0;

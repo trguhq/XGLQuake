@@ -1,5 +1,6 @@
 /* Alias command/pose contract tests. GPL-2.0-or-later. */
 #include "quakedef.h"
+#include "xgl_render.h"
 #include "xgl_alias.h"
 #include <assert.h>
 #include <stdarg.h>
@@ -95,7 +96,9 @@ static void check_triangle (const int *indices, const float uv[][2])
 
 static int check_commands (void)
 {
-    int *commands;
+    static int every_index[MAXALIASTRIS*3];
+    static float every_uv[MAXALIASTRIS*3][2];
+    int *commands, *welds;
     trivertx_t *poses;
     int order[MAXALIASTRIS*3];
     float uv[MAXALIASTRIS*3][2], triangle_uv[3][2];
@@ -116,6 +119,8 @@ static int check_commands (void)
             order[vertex] = index;
             memcpy (&uv[vertex][0], &commands[word++], sizeof(float));
             memcpy (&uv[vertex][1], &commands[word++], sizeof(float));
+            every_index[offset+vertex] = index;
+            memcpy (every_uv[offset+vertex], uv[vertex], sizeof(uv[vertex]));
             for (pose = 0; pose < 2; ++pose)
                 assert (!memcmp(&poses[pose*pheader->poseverts+offset+vertex],
                                 &source_poses[pose][index], sizeof(trivertx_t)));
@@ -137,6 +142,26 @@ static int check_commands (void)
     }
     assert (offset == pheader->poseverts && triangles_seen == pheader->numtris);
     for (i = 0; i < pheader->numtris; ++i) assert (consumed[i]);
+    /* After the terminator, for every vertex of the commands: the first
+     * one that is the same model vertex at the same place on the skin. */
+    welds = commands + word;
+    for (vertex = 0; vertex < pheader->poseverts; ++vertex)
+    {
+        for (i = 0; i < vertex; ++i)
+            if (every_index[i] == every_index[vertex] &&
+                !memcmp (every_uv[i], every_uv[vertex], sizeof(every_uv[0]))) break;
+        assert (welds[vertex] == i);
+    }
+    /* Then, for every vertex again: the first one that is the same model
+     * vertex at all, on whichever half of the skin. */
+    welds += pheader->poseverts;
+    for (vertex = 0; vertex < pheader->poseverts; ++vertex)
+    {
+        for (i = 0; i < vertex; ++i)
+            if (every_index[i] == every_index[vertex]) break;
+        assert (welds[vertex] == i);
+        assert (!memcmp (&poses[welds[vertex]], &poses[vertex], sizeof(trivertx_t)));
+    }
     return word;
 }
 
@@ -195,11 +220,12 @@ int main (void)
     XGL_MakeAliasModelDisplayLists (&model, pheader);
     assert (check_commands () == saved_words && pheader->poseverts == saved_poseverts);
     /* Every load is a new generation; nothing else may differ. The record
-     * sits directly before the commands and describes exactly those words. */
+     * sits directly before the commands and describes exactly those words
+     * and the two lists of welds after them. */
     identity = XGL_AliasIdentity (pheader);
-    assert (identity && identity->words == saved_words);
+    assert (identity && identity->words == saved_words + 2 * saved_poseverts);
     assert (identity->hash == XGL_AliasCommandHash (
-        (const int *)((const byte *)pheader + pheader->commands), saved_words));
+        (const int *)((const byte *)pheader + pheader->commands), identity->words));
     previous = (const xgl_alias_identity_t *)
         (snapshot + ((const byte *)identity - hunk.bytes));
     assert (previous->magic == XGL_ALIAS_IDENTITY_MAGIC);
@@ -207,6 +233,6 @@ int main (void)
     ((xgl_alias_identity_t *)previous)->generation = identity->generation;
     assert (hunk_used == saved_bytes && !memcmp(snapshot, hunk.bytes, saved_bytes));
     free (snapshot);
-    puts ("XGL alias mesh: topology, seams, pose reordering, 2048-triangle bounds, identity record and determinism passed");
+    puts ("XGL alias mesh: topology, seams, welds, pose reordering, 2048-triangle bounds, identity record and determinism passed");
     return 0;
 }

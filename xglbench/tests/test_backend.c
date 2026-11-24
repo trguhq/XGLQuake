@@ -11,12 +11,17 @@ void xb_test_advance(double seconds);
 static double test_draw_advance;
 static double test_ui_advance;
 static unsigned long test_draw_advance_at;
+/* Pretended microseconds for a point, for a call and, beyond its points,
+ * for a triangle sent as a polygon: mesh probe cases only, so that what
+ * the report makes of their times can be checked against known costs. */
+static double test_mesh_cost[3];
 #endif
 
 static int test_width;
 static int test_height;
+static int test_error_detection = 1;
 static size_t test_triangles;
-static size_t test_strips;
+static size_t test_strip_calls;
 static unsigned long test_draws;
 static unsigned long test_fault_draw;
 static int test_fault_pending;
@@ -110,7 +115,7 @@ static void test_log(const char *operation, int width, int height)
 int xb_backend_open(const xb_options *options, int width, int height)
 {
     const char *draw, *delay, *drain, *light;
-    (void)options;
+    test_error_detection = !options->no_error_detection;
     test_width = width;
     test_height = height;
     test_draws = 0;
@@ -151,6 +156,13 @@ int xb_backend_open(const xb_options *options, int width, int height)
     test_ui_advance = delay ? atof(delay) : 0;
     draw = getenv("XB_TEST_DRAW_ADVANCE_AT");
     test_draw_advance_at = draw ? strtoul(draw, NULL, 10) : 0;
+    test_mesh_cost[0] = test_mesh_cost[1] = test_mesh_cost[2] = 0;
+    delay = getenv("XB_TEST_MESH_COST");
+    if (delay && sscanf(delay, "%lf %lf %lf", &test_mesh_cost[0], &test_mesh_cost[1],
+                        &test_mesh_cost[2]) != 3) {
+        fprintf(stderr, "invalid test-only mesh cost\n");
+        exit(2);
+    }
 #endif
     return 1;
 }
@@ -188,6 +200,7 @@ void xb_backend_info(FILE *out)
     fprintf(out, "TEST DOUBLE: NO GRAPHICS, NO VALID HARDWARE PERFORMANCE DATA\n");
     fprintf(out, "Portable scheduling/report tests only; window=%dx%d\n",
             test_width, test_height);
+    fprintf(out, "XGL error detection: %s.\n", test_error_detection ? "on" : "off");
 }
 
 int xb_backend_validate(enum xb_method method, char *reason, size_t size)
@@ -412,7 +425,12 @@ int xb_backend_upload(const xb_mesh *mesh)
     test_native_colors = NULL;
     test_native_color_count = 0;
     test_triangles = mesh->triangles;
-    test_strips = mesh->strip_count;
+    /* As the native backend sends them: a strip longer than the batch goes
+     * in several calls, each repeating the two points it continues from. */
+    test_strip_calls = 0;
+    for (i = 0; i < mesh->strip_count; ++i)
+        test_strip_calls += (mesh->strips[i].point_count - 2 + (size_t)test_batch - 1) /
+                            (size_t)test_batch;
     free(test_native_texture_points);
     test_native_texture_points = NULL;
     test_texture_point_count = 0;
@@ -511,6 +529,7 @@ void xb_backend_clear(int color, int depth)
 size_t xb_backend_draw(enum xb_method method, int batch)
 {
     double until;
+    size_t calls;
     ++test_draws;
     test_texture_active = test_case.texture_filter != XB_TEXTURE_OFF;
     if (test_case.texture_compare) {
@@ -543,10 +562,19 @@ size_t xb_backend_draw(enum xb_method method, int batch)
             test_log(test_fault, test_width, test_height);
         }
     }
-    if (method == XB_POLYGON) return test_triangles;
-    if (method == XB_STRIP) return test_strips;
     if (batch < 1) batch = 1;
-    return (test_triangles + (size_t)batch - 1) / (size_t)batch;
+    if (method == XB_POLYGON) calls = test_triangles;
+    else if (method == XB_STRIP) calls = test_strip_calls;
+    else calls = (test_triangles + (size_t)batch - 1) / (size_t)batch;
+#ifdef XB_PROFILE_TEST_CLOCK
+    if (test_case.probe == XB_PROBE_MESH)
+        xb_test_advance(1e-6 * (test_mesh_cost[0] * (double)(method == XB_STRIP ?
+                                    test_triangles + 2 * calls : 3 * test_triangles) +
+                                test_mesh_cost[1] * (double)calls +
+                                test_mesh_cost[2] * (double)(method == XB_MULTI ?
+                                    test_triangles : 0)));
+#endif
+    return calls;
 }
 
 void xb_backend_sync(void)
@@ -664,7 +692,7 @@ size_t xb_backend_input_bytes(enum xb_method method, int batch)
     size_t points, facets;
     (void)batch;
     /* A test-double payload estimate only, never native transfer bandwidth. */
-    points = method == XB_STRIP ? test_triangles + test_strips * 2 : test_triangles * 3;
+    points = method == XB_STRIP ? test_triangles + test_strip_calls * 2 : test_triangles * 3;
     facets = method == XB_TLIST ? test_triangles * 3 : test_triangles;
     if (test_case.texture_filter != XB_TEXTURE_OFF) return points * 5 * sizeof(float);
     if (test_case.lighting != XB_LIGHT_OFF || test_case.vertex_material) {

@@ -106,10 +106,11 @@ build/test_native_%: tests/test_native_%.c xglbench_xgl.c xglbench.h \
 	    $(CFLAGS) $(LANGFLAGS) $(WARNFLAGS) -ffunction-sections -fdata-sections \
 	    $(LDFLAGS) -o $@ $< -Wl,--gc-sections -lm
 
-native-contract-check: build/test_native_raster build/test_native_render build/test_native_ui
+native-contract-check: build/test_native_raster build/test_native_render build/test_native_ui build/test_native_mesh
 	./build/test_native_raster
 	./build/test_native_render
 	./build/test_native_ui
+	./build/test_native_mesh
 
 clean:
 	rm -rf build xglbench

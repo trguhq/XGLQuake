@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../quakedef.h"
+#include "../xgl_render.h"
 #include "../xgl_profile.h"
 
 static cvar_t *profile_setting;
@@ -112,7 +113,7 @@ static void test_detail_levels(void)
     XGL_ProfileCount(XGL_PROFILE_WORLD_BUILD_VERTICES, 96);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_COLOR_HITS, 3);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_COLOR_MISSES, 2);
-    XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_HITS, 1);
+    XGL_ProfileCount(XGL_PROFILE_ALIAS_POINTS, 500);
     XGL_ProfileCount(XGL_PROFILE_TEXT_CALLS, 4);
     XGL_ProfileCount(XGL_PROFILE_WORLD_ANIMATED_SAMPLES, 15);
     XGL_ProfileCount(XGL_PROFILE_NATIVE_CACHED_VERTICES, 48);
@@ -120,11 +121,13 @@ static void test_detail_levels(void)
     XGL_ProfileCount(XGL_PROFILE_VERTEX_PACKED, 6);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_TOPOLOGY_HITS, 3);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_TOPOLOGY_MISSES, 1);
-    XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_SLOT_EVICTIONS, 2);
-    XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_BYTE_EVICTIONS, 4);
+    XGL_ProfileCount(XGL_PROFILE_ALIAS_TOPOLOGY_EVICTIONS, 4);
     XGL_ProfileCount(XGL_PROFILE_WORLD_EVICTIONS, 5);
     XGL_ProfileCount(XGL_PROFILE_WORLD_DETAIL_SURFACES, 7);
     XGL_ProfileCount(XGL_PROFILE_WORLD_DETAIL_TRIANGLES, 300);
+    XGL_ProfileCount(XGL_PROFILE_WORLD_SHAPE_SURFACES, 3);
+    XGL_ProfileCount(XGL_PROFILE_WORLD_SHAPE_TRIANGLES, 120);
+    XGL_ProfileCount(XGL_PROFILE_WORLD_HIDDEN_SURFACES, 190);
     XGL_ProfileCount(XGL_PROFILE_POINT_LIGHTS, 3);
     XGL_ProfileCount(XGL_PROFILE_WORLD_LIT_SURFACES, 9);
     XGL_ProfileCount(XGL_PROFILE_SMP_HELPED, 1);
@@ -144,7 +147,7 @@ static void test_detail_levels(void)
     XGL_ProfileCount(XGL_PROFILE_WORLD_MESH_BUILDS, 1);
     XGL_ProfileCount(XGL_PROFILE_WORLD_BUILD_VERTICES, 6);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_COLOR_HITS, 1);
-    XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_HITS, 3);
+    XGL_ProfileCount(XGL_PROFILE_ALIAS_POINTS, 300);
     XGL_ProfileCount(XGL_PROFILE_TEXT_CALLS, 2);
     clock_time = 102.2; XGL_ProfileEndFrame();
     assert(print_calls == 2);
@@ -153,17 +156,18 @@ static void test_detail_levels(void)
     assert(strstr(output, "visibility 50.00 select 0.00 build 150.00"));
     assert(strstr(output, "builds 1.5 failed builds 0.5"));
     assert(strstr(output, "vertices built 51.0"));
-    assert(strstr(output, "color hits 2.0 misses 1.0 evictions 0.0"));
-    assert(strstr(output, "pose hits 2.0 misses 0.0 evictions 0.0"));
+    assert(strstr(output, "color hits 2.0 misses 1.0 evictions 0.0; fallbacks 0.0; text calls 3.0\n"));
     assert(strstr(output, "text calls 3.0"));
     assert(strstr(output, "sky 10.00 water 20.00 ms; animated samples/frame 7.5"));
     assert(strstr(output, "vertices/frame cached native 24.0 direct native 6.0 packed 3.0"));
-    assert(strstr(output, "cache 10.00 transform 30.00 ms; topology hits 1.5 misses 0.5"));
-    assert(strstr(output, "pose evictions slot 1.0 bytes 2.0"));
+    assert(strstr(output, "cache 10.00 transform 30.00 ms; topology hits 1.5 misses 0.5 evictions 2.0; "
+                          "points placed 400.0\n"));
     assert(strstr(output, "SMP alias preparation: 1.5 jobs/frame; main prepass 2.00 worker 7.00 main wait 1.00 ms/frame"));
     assert(strstr(output, "0.5 more jobs/frame run by main while joining\n"));
-    assert(strstr(output, "vertices built 51.0 recolored 0.0 animated 0.0; detail meshes evicted 2.5\n"));
-    assert(strstr(output, "  world detail per frame: faces 3.5 triangles 150.0; "
+    assert(strstr(output, "vertices built 51.0 recolored 0.0 animated 0.0; detail meshes evicted 2.5; "
+                          "faces outside the view, not drawn 95.0\n"));
+    assert(strstr(output, "  world detail per frame: faces 3.5 triangles 150.0, "
+                          "of them cut along texture shapes 1.5 and 60.0; "
                           "dynamic lights in use 1.50, faces illuminated 4.5\n"));
     assert(!XGL_ProfileDetailEnabled());
     calls = clock_calls;
@@ -215,9 +219,12 @@ static void test_aggregation(void)
     clock_time = 10.29; call_start = XGL_ProfileNow();
     clock_time = 10.296; XGL_ProfileAdd(XGL_PROFILE_STATE, call_start);
     XGL_ProfileCount(XGL_PROFILE_STATE_CHANGES, 3);
+    XGL_ProfileCount(XGL_PROFILE_BAR_KEPT, 1); /* In one frame of the two. */
     XGL_ProfileCount(XGL_PROFILE_TRIANGLES, 30);
     XGL_ProfileCount(XGL_PROFILE_GLYPHS, 2);
     XGL_ProfileCount(XGL_PROFILE_POLYGON_CALLS, 2);
+    XGL_ProfileCount(XGL_PROFILE_STRIP_CALLS, 5);
+    XGL_ProfileCount(XGL_PROFILE_STRIP_TRIANGLES, 24);
     XGL_ProfileCount(XGL_PROFILE_WAIT_CALLS, 1);
     clock_time = 10.5; XGL_ProfileEndFrame();
     assert(print_calls == 0);
@@ -234,7 +241,9 @@ static void test_aggregation(void)
     assert(strstr(output, "2 frames; gfx 550.00 ms (max 600.00)"));
     assert(strstr(output, "world 175.00"));
     assert(strstr(output, "native calls (overlap stages): submit 12.50 sync 12.50 swap 0.00 state 3.00 ms"));
-    assert(strstr(output, "triangles 20.0 glyphs 4.0 polygon calls 3.0 waits 2.0 state changes 1.5\n"));
+    assert(strstr(output, "triangles 20.0 glyphs 4.0 polygon calls 3.0 "
+                          "strip calls 2.5 (12.0 triangles) waits 2.0 state changes 1.5 "
+                          "status bar kept 0.50\n"));
 
     /* Output is aggregated once per interval; a new interval has no stale
      * geometry counts or elapsed time from the previous report. */
@@ -246,7 +255,9 @@ static void test_aggregation(void)
     assert(print_calls == 2);
     assert(strstr(output, "2 frames; gfx 405.00 ms (max 500.00)"));
     assert(strstr(output, "world 0.00"));
-    assert(strstr(output, "triangles 0.0 glyphs 0.0 polygon calls 0.0 waits 0.0 state changes 0.0\n"));
+    assert(strstr(output, "triangles 0.0 glyphs 0.0 polygon calls 0.0 "
+                          "strip calls 0.0 (0.0 triangles) waits 0.0 state changes 0.0 "
+                          "status bar kept 0.00\n"));
 }
 
 static void test_toggle_and_clock_reset(void)

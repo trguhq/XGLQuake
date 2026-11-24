@@ -20,7 +20,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // xgl_mesh.c: bounded, memory-only alias command generation
 
 #include "quakedef.h"
-#include "xgl_local.h"
+#include "xgl_render.h"
 #include "xgl_alias.h"
 #include <string.h>
 
@@ -45,6 +45,17 @@ static int numcommands;
 // so they are in the order expected by the command list
 static int vertexorder[MAXALIASTRIS * 3];
 static int numorder;
+
+// for each vertex in that order, the first one that is the same point of
+// the mesh: the same model vertex with the same skin coordinates. The
+// renderer joins triangles into strips across the commands by it.
+static int vertexweld[MAXALIASTRIS * 3];
+static int weldfirst[2][MAXALIASVERTS];
+/* For each vertex the commands name, the first they name that is the same
+ * vertex of the model, whichever half of the skin it is drawn with: the
+ * two are at one place in every pose, with one normal. */
+static int vertexsame[MAXALIASTRIS * 3];
+static int samefirst[MAXALIASVERTS];
 
 
 
@@ -204,7 +215,7 @@ static void BuildTris (void)
     int len, bestlen, besttype;
     int bestverts[MAXALIASTRIS + 2];
     int besttris[MAXALIASTRIS];
-    int type;
+    int type, back;
 
 	//
 	// build tristrips
@@ -212,6 +223,8 @@ static void BuildTris (void)
 	numorder = 0;
 	numcommands = 0;
 	memset (used, 0, sizeof(used));
+	for (i=0 ; i<pheader->numverts ; i++)
+		weldfirst[0][i] = weldfirst[1][i] = samefirst[i] = -1;
 	for (i=0 ; i<pheader->numtris ; i++)
 	{
 		// pick an unused triangle and start the trifan
@@ -256,12 +269,19 @@ static void BuildTris (void)
 		{
 			// emit a vertex into the reorder buffer
 			k = bestverts[j];
+			back = !triangles[besttris[0]].facesfront && stverts[k].onseam;
+			if (weldfirst[back][k] < 0)
+				weldfirst[back][k] = numorder;
+			vertexweld[numorder] = weldfirst[back][k];
+			if (samefirst[k] < 0)
+				samefirst[k] = numorder;
+			vertexsame[numorder] = samefirst[k];
 			vertexorder[numorder++] = k;
 
 			// emit s/t coords into the commands stream
 			s = stverts[k].s;
 			t = stverts[k].t;
-			if (!triangles[besttris[0]].facesfront && stverts[k].onseam)
+			if (back)
 				s += pheader->skinwidth / 2;	// on back side
 			s = (s + 0.5) / pheader->skinwidth;
 			t = (t + 0.5) / pheader->skinheight;
@@ -302,16 +322,20 @@ void XGL_MakeAliasModelDisplayLists (model_t *m, aliashdr_t *hdr)
     paliashdr = hdr;
     BuildTris ();
     paliashdr->poseverts = numorder;
-    /* The identity record travels with the commands in the cache block. */
-    identity = Hunk_Alloc (sizeof(*identity) + numcommands * sizeof(*cmds));
+    /* The identity record travels with the commands in the cache block,
+     * and so do the two lists of which vertices are one, straight after
+     * their terminator: by place on the skin, then by place in space. */
+    identity = Hunk_Alloc (sizeof(*identity) + (numcommands + 2 * numorder) * sizeof(*cmds));
     cmds = (int *)(identity + 1);
     paliashdr->commands = (byte *)cmds - (byte *)paliashdr;
     memcpy (cmds, commands, numcommands * sizeof(*cmds));
+    memcpy (cmds + numcommands, vertexweld, numorder * sizeof(*cmds));
+    memcpy (cmds + numcommands + numorder, vertexsame, numorder * sizeof(*cmds));
     if (!++generation) ++generation;
     identity->magic = XGL_ALIAS_IDENTITY_MAGIC;
     identity->generation = generation;
-    identity->words = numcommands;
-    identity->hash = XGL_AliasCommandHash (cmds, numcommands);
+    identity->words = numcommands + 2 * numorder;
+    identity->hash = XGL_AliasCommandHash (cmds, identity->words);
     verts = Hunk_Alloc (paliashdr->numposes * numorder * sizeof(*verts));
     paliashdr->posedata = (byte *)verts - (byte *)paliashdr;
     for (i = 0; i < paliashdr->numposes; ++i)

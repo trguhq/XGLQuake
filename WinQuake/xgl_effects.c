@@ -20,10 +20,11 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 /* Native geometry replacements for particle sprites and palette overlays. */
 #include "quakedef.h"
+#include "xgl_render.h"
 
 void XGL_DrawParticle(const particle_t *particle)
 {
-    xgl_native_vertex_t *vertex;
+    xgl_color_vertex_t *vertex;
     float scale, distance, rgb[3];
     int i, color, count;
     distance = (particle->org[0] - r_origin[0]) * vpn[0] +
@@ -33,14 +34,13 @@ void XGL_DrawParticle(const particle_t *particle)
      * original near plane removed, before any vertex is written. */
     if (distance < XGL_PARTICLE_NEAR) return;
     count = 3;
-    vertex = XGL_ReserveTriangles(&count, 0, 1.0f, 1);
+    vertex = XGL_ReserveColorTriangles(&count, 1.0f, 1);
     if (!vertex) return;
     scale = distance < 20 ? 1.0f : 1.0f + distance * .004f;
     color = (int)particle->color & 255;
     XGL_PreparePaletteColor(color, rgb);
     for (i = 0; i < 3; ++i) {
         VectorCopy(particle->org, vertex[i].position);
-        VectorCopy(vpn, vertex[i].normal);
         VectorCopy(rgb, vertex[i].color.rgb);
     }
     for (i = 0; i < 3; ++i) {

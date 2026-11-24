@@ -25,6 +25,11 @@ static Xgl_boolean switches[6];
 static int actions, orientation, mapping, clip_planes, hlhsr, illumination;
 static int clear_calls, swap_calls, polygon_calls, text_calls, extent_calls, flush_calls;
 static int text_color_sets, audio_updates;
+/* The device's viewport: the whole window while XGL maps automatically,
+ * else what the renderer set. viewport_origin shifts the automatic one, to
+ * model a device whose viewport is not plain window rows. */
+static Xgl_bounds_d3d dc_viewport, clear_viewport;
+static int viewport_sets, viewport_gets, viewport_origin;
 static int transparency, freeze_z;
 static int transparency_sets;
 static float current_ambient, text_height, current_spacing;
@@ -34,7 +39,11 @@ static Xgl_color text_color, polygon_color;
 static Xgl_pt_color_normal_f3d submitted_vertex;
 static Xgl_pt_color_normal_f3d submitted_vertices[8192];
 static const void *submitted_sources[8192 / 3];
+/* Points submitted without normals are recorded with a zero normal. */
+static byte submitted_plain[8192];
 static int submitted_count;
+/* Triangle strip calls, and the points of the last. */
+static int strip_calls, strip_points;
 static Xgl_color recorded_quad_colors[1024];
 static Xgl_pt_f2d recorded_quad_points[1024][4];
 static const Xgl_pt_list *queued_quad_lists[1024];
@@ -113,10 +122,11 @@ void xgl_object_set(Xgl_object object, ...)
         case XGL_CTX_VDC_WINDOW: current_window = *va_arg(args, Xgl_bounds_d3d *); break;
         case XGL_CTX_VIEW_CLIP_BOUNDS: current_clip = *va_arg(args, Xgl_bounds_d3d *); break;
         case XGL_CTX_DC_VIEWPORT:
-            /* Keep device viewport management with the native mapper, as in
-             * the hardware-tested benchmark. */
-            fprintf(stderr, "Unexpected explicit XGL device viewport\n");
-            abort();
+            /* Only with XGL's automatic mapping off, as the benchmark's
+             * viewport probe did on the device. */
+            assert(object == xb.scene && mapping == XGL_VDC_MAP_OFF);
+            dc_viewport = *va_arg(args, Xgl_bounds_d3d *);
+            ++viewport_sets;
             break;
         case XGL_3D_CTX_Z_BUFFER_WRITE_MASK: write_mask = va_arg(args, Xgl_usgn32); break;
         case XGL_3D_CTX_LIGHT_SWITCHES:
@@ -145,7 +155,22 @@ void xgl_object_set(Xgl_object object, ...)
             break;
         case XGL_CTX_NEW_FRAME_ACTION: actions = va_arg(args, int); break;
         case XGL_CTX_VDC_ORIENTATION: orientation = va_arg(args, int); break;
-        case XGL_CTX_VDC_MAP: mapping = va_arg(args, int); break;
+        case XGL_CTX_VDC_MAP:
+            value = va_arg(args, int);
+            if (object == xb.scene && value != XGL_VDC_MAP_OFF) {
+                /* The renderer hands back a full viewport: it does not
+                 * count on XGL replacing a shorter one. */
+                if (mapping == XGL_VDC_MAP_OFF)
+                    assert(dc_viewport.ymin == viewport_origin &&
+                           dc_viewport.ymax == viewport_origin + xb.height - 1);
+                memset(&dc_viewport, 0, sizeof(dc_viewport));
+                dc_viewport.xmax = xb.width - 1;
+                dc_viewport.ymin = viewport_origin;
+                dc_viewport.ymax = viewport_origin + xb.height - 1;
+                dc_viewport.zmax = 16777215;
+            }
+            mapping = value;
+            break;
         case XGL_CTX_CLIP_PLANES: clip_planes = va_arg(args, int); break;
         case XGL_3D_CTX_HLHSR_MODE: hlhsr = va_arg(args, int); break;
         case XGL_3D_CTX_SURF_FRONT_ILLUMINATION: illumination = va_arg(args, int); break;
@@ -166,6 +191,13 @@ void xgl_object_set(Xgl_object object, ...)
 
 void xgl_object_get(Xgl_object object, Xgl_attribute attribute, void *result)
 {
+    if (attribute == XGL_CTX_DC_VIEWPORT) {
+        /* Read while XGL's own mapping is in force. */
+        assert(object == xb.scene && mapping == XGL_VDC_MAP_ALL);
+        *(Xgl_bounds_d3d *)result = dc_viewport;
+        ++viewport_gets;
+        return;
+    }
     assert(object == xb.system && attribute == XGL_SYS_ST_ERROR_INFO);
     *(Xgl_error_info *)result = injected_error;
 }
@@ -218,6 +250,33 @@ void xgl_context_new_frame(Xgl_ctx context)
         assert(transparency == XGL_TRANSP_NONE && !freeze_z);
         native_event('C');
         ++clear_calls;
+        clear_viewport = dc_viewport;
+    }
+}
+
+/* One strip of points that carry their own colors, as the Sun ZX was
+ * found to draw them: no facet data, no normals, and so unlit. Its points
+ * are recorded with the triangles'. */
+void xgl_triangle_strip(Xgl_ctx context, Xgl_facet_list *facets, Xgl_pt_list *list)
+{
+    Xgl_pt_color_f3d point;
+    Xgl_usgn32 i;
+    assert(context == xb.scene && !facets && list && !list->bbox);
+    assert(mapping != XGL_VDC_MAP_OFF);
+    assert(list->pt_type == XGL_PT_COLOR_F3D && list->num_pts >= 3);
+    assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+    native_event('R');
+    ++strip_calls;
+    strip_points = (int)list->num_pts;
+    for (i = 0; i < list->num_pts; ++i) {
+        assert(submitted_count < (int)(sizeof(submitted_vertices) / sizeof(submitted_vertices[0])));
+        memcpy(&point, (const byte *)list->pts.color_f3d + i * sizeof(point), sizeof(point));
+        memset(&submitted_vertices[submitted_count], 0, sizeof(submitted_vertices[0]));
+        submitted_vertices[submitted_count].x = point.x;
+        submitted_vertices[submitted_count].y = point.y;
+        submitted_vertices[submitted_count].z = point.z;
+        submitted_vertices[submitted_count].color = point.color;
+        submitted_plain[submitted_count++] = 1;
     }
 }
 
@@ -230,8 +289,32 @@ void xgl_multi_simple_polygon(Xgl_ctx context, Xgl_facet_flags flags,
     (void)flags;
     assert(!box && count > 0);
     assert(context == xb.scene || context == xb.ui);
+    /* Nothing is drawn through a viewport the renderer cut short. */
+    assert(mapping != XGL_VDC_MAP_OFF);
     ++polygon_calls;
-    if (lists[0].pt_type == XGL_PT_COLOR_NORMAL_F3D) {
+    if (lists[0].pt_type == XGL_PT_COLOR_F3D) {
+        Xgl_pt_color_f3d point;
+        assert(lists[0].num_pts == 3 && !facets);
+        /* Illumination needs normals: these are only ever drawn unlit. */
+        assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+        native_event('G');
+        for (i = 0; i < count; ++i) {
+            /* One call holds points of one kind. */
+            assert(lists[i].pt_type == XGL_PT_COLOR_F3D && lists[i].num_pts == 3);
+            assert(submitted_count + 3 <= (int)(sizeof(submitted_vertices) / sizeof(submitted_vertices[0])));
+            submitted_sources[submitted_count / 3] = lists[i].pts.color_f3d;
+            for (j = 0; j < 3; ++j) {
+                memcpy(&point, (const byte *)lists[i].pts.color_f3d + j * sizeof(point), sizeof(point));
+                memset(&submitted_vertices[submitted_count], 0, sizeof(submitted_vertices[0]));
+                submitted_vertices[submitted_count].x = point.x;
+                submitted_vertices[submitted_count].y = point.y;
+                submitted_vertices[submitted_count].z = point.z;
+                submitted_vertices[submitted_count].color = point.color;
+                if (!i && !j) submitted_vertex = submitted_vertices[submitted_count];
+                submitted_plain[submitted_count++] = 1;
+            }
+        }
+    } else if (lists[0].pt_type == XGL_PT_COLOR_NORMAL_F3D) {
         assert(lists[0].num_pts == 3 && !facets);
         native_event('G');
         /* The renderer owns an SDK-layout-compatible record. Read its bytes
@@ -246,7 +329,7 @@ void xgl_multi_simple_polygon(Xgl_ctx context, Xgl_facet_flags flags,
                 memcpy(&submitted_vertices[submitted_count],
                        (const byte *)lists[i].pts.color_normal_f3d + j * sizeof(submitted_vertex),
                        sizeof(submitted_vertex));
-                ++submitted_count;
+                submitted_plain[submitted_count++] = 0;
             }
         }
     } else {
@@ -410,6 +493,7 @@ static void reset_backend(void)
     }
     clear_calls = swap_calls = polygon_calls = text_calls = extent_calls = flush_calls = 0;
     text_color_sets = audio_updates = submitted_count = 0;
+    strip_calls = strip_points = 0;
     glyph_count = spacing_mode = proportional_metrics = vertical_advance = 0;
     space_mode = 0;
     current_spacing = 0;
@@ -418,7 +502,12 @@ static void reset_backend(void)
     recorded_quads = quad_batch_count = native_event_count = 0;
     native_events[0] = 0;
     queued_count = queued_quad_count = 0;
-    actions = orientation = mapping = clip_planes = hlhsr = illumination = 0;
+    actions = orientation = clip_planes = hlhsr = illumination = 0;
+    mapping = XGL_VDC_MAP_ALL;
+    viewport_sets = viewport_gets = viewport_origin = 0;
+    memset(&dc_viewport, 0, sizeof(dc_viewport));
+    dc_viewport.xmax = 639; dc_viewport.ymax = 479; dc_viewport.zmax = 16777215;
+    clear_viewport = dc_viewport;
     write_mask = 0; transparency = freeze_z = 0;
     transparency_sets = 0;
     r_refdef.vrect.x = 40; r_refdef.vrect.y = 30;
@@ -626,8 +715,9 @@ static void test_console_clip_full_cover(void)
     assert(flush_calls == waits + 1); /* Existing scene/UI completion. */
     XGL_UIFill(0, 0, 640, 430, 1, 1);
     XGL_UIText(8, 8, "Console", 1, 8, 8);
-    assert(text_calls == 1 && glyph_count == 7 && xb.ui_active);
+    assert(!text_calls && xb.ui_active);
     XGL_EndFrame();
+    assert(text_calls == 1 && glyph_count == 7);
     assert(swap_calls == 1 && !xb.frame && !xb.scene_active && !xb.ui_active);
 
     /* BeginFrame drops the old clip; closing the console restores drawing
@@ -663,9 +753,13 @@ static void test_first_console_frame(void)
     assert(mapping == XGL_VDC_MAP_ALL && !clip_planes);
     XGL_UIFillRGB(0, 0, 640, 480, color, 1);
     XGL_UIText(8, 8, "Loading", 1, 8, 8);
-    assert(polygon_calls == 1 && text_calls == 1 && glyph_count == 7);
+    /* Both wait for the end of the UI: background first, then the text. */
+    assert(!polygon_calls && !text_calls);
     assert(xb.ui_active && !xb.scene_active);
     XGL_EndFrame();
+    assert(polygon_calls == 1 && text_calls == 1 && glyph_count == 7);
+    assert(strchr(native_events, 'Q') < strchr(native_events, 'T'));
+    assert(strchr(native_events, 'T') < strchr(native_events, 'S'));
     assert(clear_calls == 1 && swap_calls == 1);
     assert(actions == XGL_CTX_NEW_FRAME_SWITCH_BUFFER);
     assert(!xb.frame && !xb.scene_active && !xb.ui_active && !queued_count);
@@ -710,6 +804,91 @@ static void test_clear_and_lighting(void)
     assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 3);
 }
 
+/* A frame can ask its clear to leave the status bar's rows alone. The
+ * viewport is cut short for the clear only, the way the benchmark's probe
+ * did it on the device, and nothing is drawn until XGL's own mapping of the
+ * whole window is back. */
+static void test_frame_keep(void)
+{
+    xgl_vertex_t raw[3];
+    int i;
+    reset_backend();
+    memset(raw, 0, sizeof(raw));
+    /* Unasked, a frame clears the whole window and touches no viewport. */
+    XGL_BeginFrame();
+    assert(clear_calls == 1 && !viewport_sets && !viewport_gets);
+    assert(clear_viewport.ymax == 479 && XGL_FrameKeepStreak() == 0);
+    assert(!profile_counts[XGL_PROFILE_BAR_KEPT]);
+    XGL_EndFrame();
+    /* Asked: XGL's viewport is read once, the clear stops 48 rows short of
+     * the bottom, and the mapping is whole again afterwards. */
+    for (i = 1; i <= 3; ++i) {
+        XGL_SetFrameKeep(48);
+        XGL_BeginFrame();
+        assert(clear_calls == 1 + i && viewport_gets == 1 && viewport_sets == 2 * i);
+        assert(clear_viewport.ymin == 0 && clear_viewport.ymax == 479 - 48);
+        assert(clear_viewport.xmin == 0 && clear_viewport.xmax == 639);
+        assert(mapping == XGL_VDC_MAP_ALL && dc_viewport.ymax == 479);
+        assert(XGL_FrameKeepStreak() == i);
+        assert(profile_counts[XGL_PROFILE_BAR_KEPT] == (unsigned long)i);
+        XGL_BeginScene();
+        XGL_DrawTriangles(raw, 3, 0, 1, 1);
+        XGL_UIFill(0, 0, 8, 8, 1, 1);
+        XGL_EndFrame();
+    }
+    /* The request is for one frame. */
+    XGL_BeginFrame();
+    assert(clear_viewport.ymax == 479 && XGL_FrameKeepStreak() == 0 && viewport_sets == 6);
+    XGL_EndFrame();
+    /* Other rows are another bar: the count starts again. */
+    XGL_SetFrameKeep(48); XGL_BeginFrame(); XGL_EndFrame();
+    XGL_SetFrameKeep(48); XGL_BeginFrame(); XGL_EndFrame();
+    assert(XGL_FrameKeepStreak() == 2);
+    XGL_SetFrameKeep(24); XGL_BeginFrame();
+    assert(clear_viewport.ymax == 479 - 24 && XGL_FrameKeepStreak() == 1);
+    XGL_EndFrame();
+    /* Nothing sensible is left to clear, or to keep. */
+    XGL_SetFrameKeep(480); XGL_BeginFrame();
+    assert(clear_viewport.ymax == 479 && XGL_FrameKeepStreak() == 0);
+    XGL_EndFrame();
+    XGL_SetFrameKeep(-5); XGL_BeginFrame();
+    assert(clear_viewport.ymax == 479 && XGL_FrameKeepStreak() == 0);
+    XGL_EndFrame();
+    /* A screen row must be a device row. */
+    vid.height = 240;
+    XGL_SetFrameKeep(24); XGL_BeginFrame();
+    assert(clear_viewport.ymax == 479 && XGL_FrameKeepStreak() == 0);
+    XGL_EndFrame();
+    vid.height = 480;
+    /* A resized window has new buffers and another viewport. */
+    XGL_SetFrameKeep(48); XGL_BeginFrame(); XGL_EndFrame();
+    XGL_SetFrameKeep(48); XGL_BeginFrame(); XGL_EndFrame();
+    assert(XGL_FrameKeepStreak() == 2 && viewport_gets == 1);
+    XGLB_Resize(320, 240);
+    vid.width = 320; vid.height = 240;
+    assert(XGL_FrameKeepStreak() == 0);
+    mapping = XGL_VDC_MAP_ALL;
+    dc_viewport.xmax = 319; dc_viewport.ymax = 239;
+    XGL_SetFrameKeep(48); XGL_BeginFrame();
+    assert(viewport_gets == 2 && clear_viewport.ymax == 239 - 48 && XGL_FrameKeepStreak() == 1);
+    XGL_EndFrame();
+
+    /* A device whose viewport is not the window's rows from the top is left
+     * alone: everything is cleared, and the caller is told. */
+    reset_backend();
+    viewport_origin = 16; dc_viewport.ymin = 16; dc_viewport.ymax = 16 + 479;
+    for (i = 0; i < 2; ++i) {
+        XGL_SetFrameKeep(48); XGL_BeginFrame();
+        assert(viewport_gets == 1 && !viewport_sets && XGL_FrameKeepStreak() == 0);
+        assert(clear_viewport.ymin == 16 && clear_viewport.ymax == 16 + 479);
+        assert(!profile_counts[XGL_PROFILE_BAR_KEPT]);
+        XGL_EndFrame();
+    }
+}
+
+/* Text waits in the backend's queue; these contracts look at it drawn. */
+static void ui_now(void) { submit_ui_text(); }
+
 static void test_fonts_and_gamma(void)
 {
     int extents, i;
@@ -717,6 +896,8 @@ static void test_fonts_and_gamma(void)
     xgl_vertex_t vertices[3];
     reset_backend();
     XGL_UIText(10, 20, "Hg|-. ", 1, 8, 8);
+    assert(!text_calls && extent_calls == 98); /* Measured when asked for. */
+    ui_now();
     assert(text_calls == 4 && glyph_count == 5 && extent_calls == 98);
     for (i = 1; i < 5; ++i)
         assert(recorded_glyph_position[i].y == recorded_glyph_position[0].y);
@@ -726,13 +907,20 @@ static void test_fonts_and_gamma(void)
     XGL_UIText(10, 60, "H", 1, 16, 16);
     assert(extent_calls == extents + 98 && text_height > original_height);
     XGL_UIText(10, 80, "H", 1, 8, 8);
-    assert(extent_calls == extents + 98 && text_height == original_height);
+    assert(extent_calls == extents + 98);
+    /* Drawn by size: the two small runs first, then the large one, with
+     * one change of height where the calls in order would have made two. */
+    ui_now();
+    assert(text_calls == 7 && text_height > original_height);
+    assert(recorded_position[4].y < recorded_position[5].y);
+    assert(recorded_position[5].y > recorded_position[6].y);
     XGL_UIFlush();
     assert(queued_count == 0);
     for (i = 0; i < 256; ++i) gammatable[i] = (byte)(255 - i);
     xgl_palette[3] = 64; xgl_palette[4] = 128; xgl_palette[5] = 255;
     XGL_BeginFrame();
     XGL_UIText(0, 0, "H", 1, 8, 8);
+    ui_now();
     assert(fabs(text_color.rgb.r - 191.0 / 255) < .0001);
     assert(fabs(text_color.rgb.g - 127.0 / 255) < .0001 && text_color.rgb.b == 0);
     XGL_UIFillRGB(0, 0, 8, 8, color, 1);
@@ -893,6 +1081,190 @@ static void test_native_batches(void)
     assert(!xb.count && polygon_calls == 2);
 }
 
+static void fill_color_vertices(xgl_color_vertex_t *vertices, int count, int first)
+{
+    int i;
+    for (i = 0; i < count; ++i) {
+        vertices[i].position[0] = (float)(first + i);
+        vertices[i].position[1] = .25f;
+        vertices[i].position[2] = .5f;
+        vertices[i].color.rgb[0] = .2f;
+        vertices[i].color.rgb[1] = .4f;
+        vertices[i].color.rgb[2] = .6f;
+    }
+}
+
+/* Unlit geometry is submitted as points without normals. A polygon call
+ * holds points of one kind, so the two kinds never share a batch. */
+static void test_color_batches(void)
+{
+    static xgl_color_vertex_t cached[XGL_BATCH_TRIANGLES * 3 + 3];
+    xgl_color_vertex_t *reserved;
+    xgl_native_vertex_t normals[3], *lit;
+    xgl_vertex_t raw[3];
+    unsigned long changes;
+    int i, count, total;
+    reset_backend();
+    /* Without a scene nothing is lent, reserved or drawn. */
+    fill_color_vertices(cached, XGL_BATCH_TRIANGLES * 3 + 3, 0);
+    count = 3;
+    assert(!XGL_ReserveColorTriangles(&count, 1, 1) && count == 0);
+    XGL_DrawColorTriangles(cached, 3, 1, 1);
+    assert(!xb.count);
+    XGL_BeginScene();
+    XGL_DrawColorTriangles(cached, 6, 1, 1);
+    assert(xb.count == 6 && !polygon_calls);
+    assert(xb.lists[0].pt_type == XGL_PT_COLOR_F3D && xb.lists[0].num_pts == 3);
+    assert((const void *)xb.lists[0].pts.color_f3d == cached);
+    assert((const void *)xb.lists[1].pts.color_f3d == cached + 3);
+    /* Borrowed and reserved records of the same kind share a batch. */
+    count = XGL_BATCH_TRIANGLES * 3;
+    reserved = XGL_ReserveColorTriangles(&count, 1, 1);
+    assert(reserved == xb.color_points + 6 && count == XGL_BATCH_TRIANGLES * 3 - 6);
+    fill_color_vertices(reserved, count, 6);
+    assert(!polygon_calls);
+    XGL_Flush();
+    assert(submitted_count == XGL_BATCH_TRIANGLES * 3 && polygon_calls == 1);
+    assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+    assert(submitted_sources[0] == cached && submitted_sources[2] == xb.color_points + 6);
+    for (i = 0; i < submitted_count; ++i) {
+        assert(submitted_plain[i] && submitted_vertices[i].x == (float)i);
+        assert(submitted_vertices[i].y == .25f && submitted_vertices[i].z == .5f);
+        assert(submitted_vertices[i].color.rgb.r == .2f && submitted_vertices[i].color.rgb.g == .4f);
+        assert(submitted_vertices[i].color.rgb.b == .6f);
+    }
+    assert(profile_counts[XGL_PROFILE_NATIVE_CACHED_VERTICES] == 6);
+    assert(profile_counts[XGL_PROFILE_NATIVE_DIRECT_VERTICES] == (unsigned long)count);
+
+    /* More than a batch is split; the remainder waits for the next flush. */
+    reset_backend(); XGL_BeginScene();
+    XGL_DrawColorTriangles(cached, XGL_BATCH_TRIANGLES * 3 + 3, 1, 1);
+    assert(polygon_calls == 1 && xb.count == 3);
+    /* Unlit triangles through the general entry points are packed the same
+     * way and join that batch. */
+    memset(raw, 0, sizeof(raw));
+    for (i = 0; i < 3; ++i) {
+        raw[i].position[0] = 771.0f + i; raw[i].normal[2] = 1; raw[i].color[0] = 1;
+    }
+    XGL_DrawTriangles(raw, 3, 0, 1, 1);
+    assert(xb.count == 6 && polygon_calls == 1);
+    assert((const void *)xb.lists[1].pts.color_f3d == xb.color_points + 3);
+    XGL_Flush();
+    total = XGL_BATCH_TRIANGLES * 3 + 6;
+    assert(submitted_count == total && polygon_calls == 2);
+    for (i = 0; i < total; ++i) assert(submitted_plain[i] && submitted_vertices[i].x == (float)i);
+    assert(profile_counts[XGL_PROFILE_VERTEX_PACKED] == 3);
+
+    /* A change of kind ends the batch even when the drawing state is the
+     * same, and is not a state change. */
+    reset_backend(); XGL_BeginScene();
+    XGL_DrawColorTriangles(cached, 3, 1, 1);
+    XGL_Flush();
+    changes = profile_counts[XGL_PROFILE_STATE_CHANGES];
+    XGL_DrawColorTriangles(cached, 3, 1, 1);
+    count = 3;
+    lit = XGL_ReserveTriangles(&count, 0, 1, 1);
+    assert(lit == xb.points && count == 3 && polygon_calls == 2 && xb.count == 3);
+    assert(xb.lists[0].pt_type == XGL_PT_COLOR_NORMAL_F3D);
+    fill_native_vertices(lit, 3, 3);
+    XGL_DrawColorTriangles(cached + 6, 3, 1, 1);
+    assert(polygon_calls == 3 && xb.count == 3 && xb.lists[0].pt_type == XGL_PT_COLOR_F3D);
+    XGL_Flush();
+    assert(polygon_calls == 4 && submitted_count == 12);
+    assert(submitted_plain[0] && submitted_plain[3] && !submitted_plain[6] && submitted_plain[9]);
+    assert(submitted_vertices[6].normal.z == 1 && submitted_vertices[9].x == 6);
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == changes);
+
+    /* Illuminated triangles keep their normals; the unlit ones that follow
+     * drop them, with the one state change between. */
+    reset_backend(); XGL_BeginScene();
+    fill_native_vertices(normals, 3, 0);
+    XGL_DrawNativeTriangles(normals, 3, 1, 1, 1);
+    XGL_DrawTrianglesStrided(raw, 3, sizeof(raw[0]), 1, 1, 1, 1);
+    assert(!polygon_calls && xb.count == 6);
+    XGL_DrawColorTriangles(cached, 3, 1, 1);
+    assert(polygon_calls == 1 && submitted_count == 6 && illumination == XGL_ILLUM_PER_VERTEX);
+    assert(!submitted_plain[0] && !submitted_plain[3]);
+    XGL_DrawTrianglesStrided(raw, 3, sizeof(raw[0]), 0, 1, 1, 1);
+    XGL_Flush();
+    assert(polygon_calls == 2 && submitted_count == 12);
+    assert(submitted_plain[6] && submitted_plain[9]);
+    assert(submitted_vertices[9].x == 771 && submitted_vertices[9].color.rgb.r == 1);
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 2);
+
+    /* Blended, depth-preserving use (water) and invisible geometry. */
+    reset_backend(); XGL_BeginScene();
+    XGL_DrawColorTriangles(cached, 3, .5f, 0);
+    XGL_Flush();
+    assert(polygon_calls == 1 && transparency == XGL_TRANSP_BLENDED && freeze_z && !write_mask);
+    XGL_DrawColorTriangles(cached, 3, 0, 1);
+    count = 3;
+    assert(!XGL_ReserveColorTriangles(&count, 0, 1) && !count);
+    assert(!xb.count && polygon_calls == 1);
+}
+
+static void test_color_strips(void)
+{
+    xgl_color_vertex_t points[8], cached[6];
+    xgl_native_vertex_t normals[3];
+    int i;
+    reset_backend();
+    fill_color_vertices(points, 8, 0);
+    fill_color_vertices(cached, 6, 100);
+    /* Without a scene, or without three points, nothing is drawn. */
+    XGL_DrawColorStrip(points, 8, 1, 1);
+    XGL_BeginScene();
+    XGL_DrawColorStrip(points, 2, 1, 1);
+    XGL_DrawColorStrip(NULL, 8, 1, 1);
+    assert(!strip_calls && !submitted_count);
+    /* A strip is one native call, made at once. Triangles of the same
+     * state that wait in the batch stay there. */
+    XGL_DrawColorTriangles(cached, 6, 1, 1);
+    XGL_DrawColorStrip(points, 8, 1, 1);
+    assert(strip_calls == 1 && strip_points == 8 && !polygon_calls && xb.count == 6);
+    assert(submitted_count == 8 && illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+    for (i = 0; i < 8; ++i) {
+        assert(submitted_plain[i] && submitted_vertices[i].x == (float)i);
+        assert(submitted_vertices[i].y == .25f && submitted_vertices[i].color.rgb.b == .6f);
+    }
+    assert(profile_counts[XGL_PROFILE_TRIANGLES] == 6);
+    assert(profile_counts[XGL_PROFILE_STRIP_CALLS] == 1);
+    assert(profile_counts[XGL_PROFILE_STRIP_TRIANGLES] == 6);
+    assert(profile_counts[XGL_PROFILE_NATIVE_DIRECT_VERTICES] == 8);
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 1 && profile_sections[XGL_PROFILE_SUBMIT] == 1);
+    XGL_DrawColorStrip(points + 2, 3, 1, 1);
+    assert(strip_calls == 2 && strip_points == 3 && profile_counts[XGL_PROFILE_STATE_CHANGES] == 1);
+    XGL_Flush();
+    assert(polygon_calls == 1 && submitted_count == 8 + 3 + 6);
+    assert(profile_counts[XGL_PROFILE_TRIANGLES] == 6 + 1 + 2);
+    assert(profile_counts[XGL_PROFILE_STRIP_TRIANGLES] == 7);
+    /* A strip has no normals and is unlit: illuminated triangles that
+     * wait are sent first, with the one state change between. */
+    reset_backend(); XGL_BeginScene();
+    fill_native_vertices(normals, 3, 0);
+    XGL_DrawNativeTriangles(normals, 3, 1, 1, 1);
+    XGL_DrawColorStrip(points, 5, 1, 1);
+    assert(polygon_calls == 1 && strip_calls == 1 && !xb.count);
+    assert(strchr(native_events, 'G') < strchr(native_events, 'R'));
+    assert(illumination == XGL_ILLUM_NONE_INTERP_COLOR);
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 2);
+    /* Blended triangles that wait go first as well: their order shows. */
+    reset_backend(); XGL_BeginScene();
+    XGL_DrawColorTriangles(cached, 3, .5f, 0);
+    XGL_DrawColorStrip(points, 4, .5f, 0);
+    assert(polygon_calls == 1 && strip_calls == 1 && !xb.count);
+    assert(strchr(native_events, 'G') < strchr(native_events, 'R'));
+    assert(transparency == XGL_TRANSP_BLENDED && freeze_z && !write_mask);
+    /* Triangles after a strip join a batch of the strip's state. */
+    XGL_DrawColorTriangles(cached, 3, .5f, 0);
+    assert(polygon_calls == 1 && xb.count == 3);
+    XGL_Flush();
+    assert(profile_counts[XGL_PROFILE_STATE_CHANGES] == 1);
+    /* Invisible geometry is not sent. */
+    XGL_DrawColorStrip(points, 4, 0, 1);
+    assert(strip_calls == 1);
+}
+
 static void test_prepared_palette(void)
 {
     float expected[3], actual[3];
@@ -939,6 +1311,12 @@ static void check_text_cells(const char *text, float x, float y,
     assert(index == glyph_count);
 }
 
+static void ui_text_now(float x, float y, const char *text, int color, float cell, float height)
+{
+    XGL_UIText(x, y, text, color, cell, height);
+    ui_now();
+}
+
 static void test_text_runs(void)
 {
     char mutable_text[65], long_text[301];
@@ -946,14 +1324,14 @@ static void test_text_runs(void)
     int first, extents, calls, i;
     reset_backend();
     /* A measured one-cell space stays inside the run: one native call. */
-    XGL_UIText(8, 16, "HHH Loading", 2, 8, 8);
+    ui_text_now(8, 16, "HHH Loading", 2, 8, 8);
     assert(text_calls == 1 && glyph_count == 10);
     assert(profile_counts[XGL_PROFILE_TEXT_CALLS] == 1);
     assert(profile_counts[XGL_PROFILE_GLYPHS] == 10);
     assert(!strcmp(queued_string_copy[0], "HHH Loading"));
     check_text_cells("HHH Loading", 8, 16, 8, 8, 0);
     first = glyph_count; extents = extent_calls;
-    XGL_UIText(32, 24, "HHH", 3, 8, 8);
+    ui_text_now(32, 24, "HHH", 3, 8, 8);
     assert(extent_calls == extents && text_calls == 2);
     check_text_cells("HHH", 32, 24, 8, 8, first);
     XGL_UIFlush();
@@ -962,7 +1340,7 @@ static void test_text_runs(void)
     /* Leading, repeated and trailing spaces never reach the native call as
      * a run's first or last character, and never move a later glyph. */
     reset_backend();
-    XGL_UIText(8, 16, "  HH   HH  H  ", 2, 8, 8);
+    ui_text_now(8, 16, "  HH   HH  H  ", 2, 8, 8);
     assert(text_calls == 1 && glyph_count == 5);
     assert(!strcmp(queued_string_copy[0], "HH   HH  H"));
     check_text_cells("  HH   HH  H  ", 8, 16, 8, 8, 0);
@@ -970,7 +1348,7 @@ static void test_text_runs(void)
 
     /* A font whose space is not one cell wide keeps splitting at spaces. */
     reset_backend(); space_mode = 1;
-    XGL_UIText(8, 16, "HHH Loading", 2, 8, 8);
+    ui_text_now(8, 16, "HHH Loading", 2, 8, 8);
     assert(text_calls == 2 && glyph_count == 10);
     assert(!strcmp(queued_string_copy[0], "HHH") && !strcmp(queued_string_copy[1], "Loading"));
     check_text_cells("HHH Loading", 8, 16, 8, 8, 0);
@@ -979,35 +1357,35 @@ static void test_text_runs(void)
     /* Unequal widths/advances keep the old centered glyph origins. A run
      * may end at an unusual glyph but cannot shift following characters. */
     reset_backend(); proportional_metrics = 1;
-    XGL_UIText(8, 16, mixed, 2, 8, 8);
+    ui_text_now(8, 16, mixed, 2, 8, 8);
     assert(text_calls > 3 && text_calls < glyph_count);
     check_text_cells(mixed, 8, 16, 8, 8, 0);
     first = glyph_count;
-    XGL_UIText(-16, 32, "ABHHH", 2, 8, 8);
+    ui_text_now(-16, 32, "ABHHH", 2, 8, 8);
     check_text_cells("ABHHH", -16, 32, 8, 8, first);
     first = glyph_count;
-    XGL_UIText(632, 48, "HHHH", 2, 8, 8);
+    ui_text_now(632, 48, "HHHH", 2, 8, 8);
     check_text_cells("HHHH", 632, 48, 8, 8, first);
     first = glyph_count;
-    XGL_UIText(16, -8, "HHHH", 2, 8, 8);
+    ui_text_now(16, -8, "HHHH", 2, 8, 8);
     assert(glyph_count == first);
     first = glyph_count;
-    XGL_UIText(16, 64, "\001\310 H", 2, 8, 8);
+    ui_text_now(16, 64, "\001\310 H", 2, 8, 8);
     check_text_cells("\001\310 H", 16, 64, 8, 8, first);
     XGL_UIFlush();
 
     /* Calibration uses the native result, including implementations with
      * a different spacing unit or no useful spacing response. */
     reset_backend(); spacing_mode = 1;
-    XGL_UIText(0, 0, "HHHH", 2, 8, 8);
+    ui_text_now(0, 0, "HHHH", 2, 8, 8);
     assert(text_calls == 1);
     check_text_cells("HHHH", 0, 0, 8, 8, 0);
     reset_backend(); spacing_mode = 2;
-    XGL_UIText(0, 0, "HHHH", 2, 8, 8);
+    ui_text_now(0, 0, "HHHH", 2, 8, 8);
     assert(text_calls == 4 && current_spacing == 0);
     check_text_cells("HHHH", 0, 0, 8, 8, 0);
     reset_backend(); vertical_advance = 1;
-    XGL_UIText(0, 0, "HHggHH", 2, 8, 8);
+    ui_text_now(0, 0, "HHggHH", 2, 8, 8);
     assert(text_calls == 3);
     check_text_cells("HHggHH", 0, 0, 8, 8, 0);
     XGL_UIFlush();
@@ -1017,22 +1395,27 @@ static void test_text_runs(void)
     reset_backend();
     memset(mutable_text, 'H', 64); mutable_text[64] = 0;
     XGL_UIText(0, 0, mutable_text, 2, 8, 8);
+    /* Queued, not drawn: the caller's buffer may change at once. */
+    assert(!text_calls);
     memset(mutable_text, 'Q', 64);
     for (i = 0; i < 79; ++i) XGL_UIText(0, 8, mutable_text, 2, 8, 8);
-    assert(text_calls == 80 && glyph_count == 5120 && flush_calls >= 1);
+    /* The queue's storage filled on the way and was drawn then. */
+    assert(text_calls > 0 && text_calls < 80 && flush_calls >= 1);
     XGL_UIFlush();
-    assert(!queued_count && !xb.ui_text_used);
+    assert(text_calls == 80 && glyph_count == 5120);
+    for (i = 0; i < 5120; ++i) assert(recorded_glyph[i] == (i < 64 ? 'H' : 'Q'));
+    assert(!queued_count && !xb.ui_text_used && !xb.ui_run_first && !xb.ui_glyph_count);
 
     reset_backend();
     xb.width = vid.width = 3000;
     memset(long_text, 'H', 300); long_text[300] = 0;
-    XGL_UIText(0, 0, long_text, 2, 8, 8);
+    ui_text_now(0, 0, long_text, 2, 8, 8);
     assert(text_calls == 3 && glyph_count == 300);
     check_text_cells(long_text, 0, 0, 8, 8, 0);
     calls = text_calls;
     XGLB_Resize(1500, 480);
     first = glyph_count;
-    XGL_UIText(0, 0, "HHH", 2, 8, 8);
+    ui_text_now(0, 0, "HHH", 2, 8, 8);
     assert(text_calls == calls + 1);
     check_text_cells("HHH", 0, 0, 8, 8, first);
     XGL_UIFlush();
@@ -1042,30 +1425,78 @@ static void test_ui_batch_order_and_capacity(void)
 {
     float red[3] = {1, 0, 0}, green[3] = {0, 1, 0}, blue[3] = {0, 0, 1};
     const char *quad, *text, *alpha;
-    int i;
+    int i, colors;
     reset_backend();
     XGL_UIFillRGB(0, 0, 20, 20, red, 1);
     XGL_UIFillRGB(2, 3, 12, 10, green, 1);
     assert(polygon_calls == 0);
     XGL_UIText(3, 4, "H", 1, 8, 8);
-    assert(polygon_calls == 1 && quad_batches[0] == 2 && recorded_quads == 2);
+    /* Nothing is drawn yet: the text waits, and the rectangles with it. */
+    assert(!polygon_calls && !text_calls);
+    /* A rectangle elsewhere joins them, and so does one that only touches
+     * the text's cell, which is 3..11 across and 4..12 down. */
+    XGL_UIFillRGB(40, 5, 8, 8, blue, 1);
+    XGL_UIFillRGB(11, 4, 8, 8, blue, 1);
+    XGL_UIFillRGB(3, 12, 8, 8, blue, 1);
+    assert(!polygon_calls && !text_calls);
+    /* One that would cover part of the text has the text drawn first, over
+     * every rectangle asked for so far: what the calls in order would show. */
+    XGL_UIFillRGB(4, 5, 8, 8, blue, 1);
+    assert(polygon_calls == 1 && quad_batches[0] == 5 && recorded_quads == 5 && text_calls == 1);
     assert(recorded_quad_colors[0].rgb.r == 1 && recorded_quad_colors[1].rgb.g == 1);
     assert(recorded_quad_points[0][0].x == 0 && recorded_quad_points[1][0].x == 2);
     assert(recorded_quad_points[1][0].y == 3 && recorded_quad_points[1][2].y == 13);
     quad = strchr(native_events, 'Q'); text = strchr(native_events, 'T');
     assert(quad && text && quad < text);
-    XGL_UIFillRGB(4, 5, 8, 8, blue, 1);
-    assert(polygon_calls == 1);
+    /* A blended rectangle goes through the 3D context; what waits is
+     * completed before it. */
     XGL_UIFillRGB(0, 0, 30, 30, red, .5f);
-    assert(polygon_calls == 3 && quad_batches[1] == 1 && recorded_quads == 3);
-    assert(recorded_quad_colors[2].rgb.b == 1);
+    assert(polygon_calls == 3 && quad_batches[1] == 1 && recorded_quads == 6);
+    assert(recorded_quad_colors[5].rgb.b == 1 && recorded_quad_points[5][0].x == 4);
     quad = strchr(text, 'Q'); alpha = strchr(native_events, 'A');
     assert(quad && alpha && text < quad && quad < alpha);
     XGL_UIFillRGB(1, 2, 8, 8, green, 1);
     XGL_EndFrame();
     quad = strchr(alpha, 'Q');
     assert(quad && strchr(quad, 'S') && quad < strchr(quad, 'S'));
-    assert(recorded_quads == 4 && recorded_quad_colors[3].rgb.g == 1);
+    assert(recorded_quads == 7 && recorded_quad_colors[6].rgb.g == 1);
+
+    /* Text drawn early stays where the device may still be reading it, and
+     * later text does not take its place. */
+    reset_backend();
+    XGL_UIText(0, 0, "HHH", 1, 8, 8);
+    XGL_UIFillRGB(0, 0, 8, 8, red, 1);
+    assert(text_calls == 1 && !polygon_calls && xb.ui_run_first == 1);
+    XGL_UIText(0, 16, "gg", 1, 8, 8);
+    assert(xb.ui_glyph_count == 2 && xb.ui_text_used == 7 && text_calls == 1);
+    XGL_UIFlush(); /* The fake device checks every string it was given. */
+    assert(text_calls == 2 && polygon_calls == 1 && !queued_count);
+    assert(!strcmp(queued_string_copy[0], "HHH") && !strcmp(queued_string_copy[1], "gg"));
+    assert(!xb.ui_run_first && !xb.ui_glyph_count && !xb.ui_text_used);
+
+    /* A status bar: boxes and their labels by turns, no box over another's
+     * label. One call draws every rectangle; the labels follow, those of
+     * one size and color together, in the order they were asked for. */
+    reset_backend();
+    for (i = 0; i < 6; ++i) {
+        XGL_UIFillRGB((float)(i * 40), 400, 32, 16, red, 1);
+        XGL_UIText((float)(i * 40 + 4), 404, "HH", i & 1 ? 2 : 1, i % 3 == 2 ? 6.0f : 8.0f, 8);
+    }
+    assert(!polygon_calls && !text_calls);
+    colors = text_color_sets;
+    XGL_UIFlush();
+    assert(polygon_calls == 1 && quad_batches[0] == 6 && text_calls == 6);
+    quad = strchr(native_events, 'Q');
+    assert(quad && !strncmp(quad, "QTTTTTTf", 8));
+    assert(profile_counts[XGL_PROFILE_TEXT_CALLS] == 6 && profile_counts[XGL_PROFILE_GLYPHS] == 12);
+    assert(profile_counts[XGL_PROFILE_POLYGON_CALLS] == 1);
+    /* Boxes 0 and 4, 1 and 3, then 2, then 5: four colors set, not six. */
+    assert(text_color_sets == colors + 4);
+    assert(recorded_position[0].x < recorded_position[1].x);
+    assert(recorded_position[1].x > recorded_position[2].x);
+    assert(recorded_position[2].x < recorded_position[3].x);
+    assert(recorded_position[3].x > recorded_position[4].x);
+    assert(recorded_position[4].x < recorded_position[5].x);
 
     reset_backend();
     for (i = 0; i < XGL_UI_QUADS + 3; ++i)
@@ -1302,10 +1733,13 @@ int main(void)
     test_console_clip_projection();
     test_console_clip_full_cover();
     test_clear_and_lighting();
+    test_frame_keep();
     test_fonts_and_gamma();
     test_text_runs();
     test_strided_prepared_colors();
     test_native_batches();
+    test_color_batches();
+    test_color_strips();
     test_prepared_palette();
     test_ui_batch_order_and_capacity();
     test_completion_and_attribute_reuse();

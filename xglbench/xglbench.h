@@ -5,11 +5,11 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define XB_VERSION "0.9.3"
+#define XB_VERSION "0.9.6"
 #define XB_MAX_QUEUE 8
 #define XB_MAX_LIGHTS 4
 #define XB_STYLE_LAYERS 4
-#define XB_MAX_RESULTS 512
+#define XB_MAX_RESULTS 576
 #define XB_MAX_REPEATS 31
 #define XB_METHODS 4
 #define XB_TEXTURE_WIDTH 64
@@ -52,7 +52,7 @@ enum xb_texture_filter { XB_TEXTURE_OFF, XB_TEXTURE_POINT,
 enum xb_probe { XB_PROBE_NONE, XB_PROBE_LIT_NO_ILLUM, XB_PROBE_LIGHTS_OFF,
                 XB_PROBE_STATE_GROUPED, XB_PROBE_STATE_ALTERNATE,
                 XB_PROBE_PERSIST_DEPTH, XB_PROBE_PERSIST_VIEWPORT,
-                XB_PROBE_SWAP };
+                XB_PROBE_SWAP, XB_PROBE_MESH };
 enum xb_profile { XB_QUICK, XB_MEDIUM, XB_LONG, XB_EXTRALONG };
 enum xb_failure { XB_FAILURE_NONE, XB_FAILURE_ERROR, XB_FAILURE_API,
                   XB_FAILURE_VALIDATION, XB_FAILURE_UNSUPPORTED,
@@ -95,6 +95,8 @@ typedef struct {
 typedef struct {
     int width, height, force_size;
     int repeats, base_triangles, allow_fallback, list_only, queue, custom_timing, sim_fps;
+    /* Leave XGL_SYS_ST_ERROR_DETECTION at FALSE, XGL's own default. */
+    int no_error_detection;
     enum xb_profile profile;
     double seconds, warmup, pause;
     const char *csv_path, *filter, *display;

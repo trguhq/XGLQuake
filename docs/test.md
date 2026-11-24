@@ -4,11 +4,37 @@ Shareware recognition, CPU texture/mesh, native UI/entity/particle submission, a
 queueing and profiling tests need no SDK or game data. They run against
 controlled engine/backend mocks. Alias color checks also use the real CPU
 texture sampler to compare cached output with the original color calculation.
+The texture tests compare every level of the reduced images with its
+definition, for sizes that are halved evenly and for ones that are not, and
+follow materials from one map to the next: kept when asked for again,
+replaced when their texels differ, released when not, or early when their
+memory or their place is needed.
 The SMP tests use a real POSIX worker with controlled CPU counts and startup
 failures to check mode selection, queuing, reclaiming of unstarted jobs,
 draining, and shutdown. The world and entity tests also cover drawing order
 by native state, map-load mesh building, the per-frame build limit, detail
-eviction and the identity record that lets model caches skip comparisons.
+eviction and the identity record that lets model caches skip comparisons;
+detail placed by contrast and by apparent size; and geometry submitted with
+and without normals, including the copies walls keep for dynamic lights;
+and that a face wholly outside the view is left out of the frame but found
+built when the view turns to it.
+The entity tests also draw a model as triangle strips and as separate
+triangles and require the same triangles either way, from the serial path
+and from the worker's output, and the mesh tests check the loader's two
+records of which vertices are one point: on the skin, and in space.
+The entity tests require a model drawn from its kept mesh to match the
+same model drawn by direct recursion, check that each vertex of a model and
+each middle of an edge is placed once, that light at a middle is the mean
+of its ends', and that nothing is kept for a pose.
+The shape tests examine made-up textures: which have shapes and which do
+not, bands, sloping edges, where a repeat begins, and the frames of an
+animated texture. They cut faces along the result and check that the pieces
+cover the face exactly, have the texture's colors, and share every corner
+that lies along a side. The world tests then draw such walls: their colors
+and baked light, the steps of detail by distance, and the limits; and load a
+map again to see that nothing is examined twice.
+The screen tests cover when an unchanged status bar is left in place, and
+the UI tests that every picture name draws what it did before.
 Run from `WinQuake/`:
 
 ```sh
@@ -42,8 +68,10 @@ against the SDK headers; it does not require Python. It captures SDK calls to ch
 clipping, lighting selection/state changes and their count, gamma and
 native font placement/cache behavior, including spaces kept inside text
 runs. It also checks view placement after
-resizing, strided/prepared vertex colors, cached/direct geometry batches,
-UI batch ordering and lifetimes, completion waits, and error diagnostics
+resizing, strided/prepared vertex colors, cached/direct geometry batches of
+points with and without normals, a clear that leaves the status bar's rows
+alone and the mapping restored after it, queued UI text and rectangles and
+their order and lifetimes, completion waits, and error diagnostics
 with missing library message fields.
 It does not rasterize those calls.
 

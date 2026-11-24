@@ -25,6 +25,12 @@ command line, run `make -f Makefile.XGL clean` before rebuilding because the
 dependency files only track inputs on disk. `clean` also removes the
 generated dependency files.
 
+Two things rebuild every object: a change to `Makefile.XGL`, and a change to
+`xgl_local.h`, which every source includes through `quakedef.h`. That header
+holds only what the original Quake sources need. The renderer's own
+interface is in `xgl_render.h`, which only the `xgl_` sources include, so
+renderer work normally rebuilds those alone.
+
 The SDK paths default to `/opt/SUNWits/Graphics-sw/xgl` and `/usr/openwin`.
 Override them if necessary:
 

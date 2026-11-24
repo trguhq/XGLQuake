@@ -5,6 +5,7 @@
  * Output goes to the terminal, never the in-game console being measured.
  */
 #include "quakedef.h"
+#include "xgl_render.h"
 #include "xgl_profile.h"
 
 static cvar_t xgl_profile = {"xgl_profile", "0", false, false, 0, NULL};
@@ -167,8 +168,9 @@ void XGL_ProfileEndFrame(void)
     Sys_Printf("XGL profile: %lu frames; gfx %.2f ms (max %.2f); "
         "world %.2f entities %.2f effects %.2f weapon %.2f UI %.2f audio-overlap %.2f ms\n"
         "  native calls (overlap stages): submit %.2f sync %.2f swap %.2f state %.2f ms; "
-        "per frame: triangles %.1f glyphs %.1f polygon calls %.1f waits %.1f "
-        "state changes %.1f\n",
+        "per frame: triangles %.1f glyphs %.1f polygon calls %.1f "
+        "strip calls %.1f (%.1f triangles) waits %.1f "
+        "state changes %.1f status bar kept %.2f\n",
         total_frames, total_frame * scale, maximum_frame * 1000.0,
         total_sections[XGL_PROFILE_WORLD] * scale,
         total_sections[XGL_PROFILE_ENTITIES] * scale,
@@ -183,23 +185,28 @@ void XGL_ProfileEndFrame(void)
         (double)total_counts[XGL_PROFILE_TRIANGLES] / total_frames,
         (double)total_counts[XGL_PROFILE_GLYPHS] / total_frames,
         (double)total_counts[XGL_PROFILE_POLYGON_CALLS] / total_frames,
+        (double)total_counts[XGL_PROFILE_STRIP_CALLS] / total_frames,
+        (double)total_counts[XGL_PROFILE_STRIP_TRIANGLES] / total_frames,
         (double)total_counts[XGL_PROFILE_WAIT_CALLS] / total_frames,
-        (double)total_counts[XGL_PROFILE_STATE_CHANGES] / total_frames);
+        (double)total_counts[XGL_PROFILE_STATE_CHANGES] / total_frames,
+        (double)total_counts[XGL_PROFILE_BAR_KEPT] / total_frames);
     if (profile_reporting == 2) {
         Sys_Printf("  detail ms (overlap stages; select includes builds): "
             "visibility %.2f select %.2f build %.2f colors %.2f animated %.2f "
             "pack %.2f alias-cache/transform %.2f\n"
             "  world per frame: cached draws %.1f fallback draws %.1f "
             "builds %.1f failed builds %.1f; color reuse %.1f updates %.1f; "
-            "vertices built %.1f recolored %.1f animated %.1f; detail meshes evicted %.1f\n"
-            "  world detail per frame: faces %.1f triangles %.1f; "
+            "vertices built %.1f recolored %.1f animated %.1f; detail meshes evicted %.1f; "
+            "faces outside the view, not drawn %.1f\n"
+            "  world detail per frame: faces %.1f triangles %.1f, "
+            "of them cut along texture shapes %.1f and %.1f; "
             "dynamic lights in use %.2f, faces illuminated %.1f\n"
             "  alias cache per frame: color hits %.1f misses %.1f evictions %.1f; "
-            "pose hits %.1f misses %.1f evictions %.1f; fallbacks %.1f; text calls %.1f\n"
+            "fallbacks %.1f; text calls %.1f\n"
             "  reuse: sky %.2f water %.2f ms; animated samples/frame %.1f; "
             "vertices/frame cached native %.1f direct native %.1f packed %.1f\n"
             "  alias preparation (overlap): cache %.2f transform %.2f ms; "
-            "topology hits %.1f misses %.1f; pose evictions slot %.1f bytes %.1f\n"
+            "topology hits %.1f misses %.1f evictions %.1f; points placed %.1f\n"
             "  entity scopes wall/submit/sync ms (native calls executed during scope): "
             "alias %.2f/%.2f/%.2f brush %.2f/%.2f/%.2f sprite %.2f/%.2f/%.2f; "
             "visits/frame %.1f/%.1f/%.1f\n"
@@ -232,16 +239,16 @@ void XGL_ProfileEndFrame(void)
             (double)total_counts[XGL_PROFILE_WORLD_COLOR_VERTICES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_ANIMATED_VERTICES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_EVICTIONS] / total_frames,
+            (double)total_counts[XGL_PROFILE_WORLD_HIDDEN_SURFACES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_DETAIL_SURFACES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_DETAIL_TRIANGLES] / total_frames,
+            (double)total_counts[XGL_PROFILE_WORLD_SHAPE_SURFACES] / total_frames,
+            (double)total_counts[XGL_PROFILE_WORLD_SHAPE_TRIANGLES] / total_frames,
             (double)total_counts[XGL_PROFILE_POINT_LIGHTS] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_LIT_SURFACES] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_COLOR_HITS] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_COLOR_MISSES] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_COLOR_EVICTIONS] / total_frames,
-            (double)total_counts[XGL_PROFILE_ALIAS_POSE_HITS] / total_frames,
-            (double)total_counts[XGL_PROFILE_ALIAS_POSE_MISSES] / total_frames,
-            (double)total_counts[XGL_PROFILE_ALIAS_POSE_EVICTIONS] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_FALLBACKS] / total_frames,
             (double)total_counts[XGL_PROFILE_TEXT_CALLS] / total_frames,
             total_sections[XGL_PROFILE_WORLD_SKY] * scale,
@@ -254,8 +261,8 @@ void XGL_ProfileEndFrame(void)
             total_sections[XGL_PROFILE_ALIAS_TRANSFORM] * scale,
             (double)total_counts[XGL_PROFILE_ALIAS_TOPOLOGY_HITS] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_TOPOLOGY_MISSES] / total_frames,
-            (double)total_counts[XGL_PROFILE_ALIAS_POSE_SLOT_EVICTIONS] / total_frames,
-            (double)total_counts[XGL_PROFILE_ALIAS_POSE_BYTE_EVICTIONS] / total_frames,
+            (double)total_counts[XGL_PROFILE_ALIAS_TOPOLOGY_EVICTIONS] / total_frames,
+            (double)total_counts[XGL_PROFILE_ALIAS_POINTS] / total_frames,
             total_draw[XGL_PROFILE_DRAW_ALIAS].wall * scale,
             total_draw[XGL_PROFILE_DRAW_ALIAS].submit * scale,
             total_draw[XGL_PROFILE_DRAW_ALIAS].sync * scale,

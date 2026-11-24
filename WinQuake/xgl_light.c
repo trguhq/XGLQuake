@@ -4,6 +4,7 @@
  * Distributed under GNU GPL version 2 or (at your option) any later version.
  */
 #include "quakedef.h"
+#include "xgl_render.h"
 
 int d_lightstylevalue[256];
 

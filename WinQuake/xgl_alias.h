@@ -11,6 +11,15 @@
 
 #define XGL_ALIAS_IDENTITY_MAGIC 0x58474c41U
 
+/* words counts everything that follows the record: the commands up to and
+ * including their terminator, and then two words for each pose vertex. The
+ * first list has the number of the first pose vertex that is the same point
+ * of the mesh, the same model vertex with the same skin coordinates; the
+ * second, the first that is the same model vertex at all, which a seam of
+ * the skin may give two places on it but only one in space. Whoever reads
+ * the commands stops at the terminator; the caches copy and compare it all,
+ * so models with equal commands that weld differently are never taken for
+ * one another. */
 typedef struct {
     unsigned int magic, generation, hash;
     int words;

@@ -20,7 +20,8 @@ of those boundaries.
 ### Reading a report
 
 `xgl_profile 1` prints two lines about once a second. These are from the
-supplied demo1 run of 19 November 2026 (before the `state` fields existed):
+supplied demo1 run of 19 November 2026 (before the `state` and
+`status bar kept` fields existed):
 
 ```
 XGL profile: 21 frames; gfx 46.61 ms (max 102.92); world 13.51 entities 6.47 effects 0.92 weapon 9.31 UI 7.00 audio-overlap 2.35 ms
@@ -55,6 +56,14 @@ times and per-frame counts:
   may defer part of a change's cost to the next submission.
 - `triangles` includes alias subdivision and particles; `glyphs` and
   `polygon calls` include the UI.
+- `strip calls`: native triangle strip calls, one strip each, with the
+  triangles they drew in brackets. Those triangles are part of `triangles`;
+  the rest went out in `polygon calls`. See
+  [animated models](render.md#animated-models).
+- `status bar kept`: the share of frames, 0 to 1, whose clear left the status
+  bar in place. In the rest the bar may have been drawn; `glyphs` shows how
+  often it was. Zero throughout means the bar is not being kept: see
+  [the status bar](render.md#status-bar) for what rules it out.
 
 Profiling is off by default and makes no timing queries when disabled. Output
 goes to the terminal, so it adds no console glyphs to the workload measured.
@@ -65,9 +74,9 @@ times overlap the stages and one another; do not add them to a frame total.
 - **detail ms**: world visibility; detail selection (which includes mesh
   builds); mesh builds, where a detailed mesh also pays for the texture and
   light samples that decide its shape; ordinary color validation and
-  refresh; animated sky/water colors; generic vertex packing; alias cache work plus cached-pose
-  transforms. Packing excludes submission, so a drop in packing time alone is
-  not an FPS gain.
+  refresh; animated sky/water colors; generic vertex packing; alias cache work plus
+  placing and lighting the live pose. Packing excludes submission, so a drop in
+  packing time alone is not an FPS gain.
 - **entity scopes**: wall, submission and wait time for alias, brush and
   sprite drawing, and visits per frame. Native times refer to calls executed
   during the scope, which can include geometry queued earlier: batches span
@@ -78,7 +87,8 @@ times overlap the stages and one another; do not add them to a frame total.
   and queued translucent water.
 - **alias entity detail** and **view weapon detail**: the light lookup
   (`R_LightPoint` only; flames and fullbright skip it), cached output (final
-  position, normal and color assembly into the native batch) and fallback
+  position and color assembly into the native batch, with a normal only
+  under native illumination) and fallback
   drawing (uncached transform, subdivision, skin sampling and packing). These
   are nested inside the entity and weapon scopes.
 - **SMP alias preparation**: jobs completed by the worker per frame; the main
@@ -99,19 +109,27 @@ Detailed counts are per-frame averages.
   vertices, each shared by several triangles; animated vertices are triangle
   corners, and `animated samples` in the reuse line the distinct ones.
   `detail meshes evicted` counts detailed meshes released because the world
-  cache was full.
+  cache was full. `faces outside the view, not drawn` counts faces of
+  visible leaves that lie wholly outside the view; they are in none of the
+  other counts of this line.
 - **world detail per frame**: faces drawn from their detailed mesh and the
-  triangles in them, water on its finer grid included; then the dynamic
-  lights enabled for illuminated geometry and the faces drawn illuminated,
-  both zero in a frame with no dynamic light.
-- **alias cache per frame**: color and pose (normal/topology) cache hits,
-  misses and evictions, and fallback draws, show cache pressure. Compare text
-  calls with glyphs to see how well the installed font allows runs.
+  triangles in them, water on its finer grid included; how many of those
+  faces and triangles were walls cut along
+  [texture shapes](render.md#texture-shapes); then the dynamic lights
+  enabled for illuminated geometry and the faces drawn illuminated, both
+  zero in a frame with no dynamic light.
+- **alias cache per frame**: color cache hits, misses and evictions, and
+  fallback draws, show cache pressure. Compare text calls with glyphs to see
+  how well the installed font allows runs. Both are counted when the text is
+  drawn, not when it is asked for.
 - **reuse**: sky and water color time, distinct animated vertices colored
   against animated corners emitted, and vertices per frame by path: queued from
   persistent meshes (`cached native`), written straight into the batch
   (`direct native`) or converted (`packed`).
-- **alias preparation**: cache work against live transforms, shared-topology
-  hits and misses, and pose evictions by entry or byte limit.
+- **alias preparation**: cache work against placing and lighting the live
+  pose; hits, misses and evictions of the meshes kept for each model and
+  depth (`topology`); and `points placed`, the vertices of models and
+  middles of edges that were placed and lit, each once. See
+  [animated models](render.md#animated-models).
 
 Measure FPS with profiling disabled.
