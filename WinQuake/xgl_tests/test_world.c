@@ -2338,6 +2338,57 @@ static void test_shape_distance(void)
     XGL_WorldShutdown();
 }
 
+/* A small face of a cut wall, or a far one, is allowed no triangles of the
+ * ordinary kind. It is cut along the shapes all the same: it was once given
+ * its plain mesh over again and counted as cut. */
+static void test_small_face_of_shaped_wall(void)
+{
+    xgl_shape_tree_t *tree;
+    const xgl_shape_node_t *node;
+    float low[2], distance, first;
+    int i, j, step, colors;
+    setup_shapes();
+    r_fullbright.value = 1;
+    xgl_detaildensity.value = 160;
+    tree = XGL_SurfaceShapes(&test_surface);
+    assert(tree);
+    /* A face 24 units square, laid across the texture's first cut. */
+    node = &tree->nodes[0];
+    assert((node->flags & XGL_SHAPE_AXIS) < 2);
+    low[0] = low[1] = 20;
+    low[node->flags & XGL_SHAPE_AXIS] = node->d + tree->origin[node->flags & XGL_SHAPE_AXIS] - 12;
+    for (i = 0; i < 4; ++i) {
+        test_vertices[i].position[0] = low[0] + (i == 1 || i == 2 ? 24 : 0);
+        test_vertices[i].position[1] = low[1] + (i >= 2 ? 24 : 0);
+    }
+    test_surface.extents[0] = test_surface.extents[1] = 24;
+    XGL_WorldNewMap();
+    r_origin[0] = low[0] + 12; r_origin[1] = low[1] + 12;
+    /* From here the face may have no ordinary triangle at all, and its
+     * texture two pieces or more to a repeat. */
+    distance = 320;
+    assert(XGL_DetailWant(24.0f * 24.0f, distance * distance) == 0);
+    step = XGL_SurfaceShapeStep(&test_surface, distance * distance);
+    assert(step > 0);
+    r_origin[2] = distance;
+    begin_frame();
+    assert(xgl_surfaces[0].shape_need == step && xgl_surfaces[0].shape_step == step);
+    assert(xgl_surfaces[0].detail.vertices && xgl_surfaces[0].detail_frame == r_framecount);
+    /* Drawn in pieces: more than its plain two triangles, in two colors. */
+    assert(captured_count > 6 && captured_count == xgl_surfaces[0].detail.count);
+    assert(fabs(captured_area() - 24.0f * 24.0f) < .5f);
+    first = captured[0].color.rgb[0]; colors = 1;
+    for (i = 0; i < captured_count; i += 3) {
+        for (j = 1; j < 3; ++j) assert(captured[i + j].color.rgb[0] == captured[i].color.rgb[0]);
+        if (fabs(captured[i].color.rgb[0] - first) > 8 / 255.0f) colors = 2;
+    }
+    assert(colors == 2);
+    assert(profile_counts[XGL_PROFILE_WORLD_SHAPE_SURFACES] == 1);
+    assert(profile_counts[XGL_PROFILE_WORLD_SHAPE_TRIANGLES] == (unsigned long)(captured_count / 3));
+    assert(!profile_counts[XGL_PROFILE_WORLD_MESH_FAILURES]);
+    XGL_WorldShutdown();
+}
+
 /* A wall of a small texture is given pieces, and weighs a cut, as a wall of
  * the same picture at full size would be: a sign 32 texels square has as
  * much to show as a panel of 64. */
@@ -2617,6 +2668,7 @@ int main(void)
     test_shaped_wall();
     test_shape_distance();
     test_small_shape_distance();
+    test_small_face_of_shaped_wall();
     test_shape_map_change();
     test_faces_outside_view();
     test_shape_animation();

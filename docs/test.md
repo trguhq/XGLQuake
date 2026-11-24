@@ -34,8 +34,9 @@ have no shapes at any size. They cut faces along the result and check that the p
 cover the face exactly, have the texture's colors, and share every corner
 that lies along a side. The world tests then draw such walls: their colors
 and baked light, the steps of detail by distance, and the limits; a wall of
-a small texture cut from as far as one of the same picture at full size;
-and load a map again to see that nothing is examined twice.
+a small texture cut from as far as one of the same picture at full size; a
+face too small to be allowed any ordinary triangle cut like the rest of its
+wall; and load a map again to see that nothing is examined twice.
 The screen tests cover when an unchanged status bar is left in place, and
 the UI tests that every picture name draws what it did before.
 Run from `WinQuake/`:

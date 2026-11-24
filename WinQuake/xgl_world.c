@@ -1279,7 +1279,9 @@ static int XGL_BuildShapes (model_t *model, msurface_t *surface, float longest, 
 
 /* detail is zero for the coarse mesh, else the most triangles the detailed
  * one may have. shape_step, when above zero, has the detailed mesh cut
- * along the shapes of the face's texture at that step of detail instead.
+ * along the shapes of the face's texture at that step of detail instead,
+ * whatever `detail` is: a small or distant face is allowed no triangles of
+ * the ordinary kind and is cut all the same, as the rest of its wall is.
  * Returns 1 when built, 0 when this face can have no such mesh (a detailed
  * one that would be no finer than the coarse one included), and -1 when the
  * cache had no room even after evicting idle detail. */
@@ -1305,7 +1307,7 @@ static int XGL_BuildSurfaceMeshData (model_t *model, msurface_t *surface,
         }
         return XGL_BuildFinish(surface, mesh);
     }
-    if (detail && shape_step > 0) {
+    if (shape_step > 0) {
         if (!XGL_BuildShapes(model, surface, XGL_Setting(xgl_subdivide.value, 8, 256), shape_step))
             return 0;
         return XGL_BuildFinish(surface, mesh);
@@ -1340,7 +1342,7 @@ static int XGL_BuildSurfaceMesh (model_t *model, msurface_t *surface,
     if (built > 0) {
         XGL_ProfileCount(XGL_PROFILE_WORLD_MESH_BUILDS, 1);
         XGL_ProfileCount(XGL_PROFILE_WORLD_BUILD_VERTICES, (unsigned long)mesh->unique);
-    } else if (built < 0 || !detail) XGL_ProfileCount(XGL_PROFILE_WORLD_MESH_FAILURES, 1);
+    } else if (built < 0 || (!detail && shape_step <= 0)) XGL_ProfileCount(XGL_PROFILE_WORLD_MESH_FAILURES, 1);
     return built;
 }
 
