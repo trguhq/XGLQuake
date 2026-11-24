@@ -109,7 +109,9 @@ Detailed counts are per-frame averages.
   vertices, each shared by several triangles; animated vertices are triangle
   corners, and `animated samples` in the reuse line the distinct ones.
   `detail meshes evicted` counts detailed meshes released because the world
-  cache was full.
+  cache was full. `faces outside the view, not drawn` counts faces of
+  visible leaves that lie wholly outside the view; they are in none of the
+  other counts of this line.
 - **world detail per frame**: faces drawn from their detailed mesh and the
   triangles in them, water on its finer grid included; how many of those
   faces and triangles were walls cut along

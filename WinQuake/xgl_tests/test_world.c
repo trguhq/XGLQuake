@@ -369,6 +369,34 @@ static void set_frustum(int reject)
     }
 }
 
+/* The four planes of a real view, 90 degrees wide and high, as the
+ * renderer makes them: from r_origin along `forward`. */
+static int view_planes;
+static void set_view(float fx, float fy, float fz, float rx, float ry, float rz,
+                     float ux, float uy, float uz)
+{
+    float forward[3], right[3], up[3];
+    int i, j;
+    forward[0] = fx; forward[1] = fy; forward[2] = fz;
+    right[0] = rx; right[1] = ry; right[2] = rz;
+    up[0] = ux; up[1] = uy; up[2] = uz;
+    VectorCopy(forward, vpn);
+    memset(frustum, 0, sizeof(frustum));
+    for (j = 0; j < 3; ++j) {
+        frustum[0].normal[j] = (forward[j] + right[j]) * .70710678f;
+        frustum[1].normal[j] = (forward[j] - right[j]) * .70710678f;
+        frustum[2].normal[j] = (forward[j] + up[j]) * .70710678f;
+        frustum[3].normal[j] = (forward[j] - up[j]) * .70710678f;
+    }
+    for (i = 0; i < 4; ++i) {
+        frustum[i].type = PLANE_ANYZ;
+        frustum[i].dist = DotProduct(r_origin, frustum[i].normal);
+        for (j = 0; j < 3; ++j)
+            if (frustum[i].normal[j] < 0) frustum[i].signbits |= 1 << j;
+    }
+    view_planes = 1;
+}
+
 static void begin_frame(void)
 {
     XGL_Flush(); /* The preceding frame has completed. */
@@ -376,7 +404,7 @@ static void begin_frame(void)
     captured_count = captured_calls = 0;
     memset(profile_counts, 0, sizeof(profile_counts));
     memset(profile_sections, 0, sizeof(profile_sections));
-    set_frustum(reject_box);
+    if (!view_planes) set_frustum(reject_box);
     XGL_DrawWorld();
     XGL_DrawWorldUnlit();
     XGL_DrawWorldSpecial(); /* Sky and water follow the walls in a frame. */
@@ -498,6 +526,7 @@ static void setup_world(void)
         xgl_palette[i * 3] = xgl_palette[i * 3 + 1] = xgl_palette[i * 3 + 2] = (byte)i;
     realtime = 0;
     test_vis = 1;
+    view_planes = 0;
     XGL_WorldNewMap();
 }
 
@@ -2309,6 +2338,97 @@ static void test_shape_distance(void)
     XGL_WorldShutdown();
 }
 
+/* A leaf is tested against the view by its box, and all its faces are
+ * marked when it reaches in. A face that lies wholly outside the view is
+ * then left out of the frame: not drawn, colored, lit or animated. It is
+ * still made ready, so that turning toward it finds its mesh built. */
+static void test_faces_outside_view(void)
+{
+    int i, builds, triangles;
+    setup_world();
+    xgl_subdivide.value = 256;
+    pattern_material = 1; /* A dark disc: the face has a detailed mesh. */
+    /* The node and its leaves reach far beyond the face, into any view. */
+    for (i = 0; i < 3; ++i) {
+        test_node.minmaxs[i] = -2048; test_node.minmaxs[3 + i] = 2048;
+        test_leaves[1].minmaxs[i] = test_leaves[2].minmaxs[i] = -2048;
+        test_leaves[1].minmaxs[3 + i] = test_leaves[2].minmaxs[3 + i] = 2048;
+    }
+    /* Standing back from the face and looking away from it. */
+    r_origin[0] = -200; r_origin[1] = 64; r_origin[2] = 32;
+    set_view(-1, 0, 0, 0, 1, 0, 0, 0, 1);
+    begin_frame();
+    assert(captured_count == 0 && captured_calls == 0);
+    assert(profile_counts[XGL_PROFILE_WORLD_HIDDEN_SURFACES] == 1);
+    assert(!profile_counts[XGL_PROFILE_WORLD_CACHED_SURFACES]);
+    assert(!profile_counts[XGL_PROFILE_WORLD_COLOR_HITS] && !profile_counts[XGL_PROFILE_WORLD_COLOR_UPDATES]);
+    assert(!profile_counts[XGL_PROFILE_WORLD_DETAIL_SURFACES]);
+    /* No light is switched on for a wall that is not drawn. */
+    assert(!used_lights && !profile_counts[XGL_PROFILE_WORLD_LIT_SURFACES]);
+    /* It took nothing from the allowance, but its meshes are built. */
+    assert(!xgl_detail_used && xgl_surfaces[0].detail_frame != r_framecount);
+    assert(xgl_surfaces[0].coarse.vertices && xgl_surfaces[0].detail.vertices);
+    assert(xgl_surfaces[0].detail_used == r_framecount);
+    builds = (int)profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS];
+    assert(builds == 2);
+    triangles = xgl_surfaces[0].detail.count / 3;
+    /* Turning round: it is drawn at once, in detail, and nothing is built. */
+    set_view(1, 0, 0, 0, -1, 0, 0, 0, 1);
+    begin_frame();
+    assert(captured_count == triangles * 3 && triangles > 40);
+    assert(!profile_counts[XGL_PROFILE_WORLD_HIDDEN_SURFACES]);
+    assert(!profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS]);
+    assert(profile_counts[XGL_PROFILE_WORLD_DETAIL_SURFACES] == 1 && xgl_detail_used == triangles);
+    assert(used_lights == 1);
+    /* And away again. */
+    set_view(-1, 0, 0, 0, 1, 0, 0, 0, 1);
+    begin_frame();
+    assert(captured_count == 0 && !xgl_detail_used && !used_lights);
+    /* A face the edge of the view crosses is drawn whole. Standing over
+     * the face and looking level, only its far part is below the view. */
+    r_origin[0] = 64;
+    set_view(1, 0, 0, 0, -1, 0, 0, 0, 1);
+    begin_frame();
+    assert(captured_count == triangles * 3 && !profile_counts[XGL_PROFILE_WORLD_HIDDEN_SURFACES]);
+    /* Looking straight up from there, every corner is behind, but no one
+     * plane of the view has the whole box beyond it: such a face is drawn,
+     * as it always was. */
+    set_view(0, 0, 1, 0, -1, 0, -1, 0, 0);
+    begin_frame();
+    assert(captured_count == triangles * 3);
+    /* A node wholly inside the view has no face tested at all. */
+    r_origin[0] = -200;
+    set_view(1, 0, 0, 0, -1, 0, 0, 0, 1);
+    for (i = 0; i < 3; ++i) { test_node.minmaxs[i] = 0; test_node.minmaxs[3 + i] = 128; }
+    test_node.minmaxs[5] = 0;
+    xgl_surfaces[0].bounds[0][0] = xgl_surfaces[0].bounds[1][0] = -5000; /* Would be hidden if asked. */
+    begin_frame();
+    assert(captured_count == triangles * 3);
+    XGL_WorldShutdown();
+
+    /* Water outside the view is not animated; in view it is. */
+    setup_world();
+    test_surface.flags = SURF_DRAWTURB;
+    for (i = 0; i < 3; ++i) {
+        test_node.minmaxs[i] = -2048; test_node.minmaxs[3 + i] = 2048;
+        test_leaves[1].minmaxs[i] = test_leaves[2].minmaxs[i] = -2048;
+        test_leaves[1].minmaxs[3 + i] = test_leaves[2].minmaxs[3 + i] = 2048;
+    }
+    r_origin[0] = -200; r_origin[1] = 64; r_origin[2] = 32;
+    set_view(-1, 0, 0, 0, 1, 0, 0, 0, 1);
+    begin_frame();
+    assert(captured_count == 0 && !profile_counts[XGL_PROFILE_WORLD_ANIMATED_VERTICES]);
+    assert(profile_counts[XGL_PROFILE_WORLD_HIDDEN_SURFACES] == 1);
+    /* Its finer grid is ready all the same. */
+    assert(xgl_surfaces[0].detail.vertices && xgl_surfaces[0].detail_frame != r_framecount);
+    set_view(1, 0, 0, 0, -1, 0, 0, 0, 1);
+    begin_frame();
+    assert(captured_count == xgl_surfaces[0].detail.count && captured_count > 6);
+    assert(profile_counts[XGL_PROFILE_WORLD_ANIMATED_VERTICES] == (unsigned long)captured_count);
+    assert(!profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS]);
+    XGL_WorldShutdown();
+}
+
 /* A map that has the textures of the one before does not examine them
  * again; a texture loaded with other texels is examined; and the going
  * map's leftover materials are released each time a map has loaded. */
@@ -2440,6 +2560,7 @@ int main(void)
     test_shaped_wall();
     test_shape_distance();
     test_shape_map_change();
+    test_faces_outside_view();
     test_shape_animation();
     test_shape_limits();
     XGL_WorldShutdown();

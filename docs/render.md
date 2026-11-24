@@ -124,6 +124,15 @@ with clear shapes are therefore drawn another way, described under
   `xgl_detailtris` triangles are used. A face detailed in the previous frame
   ranks slightly higher, so faces near the cut-off do not flicker between
   their two meshes.
+- A face that lies wholly outside the view is left out of the frame. The
+  engine tests leaves against the view by their boxes and marks every face
+  of a leaf that reaches in, so about half the triangles found that way
+  belong to faces the view cannot show: 56%, 49% and 46% in replays of the
+  three shareware demos. Each face's own box is therefore tested against the
+  planes of the view that its node may cross. A face outside is not drawn,
+  colored, lit or animated and takes nothing from `xgl_detailtris`. It is
+  still built, after the faces in view and as far as the same allowance
+  would reach, so that turning toward it finds its detailed mesh ready.
 - When the 8 MiB world cache is full, detailed meshes that have not been
   drawn recently are released to make room. Coarse meshes are kept.
 - External brush models such as ammo and health boxes keep meshes of their

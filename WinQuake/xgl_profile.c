@@ -196,7 +196,8 @@ void XGL_ProfileEndFrame(void)
             "pack %.2f alias-cache/transform %.2f\n"
             "  world per frame: cached draws %.1f fallback draws %.1f "
             "builds %.1f failed builds %.1f; color reuse %.1f updates %.1f; "
-            "vertices built %.1f recolored %.1f animated %.1f; detail meshes evicted %.1f\n"
+            "vertices built %.1f recolored %.1f animated %.1f; detail meshes evicted %.1f; "
+            "faces outside the view, not drawn %.1f\n"
             "  world detail per frame: faces %.1f triangles %.1f, "
             "of them cut along texture shapes %.1f and %.1f; "
             "dynamic lights in use %.2f, faces illuminated %.1f\n"
@@ -238,6 +239,7 @@ void XGL_ProfileEndFrame(void)
             (double)total_counts[XGL_PROFILE_WORLD_COLOR_VERTICES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_ANIMATED_VERTICES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_EVICTIONS] / total_frames,
+            (double)total_counts[XGL_PROFILE_WORLD_HIDDEN_SURFACES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_DETAIL_SURFACES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_DETAIL_TRIANGLES] / total_frames,
             (double)total_counts[XGL_PROFILE_WORLD_SHAPE_SURFACES] / total_frames,

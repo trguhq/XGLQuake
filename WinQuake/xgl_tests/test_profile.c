@@ -128,6 +128,7 @@ static void test_detail_levels(void)
     XGL_ProfileCount(XGL_PROFILE_WORLD_DETAIL_TRIANGLES, 300);
     XGL_ProfileCount(XGL_PROFILE_WORLD_SHAPE_SURFACES, 3);
     XGL_ProfileCount(XGL_PROFILE_WORLD_SHAPE_TRIANGLES, 120);
+    XGL_ProfileCount(XGL_PROFILE_WORLD_HIDDEN_SURFACES, 190);
     XGL_ProfileCount(XGL_PROFILE_POINT_LIGHTS, 3);
     XGL_ProfileCount(XGL_PROFILE_WORLD_LIT_SURFACES, 9);
     XGL_ProfileCount(XGL_PROFILE_SMP_HELPED, 1);
@@ -165,7 +166,8 @@ static void test_detail_levels(void)
     assert(strstr(output, "pose evictions slot 1.0 bytes 2.0"));
     assert(strstr(output, "SMP alias preparation: 1.5 jobs/frame; main prepass 2.00 worker 7.00 main wait 1.00 ms/frame"));
     assert(strstr(output, "0.5 more jobs/frame run by main while joining\n"));
-    assert(strstr(output, "vertices built 51.0 recolored 0.0 animated 0.0; detail meshes evicted 2.5\n"));
+    assert(strstr(output, "vertices built 51.0 recolored 0.0 animated 0.0; detail meshes evicted 2.5; "
+                          "faces outside the view, not drawn 95.0\n"));
     assert(strstr(output, "  world detail per frame: faces 3.5 triangles 150.0, "
                           "of them cut along texture shapes 1.5 and 60.0; "
                           "dynamic lights in use 1.50, faces illuminated 4.5\n"));

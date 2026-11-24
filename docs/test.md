@@ -15,7 +15,9 @@ draining, and shutdown. The world and entity tests also cover drawing order
 by native state, map-load mesh building, the per-frame build limit, detail
 eviction and the identity record that lets model caches skip comparisons;
 detail placed by contrast and by apparent size; and geometry submitted with
-and without normals, including the copies walls keep for dynamic lights.
+and without normals, including the copies walls keep for dynamic lights;
+and that a face wholly outside the view is left out of the frame but found
+built when the view turns to it.
 The entity tests also draw a model as triangle strips and as separate
 triangles and require the same triangles either way, from the serial path
 and from the worker's output, and the mesh tests check the loader's record

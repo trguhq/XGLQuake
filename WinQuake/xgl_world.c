@@ -102,6 +102,8 @@ typedef struct {
      * detail_want: the limit this frame's apparent size allows. */
     int coarse_attempted, detail_attempted, detail_retry, detail_limit, detail_want;
     vec3_t center;
+    /* The face's box, least corner then greatest: valid with the center. */
+    float bounds[2][3];
     /* detail_frame: frame in which the world pass selected the detail mesh.
      * detail_used: last frame the detail mesh was built or drawn.
      * light_frame: frame in which a dynamic light reached this wall. */
@@ -154,7 +156,12 @@ static int xgl_surface_count, xgl_detail_used, xgl_detail_built, xgl_evict_hand;
 /* Frame before which a full cache is not searched again for room for an
  * illuminated copy: the search visits every face. */
 static int xgl_lit_retry;
+/* The faces the traversal found, in its order. Those of them that lie
+ * wholly outside the view are kept apart, from the end of the same array
+ * backward: they are not drawn, but turning toward them must not find them
+ * unprepared. */
 static int *xgl_world_order, *xgl_detail_order, *xgl_detail_sorted, xgl_world_count;
+static int xgl_hidden_count;
 static model_t *xgl_pvs_world;
 static mleaf_t *xgl_pvs_leaf;
 static int xgl_pvs_novis;
@@ -259,7 +266,7 @@ static void XGL_WorldRelease (void)
     }
     free(xgl_world_order);
     xgl_world_order = xgl_detail_order = xgl_detail_sorted = NULL;
-    xgl_world_count = 0;
+    xgl_world_count = xgl_hidden_count = 0;
     xgl_surfaces = NULL;
     xgl_cached_world = NULL;
     xgl_surface_count = 0;
@@ -1930,6 +1937,13 @@ static void XGL_SurfaceBounds(model_t *model, msurface_t *surface, xgl_surface_c
     for (i = 0; i < surface->numedges; ++i) {
         XGL_SurfacePoint(model, surface, i, point);
         VectorAdd(cache->center, point, cache->center);
+        if (!i) { VectorCopy(point, cache->bounds[0]); VectorCopy(point, cache->bounds[1]); }
+        if (point[0] < cache->bounds[0][0]) cache->bounds[0][0] = point[0];
+        if (point[1] < cache->bounds[0][1]) cache->bounds[0][1] = point[1];
+        if (point[2] < cache->bounds[0][2]) cache->bounds[0][2] = point[2];
+        if (point[0] > cache->bounds[1][0]) cache->bounds[1][0] = point[0];
+        if (point[1] > cache->bounds[1][1]) cache->bounds[1][1] = point[1];
+        if (point[2] > cache->bounds[1][2]) cache->bounds[1][2] = point[2];
     }
     if (surface->numedges) { VectorScale(cache->center, 1.0f / surface->numedges, cache->center); }
     radius_squared = 0;
@@ -2176,6 +2190,80 @@ static int XGL_DetailBucket (float priority)
     return bucket;
 }
 
+/* One of the faces the traversal found, before the walls are ranked: its
+ * coarse mesh if it has none yet, water's finer grid, and for a wall in
+ * range what detail it asks for. Returns 1 for a wall that is a candidate
+ * for the allowance, with its rank in cache->bucket. A face outside the
+ * view is prepared in the same way but is not marked as drawn. */
+static int XGL_ConsiderDetail (int index, int shown, int *shaped)
+{
+    xgl_surface_cache_t *cache;
+    msurface_t *surface;
+    vec3_t delta;
+    float distance, range;
+    int bucket;
+    cache = xgl_surfaces + index;
+    surface = cl.worldmodel->surfaces + index;
+    bucket = cache->detail_frame == r_framecount - 1 ? XGL_DETAIL_KEEP : 0;
+    cache->detail_frame = -1;
+    if ((surface->flags & SURF_DRAWTURB) && r_wateralpha.value <= 0) return 0;
+    /* Coarse meshes get memory first, preserving cheap complete fallback. */
+    if (!cache->coarse_attempted) {
+        cache->coarse_attempted = 1;
+        XGL_BuildSurfaceMesh(cl.worldmodel, surface, &cache->coarse, 0, -1);
+    }
+    if ((surface->flags & SURF_DRAWSKY) || !(xgl_detaildistance.value > 0)) return 0;
+    XGL_SurfaceBounds(cl.worldmodel, surface, cache);
+    VectorSubtract(cache->center, r_origin, delta);
+    distance = DotProduct(delta, delta);
+    range = xgl_detaildistance.value + cache->radius;
+    if (distance >= range * range) return 0;
+    if (surface->flags & SURF_DRAWTURB) {
+        /* Water in range always uses its finer grid, outside the wall
+         * allowance: the ripple that needs it fades with distance, so
+         * the change of grid at the range cannot be seen. */
+        XGL_TryBuildDetail(cl.worldmodel, surface, cache, 1, -1);
+        if (cache->detail.vertices) {
+            cache->detail_used = r_framecount;
+            if (shown) cache->detail_frame = r_framecount;
+        }
+        return 0;
+    }
+    if (!(xgl_detailtris.value > 0)) return 0;
+    cache->detail_want = XGL_DetailWant(cache->area, distance);
+    cache->shape_need = (short)XGL_SurfaceShapeStep(surface, distance);
+    if (cache->shape_need > 0) {
+        ++*shaped;
+        bucket += XGL_DetailBucket(XGL_SHAPE_RANK_AREA / (distance + 64));
+    } else {
+        if (cache->detail_want < XGL_DETAIL_WANT_MIN) return 0;
+        bucket += XGL_DetailBucket(cache->area / (distance + 64));
+    }
+    cache->bucket = bucket;
+    return 1;
+}
+
+/* Put `count` candidates of xgl_detail_order, from `first` on, into
+ * xgl_detail_sorted at the same places, highest rank first; equal ranks
+ * keep their BSP order. */
+static void XGL_SortDetail (int first, int count)
+{
+    static int counts[XGL_DETAIL_BUCKETS];
+    int i, bucket, start, index;
+    memset(counts, 0, sizeof(counts));
+    for (i = first; i < first + count; ++i) ++counts[xgl_surfaces[xgl_detail_order[i]].bucket];
+    start = first;
+    for (bucket = XGL_DETAIL_BUCKETS - 1; bucket >= 0; --bucket) {
+        i = counts[bucket];
+        counts[bucket] = start;
+        start += i;
+    }
+    for (i = first; i < first + count; ++i) {
+        index = xgl_detail_order[i];
+        xgl_detail_sorted[counts[xgl_surfaces[index].bucket]++] = index;
+    }
+}
+
 /* Reserve the fixed detail allowance for the largest visible projected-size
  * estimates, then submit in the original BSP order. This avoids spending the
  * whole allowance on small faces encountered early in the traversal. A face
@@ -2186,70 +2274,32 @@ static int XGL_DetailBucket (float priority)
  * plain. Its faces are therefore taken however small, rank by nearness
  * alone, so that if the allowance runs out it is the far walls that go
  * plain and not the small faces of a near one, and may run somewhat over
- * the allowance before any is dropped. */
+ * the allowance before any is dropped.
+ *
+ * The faces outside the view take nothing from the allowance, which is for
+ * what is drawn. But a turn of the head brings them into view, and they
+ * must not then be found plain: after the faces in view, they are built
+ * as far as the same allowance would reach if they were drawn too, with
+ * whatever this frame's building has left, and their meshes kept. */
 static void XGL_SelectWorldDetail(void)
 {
-    static int counts[XGL_DETAIL_BUCKETS];
     xgl_surface_cache_t *cache;
-    msurface_t *surface;
-    vec3_t delta;
-    float distance, range, allowance, most;
-    int i, index, candidates, bucket, start, shaped;
+    float allowance, most, planned;
+    int i, index, candidates, hidden, shaped, hidden_shaped;
     candidates = shaped = 0;
-    memset(counts, 0, sizeof(counts));
     for (i = 0; i < xgl_world_count; ++i) {
         if ((i & 63) == 0) XGL_AudioUpdate();
         index = xgl_world_order[i];
-        cache = xgl_surfaces + index;
-        surface = cl.worldmodel->surfaces + index;
-        bucket = cache->detail_frame == r_framecount - 1 ? XGL_DETAIL_KEEP : 0;
-        cache->detail_frame = -1;
-        if ((surface->flags & SURF_DRAWTURB) && r_wateralpha.value <= 0) continue;
-        /* Coarse meshes get memory first, preserving cheap complete fallback. */
-        if (!cache->coarse_attempted) {
-            cache->coarse_attempted = 1;
-            XGL_BuildSurfaceMesh(cl.worldmodel, surface, &cache->coarse, 0, -1);
-        }
-        if ((surface->flags & SURF_DRAWSKY) || !(xgl_detaildistance.value > 0)) continue;
-        XGL_SurfaceBounds(cl.worldmodel, surface, cache);
-        VectorSubtract(cache->center, r_origin, delta);
-        distance = DotProduct(delta, delta);
-        range = xgl_detaildistance.value + cache->radius;
-        if (distance >= range * range) continue;
-        if (surface->flags & SURF_DRAWTURB) {
-            /* Water in range always uses its finer grid, outside the wall
-             * allowance: the ripple that needs it fades with distance, so
-             * the change of grid at the range cannot be seen. */
-            XGL_TryBuildDetail(cl.worldmodel, surface, cache, 1, -1);
-            if (cache->detail.vertices)
-                cache->detail_frame = cache->detail_used = r_framecount;
-            continue;
-        }
-        if (!(xgl_detailtris.value > 0)) continue;
-        cache->detail_want = XGL_DetailWant(cache->area, distance);
-        cache->shape_need = (short)XGL_SurfaceShapeStep(surface, distance);
-        if (cache->shape_need > 0) {
-            ++shaped;
-            bucket += XGL_DetailBucket(XGL_SHAPE_RANK_AREA / (distance + 64));
-        } else {
-            if (cache->detail_want < XGL_DETAIL_WANT_MIN) continue;
-            bucket += XGL_DetailBucket(cache->area / (distance + 64));
-        }
-        cache->bucket = bucket;
-        ++counts[bucket];
-        xgl_detail_order[candidates++] = index;
+        if (XGL_ConsiderDetail(index, 1, &shaped)) xgl_detail_order[candidates++] = index;
     }
-    /* Counting sort, largest first; equal ranks keep their BSP order. */
-    start = 0;
-    for (bucket = XGL_DETAIL_BUCKETS - 1; bucket >= 0; --bucket) {
-        i = counts[bucket];
-        counts[bucket] = start;
-        start += i;
+    hidden = hidden_shaped = 0;
+    for (i = 0; i < xgl_hidden_count; ++i) {
+        if ((i & 63) == 0) XGL_AudioUpdate();
+        index = xgl_world_order[xgl_surface_count - 1 - i];
+        if (XGL_ConsiderDetail(index, 0, &hidden_shaped)) xgl_detail_order[candidates + hidden++] = index;
     }
-    for (i = 0; i < candidates; ++i) {
-        index = xgl_detail_order[i];
-        xgl_detail_sorted[counts[xgl_surfaces[index].bucket]++] = index;
-    }
+    XGL_SortDetail(0, candidates);
+    XGL_SortDetail(candidates, hidden);
     most = xgl_detailtris.value;
     if (shaped) most *= XGL_SHAPE_OVER;
     for (i = 0; i < candidates && xgl_detail_used < most; ++i) {
@@ -2263,6 +2313,22 @@ static void XGL_SelectWorldDetail(void)
             xgl_detail_used + cache->detail.count / 3 <= allowance) {
             cache->detail_frame = cache->detail_used = r_framecount;
             xgl_detail_used += cache->detail.count / 3;
+        }
+    }
+    planned = (float)xgl_detail_used;
+    most = xgl_detailtris.value;
+    if (shaped || hidden_shaped) most *= XGL_SHAPE_OVER;
+    for (i = candidates; i < candidates + hidden && planned < most; ++i) {
+        if ((i & 63) == 0) XGL_AudioUpdate();
+        index = xgl_detail_sorted[i]; cache = xgl_surfaces + index;
+        allowance = cache->shape_need > 0 ? most : xgl_detailtris.value;
+        if (planned >= allowance) continue;
+        XGL_TryBuildDetail(cl.worldmodel, cl.worldmodel->surfaces + index, cache,
+                           cache->detail_want, cache->shape_need);
+        if (cache->detail.vertices && planned + cache->detail.count / 3 <= allowance) {
+            /* Kept as if it had been drawn, but not drawn. */
+            cache->detail_used = r_framecount;
+            planned += cache->detail.count / 3;
         }
     }
 }
@@ -2504,15 +2570,35 @@ static void XGL_MarkLeaves (void)
     }
 }
 
+/* Whether a face lies wholly outside the view: its box beyond one of the
+ * view's four planes. Only the planes its node may cross need asking; the
+ * box's corner farthest into the view is the one that decides. Leaves are
+ * tested by their boxes only, and the faces of one that reaches into the
+ * view are all marked: about half of the triangles so found are in faces
+ * that no part of the view can show. */
+static int XGL_SurfaceHidden (const xgl_surface_cache_t *cache, int clipflags)
+{
+    const mplane_t *plane;
+    int i;
+    for (i = 0, plane = frustum; i < 4; ++i, ++plane) {
+        if (!(clipflags & (1 << i))) continue;
+        if (plane->normal[0] * cache->bounds[!(plane->signbits & 1)][0] +
+            plane->normal[1] * cache->bounds[!(plane->signbits & 2)][1] +
+            plane->normal[2] * cache->bounds[!(plane->signbits & 4)][2] < plane->dist) return 1;
+    }
+    return 0;
+}
+
 /* clipflags has one bit for each frustum plane this node may still cross.
  * A box wholly inside a plane keeps every descendant inside it too, so that
  * plane is never tested again below; the culling result is unchanged. */
 static void XGL_WorldNode (mnode_t *node, int clipflags)
 {
+    xgl_surface_cache_t *cache;
     mleaf_t *leaf;
     msurface_t *surface;
     float distance;
-    int i, side;
+    int i, side, index;
     if (node->contents == CONTENTS_SOLID || node->visframe != r_visframecount) return;
     for (i = 0; clipflags && i < 4; ++i) {
         if (!(clipflags & (1 << i))) continue;
@@ -2534,9 +2620,20 @@ static void XGL_WorldNode (mnode_t *node, int clipflags)
         if (surface->visframe != r_framecount) continue;
         if (!(surface->flags & SURF_UNDERWATER) &&
             ((distance < 0) != ((surface->flags & SURF_PLANEBACK) != 0))) continue;
-        if (xgl_world_order)
-            xgl_world_order[xgl_world_count++] = (int)(surface - cl.worldmodel->surfaces);
-        else XGL_QueueSurface(cl.worldmodel, surface, &r_worldentity);
+        if (!xgl_world_order) {
+            XGL_QueueSurface(cl.worldmodel, surface, &r_worldentity);
+            continue;
+        }
+        index = (int)(surface - cl.worldmodel->surfaces);
+        if (clipflags) {
+            cache = xgl_surfaces + index;
+            if (!cache->center_valid) XGL_SurfaceBounds(cl.worldmodel, surface, cache);
+            if (XGL_SurfaceHidden(cache, clipflags)) {
+                xgl_world_order[xgl_surface_count - 1 - xgl_hidden_count++] = index;
+                continue;
+            }
+        }
+        xgl_world_order[xgl_world_count++] = index;
     }
     XGL_WorldNode(node->children[!side], clipflags);
 }
@@ -2553,11 +2650,12 @@ void XGL_DrawWorld (void)
     if (XGL_BuildSettingsChanged()) XGL_WorldSetup();
     xgl_detail_used = xgl_detail_built = 0;
     xgl_water_count = 0;
-    xgl_world_count = 0;
+    xgl_world_count = xgl_hidden_count = 0;
     currententity = &r_worldentity;
     start = XGL_ProfileDetailNow();
     XGL_MarkLeaves();
     XGL_WorldNode(cl.worldmodel->nodes, 15);
+    XGL_ProfileCount(XGL_PROFILE_WORLD_HIDDEN_SURFACES, (unsigned long)xgl_hidden_count);
     /* Without the cache index, traversal also emits coarse fallback faces.
      * The fallback counter identifies that case in a detailed report. */
     XGL_ProfileAdd(XGL_PROFILE_WORLD_VISIBILITY, start);
