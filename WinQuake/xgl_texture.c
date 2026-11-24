@@ -19,7 +19,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 /* xgl_texture.c: bounded CPU indexed materials, never XGL texture objects. */
 #include "quakedef.h"
-#include "xgl_local.h"
+#include "xgl_render.h"
 #include "xgl_audio.h"
 #include <stdlib.h>
 #include <string.h>

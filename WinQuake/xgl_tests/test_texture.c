@@ -1,5 +1,6 @@
 /* CPU indexed-material regression tests. GPL-2.0-or-later. */
 #include "quakedef.h"
+#include "xgl_render.h"
 #include <assert.h>
 #include <setjmp.h>
 #include <stdarg.h>

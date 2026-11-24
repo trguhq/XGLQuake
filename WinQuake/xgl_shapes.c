@@ -38,7 +38,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  * have triangles for describe it distinctly better than that mesh does. Most
  * rock, brick and rough metal does not qualify and is left alone. */
 #include "quakedef.h"
-#include "xgl_local.h"
+#include "xgl_render.h"
 #include "xgl_audio.h"
 #include <math.h>
 #include <stdlib.h>

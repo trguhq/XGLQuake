@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../quakedef.h"
+#include "../xgl_render.h"
 #include "../xgl_profile.h"
 
 static cvar_t *profile_setting;

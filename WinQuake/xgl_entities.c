@@ -21,7 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  * are shaded here and submitted unlit unless xgl_alias_shade is 0, when
  * world-space normals are output and the device illuminates them. */
 #include "quakedef.h"
-#include "xgl_local.h"
+#include "xgl_render.h"
 #include "xgl_alias.h"
 #include "xgl_audio.h"
 #include "xgl_profile.h"

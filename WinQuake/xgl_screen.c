@@ -21,6 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // xgl_screen.c -- OpenGL screen orchestration with native XGL presentation. -- master for refresh, status bar, console, chat, notify, etc
 
 #include "quakedef.h"
+#include "xgl_render.h"
 #include "xgl_profile.h"
 #include "xgl_smp.h"
 

@@ -4,6 +4,7 @@
  * GNU GPL version 2 or (at your option) any later version.
  */
 #include "quakedef.h"
+#include "xgl_render.h"
 #include "xgl_audio.h"
 #include "xgl_profile.h"
 #include "xgl_smp.h"

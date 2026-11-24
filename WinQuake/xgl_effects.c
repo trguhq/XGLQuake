@@ -20,6 +20,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 /* Native geometry replacements for particle sprites and palette overlays. */
 #include "quakedef.h"
+#include "xgl_render.h"
 
 void XGL_DrawParticle(const particle_t *particle)
 {

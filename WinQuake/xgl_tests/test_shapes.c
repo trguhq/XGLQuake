@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "quakedef.h"
-#include "xgl_local.h"
+#include "xgl_render.h"
 
 byte xgl_palette[768];
 

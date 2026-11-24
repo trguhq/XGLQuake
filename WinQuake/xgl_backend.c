@@ -2,7 +2,7 @@
  * Uses the XGL 3.x SDK directly: no OpenGL and no texture/raster UI uploads.
  */
 #include "quakedef.h"
-#include "xgl_local.h"
+#include "xgl_render.h"
 #include "xgl_backend.h"
 #include "xgl_audio.h"
 #include "xgl_profile.h"

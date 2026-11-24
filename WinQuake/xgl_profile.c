@@ -5,6 +5,7 @@
  * Output goes to the terminal, never the in-game console being measured.
  */
 #include "quakedef.h"
+#include "xgl_render.h"
 #include "xgl_profile.h"
 
 static cvar_t xgl_profile = {"xgl_profile", "0", false, false, 0, NULL};

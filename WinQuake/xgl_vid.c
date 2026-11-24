@@ -21,6 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 /* XGL window and input driver. Based on the Solaris X11 input conventions;
  * the software framebuffer and OpenGL drivers remain separate targets. */
 #include "quakedef.h"
+#include "xgl_render.h"
 #include "xgl_backend.h"
 #include "xgl_smp.h"
 #include <X11/Xutil.h>

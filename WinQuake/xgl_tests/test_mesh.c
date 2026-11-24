@@ -1,5 +1,6 @@
 /* Alias command/pose contract tests. GPL-2.0-or-later. */
 #include "quakedef.h"
+#include "xgl_render.h"
 #include "xgl_alias.h"
 #include <assert.h>
 #include <stdarg.h>

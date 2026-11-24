@@ -7,7 +7,7 @@
  * picture pixels or character atlas are submitted to XGL.
  */
 #include "quakedef.h"
-#include "xgl_local.h"
+#include "xgl_render.h"
 
 #define XGL_DRAW_PICS 512
 #define XGL_DRAW_RUN 256

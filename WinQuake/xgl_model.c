@@ -23,7 +23,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // on the same machine.
 
 #include "quakedef.h"
-#include "xgl_local.h"
+#include "xgl_render.h"
 
 /* Map allocations may be released without invalidating cached alias skins. */
 void XGL_TextureMarkMap (int id);
