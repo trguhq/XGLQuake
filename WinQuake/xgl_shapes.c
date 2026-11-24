@@ -32,11 +32,24 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  * found lies in different places in the two halves of the part, and kept if
  * the color really steps across the tilted line along its whole length. A
  * part with a tilted side is also tried with a cut parallel to that side,
- * since an outline is often a thin line of its own color.
+ * since an outline is often a thin line of its own color. And once upright
+ * and level cuts have boxed a round or chamfered shape in, each corner of
+ * the box is tried cut off at 45 degrees: such a shape otherwise comes out
+ * as a flight of steps.
  *
  * A texture is drawn this way only if as many pieces as a smooth mesh would
  * have triangles for describe it distinctly better than that mesh does. Most
- * rock, brick and rough metal does not qualify and is left alone. */
+ * rock, brick and rough metal does not qualify and is left alone.
+ *
+ * A small texture is examined at its own scale. A sign 32 texels square has
+ * as much to show as a panel of 64, and a mesh with a vertex every 16
+ * texels has four vertices to show it with: judged against that on the two
+ * pieces those would pay for, no small texture has shapes. Along a side
+ * shorter than XGL_SHAPE_FULL texels it is therefore looked at as the same
+ * picture drawn that long: compared with a mesh of four cells along that
+ * side, on the pieces such a mesh pays for. And a texture with fewer texels
+ * than a square of XGL_SHAPE_FULL has is asked for as much less of a cut as
+ * it has fewer, here and when a wall weighs the cut. */
 #include "quakedef.h"
 #include "xgl_render.h"
 #include "xgl_audio.h"
@@ -56,9 +69,12 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define XGL_SHAPE_STOP 1.0
 #define XGL_SHAPE_STOP_GAIN 40000.0
 /* The smooth mesh the pieces are compared with has a vertex every so many
- * texels, and a piece is reckoned to cost 3.3 of its triangles. */
+ * texels, and a piece is reckoned to cost 3.3 of its triangles. Along a
+ * side under XGL_SHAPE_FULL texels the mesh has as many cells as along one
+ * of that length, though never cells under two texels. */
 #define XGL_SHAPE_GRID 16
 #define XGL_SHAPE_PIECE_TRIANGLES 3.3
+#define XGL_SHAPE_FULL_CELLS (XGL_SHAPE_FULL / XGL_SHAPE_GRID)
 /* Pieces must leave at most this share of the smooth mesh's error, and at
  * least one level of color less, for the texture to be drawn as pieces. */
 #define XGL_SHAPE_BETTER .85
@@ -78,6 +94,19 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define XGL_SHAPE_EDGE_AGREE .35
 /* How far in from a tilted side a parallel cut is looked for. */
 #define XGL_SHAPE_SIDE_REACH 20
+/* A corner cut off at 45 degrees has legs of at least this many texels and
+ * at most half the part's box, or this many; the color must step this many
+ * levels across the cut; and the corner's own texels must lie no farther
+ * from their mean, by this factor, than that step. */
+#define XGL_SHAPE_CORNER_LEAST 3
+#define XGL_SHAPE_CORNER_MOST 32
+#define XGL_SHAPE_CORNER_STEP 30.0
+#define XGL_SHAPE_CORNER_FLAT 1.0
+/* A step of detail ends only where every cut it makes is worth this many
+ * times any it leaves out, and may make cuts for up to twice the pieces it
+ * pays for to reach such a place. */
+#define XGL_SHAPE_RUN 1.5f
+#define XGL_SHAPE_RUN_OVER 2
 /* The share of a piece's darkest and of its brightest texels left out of
  * its color. */
 #define XGL_SHAPE_TRIM .2
@@ -155,6 +184,22 @@ typedef struct {
 /* Indexed by texture number less one. */
 static xgl_shape_entry_t *xgl_shape_entries;
 static int xgl_shape_examined, xgl_shape_found;
+
+/* The texels a repeat of a texture counts as: see xgl_shape_tree_t. */
+static int XGL_ShapeArea (int width, int height)
+{
+    return width * height > XGL_SHAPE_FULL * XGL_SHAPE_FULL ? width * height : XGL_SHAPE_FULL * XGL_SHAPE_FULL;
+}
+
+/* The cells of the smooth mesh along one side of the texture. */
+static int XGL_ShapeCells (int side)
+{
+    int cells, least;
+    cells = side / XGL_SHAPE_GRID;
+    least = side / 2 < XGL_SHAPE_FULL_CELLS ? side / 2 : XGL_SHAPE_FULL_CELLS;
+    if (cells < least) cells = least;
+    return cells > 1 ? cells : 1;
+}
 
 static void XGL_ShapeBox (int x0, int y0, int x1, int y1, double *sum)
 {
@@ -241,9 +286,10 @@ static int XGL_ShapeOrigin (unsigned int (*sums)[4], int length, int across)
 }
 
 /* The error of the ordinary kind of mesh on this texture: vertices every
- * XGL_SHAPE_GRID texels, each the mean of a box three quarters as wide,
- * colors running smoothly between them. Every second texel is compared, the
- * other ones on the next row, so that a striped texture is judged fairly. */
+ * XGL_SHAPE_GRID texels, or nearer along a short side, each the mean of a
+ * box three quarters as wide as their spacing, colors running smoothly
+ * between them. Every second texel is compared, the other ones on the next
+ * row, so that a striped texture is judged fairly. */
 static double XGL_ShapeSmooth (void)
 {
     static float grid[17][17][3];
@@ -253,11 +299,13 @@ static double XGL_ShapeSmooth (void)
     const unsigned int *texel;
     double sum[4], part[4], error;
     float fx, fy, value, difference;
-    int w, h, gw, gh, gx, gy, nx, ny, x, y, c, half, x0, y0, x1, y1, i, j, skip, taken;
+    int w, h, gw, gh, gx, gy, nx, ny, x, y, c, half_x, half_y, x0, y0, x1, y1, i, j, skip, taken;
     w = xgl_shape.width; h = xgl_shape.height;
-    gw = w / XGL_SHAPE_GRID; if (gw < 1) gw = 1;
-    gh = h / XGL_SHAPE_GRID; if (gh < 1) gh = 1;
-    half = XGL_SHAPE_GRID * 3 / 8;
+    gw = XGL_ShapeCells(w); gh = XGL_ShapeCells(h);
+    half_x = (w / gw < XGL_SHAPE_GRID ? w / gw : XGL_SHAPE_GRID) * 3 / 8;
+    half_y = (h / gh < XGL_SHAPE_GRID ? h / gh : XGL_SHAPE_GRID) * 3 / 8;
+    if (half_x < 1) half_x = 1;
+    if (half_y < 1) half_y = 1;
     for (gy = 0; gy < gh; ++gy)
         for (gx = 0; gx < gw; ++gx) {
             sum[0] = sum[1] = sum[2] = 0;
@@ -265,8 +313,8 @@ static double XGL_ShapeSmooth (void)
              * next repeat: up to four rectangles of this one. */
             for (j = 0; j < 2; ++j)
                 for (i = 0; i < 2; ++i) {
-                    x0 = gx * w / gw - half; x1 = gx * w / gw + half;
-                    y0 = gy * h / gh - half; y1 = gy * h / gh + half;
+                    x0 = gx * w / gw - half_x; x1 = gx * w / gw + half_x;
+                    y0 = gy * h / gh - half_y; y1 = gy * h / gh + half_y;
                     if (x1 - x0 > w) { x0 = 0; x1 = w; }
                     if (y1 - y0 > h) { y0 = 0; y1 = h; }
                     if (i == 0) {
@@ -285,7 +333,7 @@ static double XGL_ShapeSmooth (void)
                     XGL_ShapeBox(x0, y0, x1, y1, part);
                     for (c = 0; c < 3; ++c) sum[c] += part[c];
                 }
-            x0 = 2 * half < w ? 2 * half : w; y0 = 2 * half < h ? 2 * half : h;
+            x0 = 2 * half_x < w ? 2 * half_x : w; y0 = 2 * half_y < h ? 2 * half_y : h;
             for (c = 0; c < 3; ++c) grid[gy][gx][c] = (float)(sum[c] / (x0 * y0));
         }
     for (x = 0; x < w; ++x) {
@@ -632,6 +680,86 @@ static double XGL_ShapeClimb (int index, int family, float half, double whole, d
     return gain;
 }
 
+/* Whether the color steps across a corner cut along the whole of it, and
+ * the corner is of one color. The strips three texels deep either side of
+ * the cut, over the rows ya to yb that the corner has, must differ by a
+ * clear step, the same way in every stretch: four stretches of a long cut,
+ * two of a short one. And the corner's texels must lie nearer their own
+ * mean than that step is high: a vein across a marble tile steps too, but
+ * what it cuts off is no corner. */
+static int XGL_ShapeCornerHolds (int index, float a, float b, float d, int ya, int yb)
+{
+    const xgl_shape_part_t *part = &xgl_shape.part[index];
+    double outer[4], middle[4], inner[4], step[4][3], mean[3], dot, length2;
+    float width;
+    int q, c, n0, n1, n2, from, to, stretches;
+    width = 3 * (float)sqrt(a * a + b * b);
+    if (yb - ya < XGL_SHAPE_CORNER_LEAST) return 0;
+    stretches = yb - ya >= 8 ? 4 : (yb - ya >= 4 ? 2 : 1);
+    mean[0] = mean[1] = mean[2] = 0;
+    for (q = 0; q < stretches; ++q) {
+        from = ya + (yb - ya) * q / stretches; to = ya + (yb - ya) * (q + 1) / stretches;
+        XGL_ShapeFar(index, a, b, d - width, from, to, part->x0, part->x1, outer, &n0);
+        XGL_ShapeFar(index, a, b, d, from, to, part->x0, part->x1, middle, &n1);
+        XGL_ShapeFar(index, a, b, d + width, from, to, part->x0, part->x1, inner, &n2);
+        if (n0 - n1 < 2 || n1 - n2 < 1) return 0;
+        for (c = 0; c < 3; ++c) {
+            step[q][c] = (middle[c] - inner[c]) / (n1 - n2) - (outer[c] - middle[c]) / (n0 - n1);
+            mean[c] += step[q][c];
+        }
+    }
+    length2 = 0;
+    for (c = 0; c < 3; ++c) { mean[c] /= stretches; length2 += mean[c] * mean[c]; }
+    if (length2 < XGL_SHAPE_CORNER_STEP * XGL_SHAPE_CORNER_STEP) return 0;
+    for (q = 0; q < stretches; ++q) {
+        dot = step[q][0] * mean[0] + step[q][1] * mean[1] + step[q][2] * mean[2];
+        if (dot < XGL_SHAPE_EDGE_AGREE * length2) return 0;
+    }
+    XGL_ShapeFar(index, a, b, d, ya, yb, part->x0, part->x1, inner, &n2);
+    if (n2 < 2 * XGL_SHAPE_LEAST ||
+        XGL_ShapeError(inner, n2) / (3.0 * n2) > XGL_SHAPE_CORNER_FLAT * XGL_SHAPE_CORNER_FLAT * length2 / 3.0) return 0;
+    return 1;
+}
+
+/* A round or chamfered shape, once upright and level cuts have boxed it in,
+ * has corners of another color. Try cutting each corner of the part's box
+ * off at 45 degrees, at every size from XGL_SHAPE_CORNER_LEAST texels a leg
+ * to half the box, and take the best such cut in place of the part's
+ * upright or level one if it gains more and holds. Only the corner's own
+ * rows have texels beyond the cut, so only they are summed. */
+static void XGL_ShapeCorner (int index)
+{
+    xgl_shape_part_t *part = &xgl_shape.part[index];
+    double whole, trial, best, far_sum[4], near_sum[4];
+    float a, b, d, best_a = 0, best_b = 0, best_d = 0;
+    int corner, legs, reach, w, h, found, ya, yb, far_n, c;
+    w = part->x1 - part->x0; h = part->y1 - part->y0;
+    if (part->n < 24 || w < 2 * XGL_SHAPE_CORNER_LEAST || h < 2 * XGL_SHAPE_CORNER_LEAST) return;
+    whole = XGL_ShapeError(part->sum, part->n);
+    reach = (w < h ? w : h) / 2;
+    if (reach > XGL_SHAPE_CORNER_MOST) reach = XGL_SHAPE_CORNER_MOST;
+    best = part->gain * XGL_SHAPE_TILT_WORTH; found = 0;
+    for (corner = 0; corner < 4; ++corner) {
+        a = (corner & 1) ? 1.0f : -1.0f; b = (corner & 2) ? 1.0f : -1.0f;
+        for (legs = XGL_SHAPE_CORNER_LEAST; legs <= reach; ++legs) {
+            /* The far side is the corner: the texels whose centers lie
+             * within `legs` texels of it along both sides of the box. */
+            d = a * ((corner & 1) ? part->x1 : part->x0) + b * ((corner & 2) ? part->y1 : part->y0) - legs - .5f;
+            ya = (corner & 2) ? part->y1 - legs : part->y0; yb = ya + legs;
+            XGL_ShapeFar(index, a, b, d, ya, yb, part->x0, part->x1, far_sum, &far_n);
+            if (far_n < 2 * XGL_SHAPE_LEAST || part->n - far_n < 2 * XGL_SHAPE_LEAST) continue;
+            for (c = 0; c < 4; ++c) near_sum[c] = part->sum[c] - far_sum[c];
+            trial = whole - XGL_ShapeError(far_sum, far_n) - XGL_ShapeError(near_sum, part->n - far_n);
+            if (!(trial > best) || !XGL_ShapeCornerHolds(index, a, b, d, ya, yb)) continue;
+            best = trial; best_a = a; best_b = b; best_d = d; found = 1;
+        }
+    }
+    if (!found) return;
+    part->gain = part->total = (float)best;
+    part->axis = 2; part->band = 0;
+    part->a = best_a; part->b = best_b; part->d = part->d2 = best_d;
+}
+
 /* A sloping outline shows as a middling upright or level cut. To find the
  * slope, the edge, or the thin band, is located separately in the two
  * halves of the part; if it lies in different places, the line through both
@@ -828,23 +956,31 @@ static void XGL_ShapeTake (int index, int parent, int far)
 /* Divide the repeat, most telling cut first, and say whether the texture
  * has shapes. First with upright and level cuts only, as far as the verdict
  * looks: a texture nowhere near having shapes is left at that. One that may
- * have them is divided again from the start with tilting, and, if the
- * verdict holds, all the way. */
+ * have them is divided again from the start with tilted cuts and corners
+ * cut off, and, if the verdict holds, all the way. But the most telling
+ * cut at each turn is not always the best in the end, and tilting must not
+ * lose what plain cuts had: if the pieces then describe the texture worse,
+ * where the verdict looks, than the first go's did, it is divided a third
+ * time as at first, to the end. */
 static int XGL_ShapeDivide (double smooth)
 {
     xgl_shape_part_t *part, *rest_part;
-    double whole, rest, pieces_error, texels;
-    int i, best, leaves, pass, first, judged, structured, enough, w, h;
+    double whole, rest, pieces_error, plain_error, texels, stop_gain;
+    int i, best, leaves, pass, tilt, worse, first, judged, structured, enough, w, h;
     w = xgl_shape.width; h = xgl_shape.height;
     texels = 3.0 * w * h;
     /* As many pieces as the triangles of the smooth mesh would pay for. */
-    enough = (int)(2 * (w / XGL_SHAPE_GRID > 1 ? w / XGL_SHAPE_GRID : 1) *
-                   (h / XGL_SHAPE_GRID > 1 ? h / XGL_SHAPE_GRID : 1) / XGL_SHAPE_PIECE_TRIANGLES);
+    enough = (int)(2 * XGL_ShapeCells(w) * XGL_ShapeCells(h) / XGL_SHAPE_PIECE_TRIANGLES);
     if (enough < 2) enough = 2;
+    /* A cut removes less in all from a small texture, which has fewer
+     * texels, than from the same picture at full size. */
+    stop_gain = XGL_SHAPE_STOP_GAIN * w * h / XGL_ShapeArea(w, h);
     part = &xgl_shape.part[0];
     whole = XGL_ShapeError(part->sum, part->n);
-    structured = 0;
-    for (pass = 0; pass < 2; ++pass) {
+    structured = worse = 0;
+    plain_error = 0;
+    for (pass = 0; pass < 3; ++pass) {
+        tilt = pass == 1;
         xgl_shape.count = 1; leaves = 1; rest = whole; judged = 0;
         part = &xgl_shape.part[0];
         part->child[0] = part->child[1] = -1; part->tilted = part->paired = 0;
@@ -857,9 +993,9 @@ static int XGL_ShapeDivide (double smooth)
                 if (xgl_shape.part[i].child[0] < 0 && xgl_shape.part[i].gain > 0 &&
                     (best < 0 || xgl_shape.part[i].gain > xgl_shape.part[best].gain)) best = i;
             if (best < 0 || xgl_shape.part[best].gain < XGL_SHAPE_STOP * w * h) break;
-            if (judged && xgl_shape.part[best].gain < XGL_SHAPE_STOP_GAIN) break;
+            if (judged && xgl_shape.part[best].gain < stop_gain) break;
             part = &xgl_shape.part[best];
-            if (pass && !part->tilted) XGL_ShapeTilt(best);
+            if (tilt && !part->tilted) XGL_ShapeTilt(best);
             first = xgl_shape.count;
             XGL_ShapeTake(first, best, 0);
             XGL_ShapeTake(first + 1, best, 1);
@@ -879,22 +1015,33 @@ static int XGL_ShapeDivide (double smooth)
                 rest_part->child[1] = (short)(xgl_shape.count + 1);
                 XGL_ShapeBest(first);
                 XGL_ShapeBest(xgl_shape.count); XGL_ShapeBest(xgl_shape.count + 1);
+                if (tilt) {
+                    XGL_ShapeCorner(first);
+                    XGL_ShapeCorner(xgl_shape.count); XGL_ShapeCorner(xgl_shape.count + 1);
+                }
                 xgl_shape.count += 2; ++leaves;
             } else {
                 part->band = 0;
                 XGL_ShapeBest(first); XGL_ShapeBest(first + 1);
+                if (tilt) { XGL_ShapeCorner(first); XGL_ShapeCorner(first + 1); }
             }
             if (judged) continue;
             pieces_error = sqrt((rest > 0 ? rest : 0) / texels);
             if (leaves < enough) continue;
             judged = 1;
             structured = pieces_error < smooth * XGL_SHAPE_BETTER && smooth - pieces_error >= XGL_SHAPE_MARGIN;
+            if (tilt && pieces_error > plain_error * (1 + 1e-9)) { worse = 1; break; }
             /* Tilting may yet win a near miss, so the first pass ends here. */
             if (!pass || !structured) break;
         }
-        if (!judged)
+        if (!judged) {
             structured = pieces_error < smooth * XGL_SHAPE_BETTER && smooth - pieces_error >= XGL_SHAPE_MARGIN;
-        if (!pass && !(pieces_error < smooth * XGL_SHAPE_HOPE)) break;
+            if (tilt && pieces_error > plain_error * (1 + 1e-9)) worse = 1;
+        }
+        if (!pass) {
+            plain_error = pieces_error;
+            if (!(pieces_error < smooth * XGL_SHAPE_HOPE)) break;
+        } else if (!worse) break;
     }
     return structured;
 }
@@ -1000,6 +1147,46 @@ static xgl_shape_node_t *XGL_ShapeAnalyse (const byte *texels, int width, int he
     free(memory);
     xgl_shape.table = NULL; xgl_shape.texel = NULL; xgl_shape.row = NULL; xgl_shape.span = NULL;
     return nodes;
+}
+
+/* Where the steps of detail may end among a division's cuts: see `cuts` in
+ * xgl_shape_tree_t. A number of cuts is a place to stop when the least
+ * telling of them is worth XGL_SHAPE_RUN times the most telling of the
+ * rest; a step that pays for n pieces stops at the place whose pieces are
+ * nearest n in proportion, and no more than XGL_SHAPE_RUN_OVER times n.
+ * The two sides of a band are worth the same and so are never parted. */
+static void XGL_ShapeRuns (xgl_shape_tree_t *tree)
+{
+    float gain[XGL_SHAPE_PIECES], rest[XGL_SHAPE_PIECES + 1], least, off, nearest;
+    byte stop[XGL_SHAPE_PIECES + 1];
+    int cuts, i, k, pieces, best;
+    cuts = (tree->count - 1) / 2;
+    if (cuts > XGL_SHAPE_PIECES - 1) cuts = XGL_SHAPE_PIECES - 1;
+    memset(gain, 0, sizeof(gain));
+    /* A node's cut is the k-th made when its children are nodes 2k - 1
+     * and 2k. */
+    for (i = 0; i < tree->count; ++i) {
+        k = (tree->nodes[i].child[0] - 1) / 2;
+        if (tree->nodes[i].child[0] > 0 && k < cuts) gain[k] = tree->nodes[i].gain;
+    }
+    rest[cuts] = 0;
+    for (k = cuts - 1; k >= 0; --k) rest[k] = gain[k] > rest[k + 1] ? gain[k] : rest[k + 1];
+    stop[0] = 1; least = 0;
+    for (k = 1; k <= cuts; ++k) {
+        if (k == 1 || gain[k - 1] < least) least = gain[k - 1];
+        stop[k] = (byte)(k == cuts || least >= XGL_SHAPE_RUN * rest[k]);
+    }
+    tree->cuts[0] = 0;
+    for (pieces = 1; pieces <= XGL_SHAPE_PIECES; ++pieces) {
+        best = 0; nearest = 0;
+        for (k = 0; k <= cuts && k + 1 <= XGL_SHAPE_RUN_OVER * pieces; ++k) {
+            if (!stop[k]) continue;
+            /* How far from the pieces paid for, as a proportion either way. */
+            off = k + 1 > pieces ? (float)(k + 1) / pieces : (float)pieces / (k + 1);
+            if (!k || off < nearest) { nearest = off; best = k; }
+        }
+        tree->cuts[pieces] = (byte)best;
+    }
 }
 
 /* A division is going away: nothing may point at it any longer. Which
@@ -1109,6 +1296,8 @@ static xgl_shape_entry_t *XGL_ShapeEntry (texture_t *texture)
         return entry;
     }
     tree->width = width; tree->height = height;
+    tree->area = XGL_ShapeArea(width, height);
+    XGL_ShapeRuns(tree);
     entry->tree = tree;
     ++xgl_shape_found;
     return entry;

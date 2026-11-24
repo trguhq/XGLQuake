@@ -57,7 +57,7 @@ locations and shareware restrictions.
 | `+xgl_alias_subdivide 0` | Keep original model triangles without extra subdivision. |
 | `+xgl_alias_strips 0` | Send every model triangle separately. By default runs of four and more go out as triangle strips. |
 | `+xgl_smp 0` | Select serial vertex preparation. The default detects multiple CPUs. Use 1 to request a helper. |
-| `+xgl_detailtris 2048` | Set the detailed world triangle allowance; complete coarse faces remain. |
+| `+xgl_detailtris 3072` | Set the detailed world triangle allowance; complete coarse faces remain. |
 | `+xgl_detailerror 16` | Set how much a texture or shadow must differ before it is given more triangles; larger is coarser. |
 | `+xgl_detaildensity 160` | Set how many triangles a face may have for its apparent size; 0 gives every face the same limit. |
 | `+xgl_shapes 0` | Draw every wall as a smooth mesh. By default walls whose textures have clear shapes are cut along them; see [texture shapes](docs/render.md#texture-shapes). |

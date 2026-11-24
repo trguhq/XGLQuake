@@ -282,6 +282,280 @@ static void test_animated_frames(void)
     XGL_ShapesClear();
 }
 
+/* A sign 32 texels square: two bright bars on a dark ground, a faint block
+ * between them and a thin strip under them. Then the same picture drawn
+ * twice the size. */
+static int sign(int x, int y)
+{
+    if (y >= 26 && y < 28) return 250;
+    if (y >= 6 && y < 22 && ((x >= 6 && x < 10) || (x >= 20 && x < 24))) return 220;
+    if (x >= 12 && x < 18 && y >= 9 && y < 15) return 74;
+    return 50;
+}
+static int sign_doubled(int x, int y) { return sign(x / 2, y / 2); }
+/* The same sign with grain over it: each texel a little off its color. */
+static int sign_grainy(int x, int y)
+{
+    int value = sign(x, y) + (noise(x, y) - 120) / 6;
+    return value > 255 ? 255 : value;
+}
+/* A smooth swell that repeats every 32 texels, or every 16. */
+static int swell(int x, int y)
+{
+    return 128 + (int)(60 * sin(x * (2 * 3.14159265 / 32)) * cos(y * (2 * 3.14159265 / 32)));
+}
+static int swell_fine(int x, int y) { return swell(2 * x, 2 * y); }
+/* Four lamps, one in each quarter of 32 texels square: no single cut sets
+ * any of them apart. */
+static int lamps(int x, int y)
+{
+    return ((x >= 4 && x < 12) || (x >= 20 && x < 28)) && ((y >= 4 && y < 12) || (y >= 20 && y < 28)) ? 220 : 50;
+}
+/* A glow with no edge to it. */
+static int glow(int x, int y)
+{
+    double dx = x - 15.5, dy = y - 15.5;
+    return 60 + (int)(160 * exp(-(dx * dx + dy * dy) / 60.0));
+}
+/* A strip light 16 texels wide: a bright bar along it between dark edges. */
+static int strip_light(int x, int y) { (void)y; return x >= 5 && x < 11 ? 240 : 40; }
+
+/* A small texture is examined at its own scale: as the same picture drawn
+ * XGL_SHAPE_FULL texels to a side would be. */
+static void test_small_textures(void)
+{
+    xgl_shape_tree_t *small, *large, *tree;
+    const xgl_shape_node_t *a, *b;
+    int i, x, y, examined, shaped;
+    XGL_ShapesClear();
+    small = XGL_TextureShapes(make(0, 32, 32, sign));
+    large = XGL_TextureShapes(make(1, 64, 64, sign_doubled));
+    assert(small && large);
+    check_tree(small); check_tree(large);
+    /* It has every part of the sign, the faint block too: a cut is asked
+     * for as much less as the texture has fewer texels than at full size. */
+    assert(small->count >= 2 * 8 - 1);
+    assert(near_value(small->colors[3 * node_at(small, 8, 12)], 220));
+    assert(near_value(small->colors[3 * node_at(small, 22, 12)], 220));
+    assert(near_value(small->colors[3 * node_at(small, 15, 12)], 74));
+    assert(near_value(small->colors[3 * node_at(small, 15, 18)], 50));
+    assert(near_value(small->colors[3 * node_at(small, 15, 27)], 250));
+    assert(near_value(small->colors[3 * node_at(small, 15, 2)], 50));
+    /* It is divided as the doubled picture is, cut for cut: each at twice
+     * the place, for four times the gain. */
+    assert(small->count == large->count);
+    assert(large->origin[0] == 2 * small->origin[0] && large->origin[1] == 2 * small->origin[1]);
+    for (i = 0; i < small->count; ++i) {
+        a = &small->nodes[i]; b = &large->nodes[i];
+        assert(a->child[0] == b->child[0] && a->child[1] == b->child[1] && a->flags == b->flags);
+        assert(!memcmp(small->colors + 3 * i, large->colors + 3 * i, 3));
+        if (a->child[0] < 0) continue;
+        assert(a->a == b->a && a->b == b->b && b->d == 2 * a->d);
+        assert(fabs(b->gain - 4 * a->gain) <= 1e-4 * b->gain);
+    }
+    for (y = 0; y < 32; ++y)
+        for (x = 0; x < 32; ++x) {
+            assert(near_value(small->colors[3 * node_at(small, x, y)], sign(x, y)));
+            assert(near_value(large->colors[3 * node_at(large, 2 * x + 1, 2 * y)], sign(x, y)));
+        }
+    /* Both count as the same number of texels when a wall's detail is
+     * budgeted. A larger texture counts as what it has; so does a strip
+     * that has as many texels, and one that has fewer counts as the
+     * square does. */
+    assert(small->area == XGL_SHAPE_FULL * XGL_SHAPE_FULL && large->area == small->area);
+    tree = XGL_TextureShapes(make(2, 128, 128, panel));
+    assert(tree && tree->area == 128 * 128);
+    tree = XGL_TextureShapes(make(2, 32, 160, strip_light));
+    assert(tree && tree->area == 32 * 160);
+    tree = XGL_TextureShapes(make(3, 16, 128, strip_light));
+    assert(tree && tree->area == XGL_SHAPE_FULL * XGL_SHAPE_FULL);
+    check_tree(tree);
+    assert(near_value(tree->colors[3 * node_at(tree, 8, 70)], 240));
+    assert(near_value(tree->colors[3 * node_at(tree, 2, 70)], 40));
+    /* Judged on the two pieces that a mesh with a vertex every 16 texels
+     * pays for, four lamps could not pass: one cut sets none of them
+     * apart. Judged on what the same picture has at full size, they do. */
+    tree = XGL_TextureShapes(make(4, 32, 32, lamps));
+    assert(tree);
+    check_tree(tree);
+    for (y = 0; y < 32; ++y)
+        for (x = 0; x < 32; ++x) assert(near_value(tree->colors[3 * node_at(tree, x, y)], lamps(x, y)));
+    /* Grain over the sign does not hide it. */
+    tree = XGL_TextureShapes(make(4, 32, 32, sign_grainy));
+    assert(tree);
+    assert(abs(tree->colors[3 * node_at(tree, 8, 12)] - 220) <= 12);
+    assert(abs(tree->colors[3 * node_at(tree, 15, 18)] - 50) <= 12);
+    assert(abs(tree->colors[3 * node_at(tree, 15, 27)] - 250) <= 12);
+    /* And being small makes nothing of what has no shapes: one color,
+     * grain alone, a smooth swell. */
+    assert(!XGL_TextureShapes(make(5, 32, 32, flat)));
+    assert(!XGL_TextureShapes(make(6, 32, 32, noise)));
+    assert(!XGL_TextureShapes(make(7, 32, 32, swell)));
+    assert(!XGL_TextureShapes(make(5, 16, 16, noise)));
+    assert(!XGL_TextureShapes(make(6, 48, 48, noise)));
+    assert(!XGL_TextureShapes(make(7, 16, 64, noise)));
+    assert(!XGL_TextureShapes(make(5, 16, 16, swell_fine)));
+    /* Nor of a glow, which the finer mesh a small texture is compared
+     * with shows as well as pieces could. */
+    assert(!XGL_TextureShapes(make(6, 32, 32, glow)));
+    XGL_ShapesCount(&examined, &shaped);
+    assert(examined == 15 && shaped == 7);
+    XGL_ShapesClear();
+}
+
+/* A light of five like bars on a dark ground, and a strip of another tone
+ * below them. */
+static int bars(int x, int y)
+{
+    if (y >= 50 && y < 54) return 120;
+    if (y >= 8 && y < 40 && x >= 4 && x < 56 && (x - 4) % 12 < 4) return 220;
+    return 40;
+}
+
+/* The node whose piece holds a texel when the cuts made are the first so
+ * many: those whose children are nodes up to `most`. */
+static int node_under(const xgl_shape_tree_t *tree, int most, int x, int y)
+{
+    const xgl_shape_node_t *node;
+    float s, t;
+    int index;
+    s = (float)((x - tree->origin[0] + tree->width) % tree->width) + .5f;
+    t = (float)((y - tree->origin[1] + tree->height) % tree->height) + .5f;
+    for (index = 0;;) {
+        node = &tree->nodes[index];
+        if (node->child[0] < 0 || node->child[1] > most) return index;
+        if ((node->flags & XGL_SHAPE_PAIRED) && tree->nodes[node->child[1]].child[1] > most) return index;
+        index = node->child[node->a * s + node->b * t >= node->d];
+    }
+}
+
+/* A step of detail shows like details all or none: it ends where a run of
+ * cuts worth about the same ends, never among them. */
+static void test_steps_keep_like_details(void)
+{
+    xgl_shape_tree_t *tree;
+    float gain[XGL_SHAPE_PIECES], least, rest;
+    int i, k, pieces, cuts, shown, total, all_shown, none_shown, between;
+    XGL_ShapesClear();
+    tree = XGL_TextureShapes(make(0, 64, 64, bars));
+    assert(tree);
+    check_tree(tree);
+    total = (tree->count - 1) / 2;
+    /* Every cut made, each bar is a piece of its own. */
+    for (i = 0; i < 5; ++i) assert(near_value(tree->colors[3 * node_at(tree, 6 + 12 * i, 20)], 220));
+    assert(near_value(tree->colors[3 * node_at(tree, 12, 20)], 40));
+    assert(tree->cuts[0] == 0 && tree->cuts[1] == 0 && tree->cuts[XGL_SHAPE_PIECES] == total);
+    memset(gain, 0, sizeof(gain));
+    for (i = 0; i < tree->count; ++i)
+        if (tree->nodes[i].child[0] > 0) gain[(tree->nodes[i].child[0] - 1) / 2] = tree->nodes[i].gain;
+    all_shown = none_shown = between = 0;
+    for (pieces = 1; pieces <= XGL_SHAPE_PIECES; ++pieces) {
+        cuts = tree->cuts[pieces];
+        /* More pieces paid for, no fewer cuts; never more than twice the
+         * pieces; and what is made is worth clearly more than what is not. */
+        assert(cuts >= tree->cuts[pieces - 1] && cuts <= total && cuts + 1 <= 2 * pieces);
+        least = 1e30f; rest = 0;
+        for (k = 0; k < total; ++k) {
+            if (k < cuts) { if (gain[k] < least) least = gain[k]; }
+            else if (gain[k] > rest) rest = gain[k];
+        }
+        if (cuts && cuts < total) assert(least >= 1.5f * rest);
+        /* The bars: all of them pieces of their own, or none. */
+        shown = 0;
+        for (i = 0; i < 5; ++i)
+            if (abs(tree->colors[3 * node_under(tree, 2 * cuts, 6 + 12 * i, 20)] - 220) <= 3) ++shown;
+        assert(shown == 0 || shown == 5);
+        if (shown) ++all_shown; else ++none_shown;
+        /* A count of pieces that would have stopped among the bars. */
+        shown = 0;
+        for (i = 0; i < 5; ++i)
+            if (pieces - 1 <= total && abs(tree->colors[3 * node_under(tree, 2 * (pieces - 1), 6 + 12 * i, 20)] - 220) <= 3) ++shown;
+        if (shown > 0 && shown < 5) ++between;
+    }
+    /* Both happen, and stopping by the count alone would have parted them. */
+    assert(all_shown > 0 && none_shown > 0 && between >= 2);
+    XGL_ShapesClear();
+}
+
+/* A round lamp with a hard edge, on a dark ground with a strip below it. */
+static int lamp(int x, int y)
+{
+    int dx = 2 * x - 47, dy = 2 * y - 47; /* About (23.5, 23.5), radius 14. */
+    if (y >= 54 && y < 58) return 130;
+    return dx * dx + dy * dy < 28 * 28 ? 230 : 40;
+}
+/* The same, so dim that its edge is no clearer than grain is. */
+static int lamp_dim(int x, int y) { return lamp(x, y) == 230 ? 56 : lamp(x, y); }
+/* A square lamp in a corner of the repeat. */
+static int lamp_square(int x, int y) { return x >= 32 ? 120 : (x < 12 && y < 12 ? 230 : 40); }
+/* Coarse grain, in blocks, with a brighter vein across its corner at 45
+ * degrees, beside two plain panels. */
+static int vein(int x, int y)
+{
+    if (x >= 32) return 20;
+    if (y >= 32) return 235;
+    if (x + y >= 13 && x + y < 16) return 200;
+    return (((x >> 1) ^ (y >> 2)) & 1 ? 215 : 40);
+}
+
+static int corner_cuts(const xgl_shape_tree_t *tree)
+{
+    const xgl_shape_node_t *node;
+    int i, corners = 0;
+    for (i = 0; i < tree->count; ++i) {
+        node = &tree->nodes[i];
+        if (node->child[0] >= 0 && (node->flags & XGL_SHAPE_AXIS) == 2 && fabs(node->a) == 1 && fabs(node->b) == 1) ++corners;
+    }
+    return corners;
+}
+
+/* A round or chamfered shape has its corners cut off at 45 degrees, not
+ * stepped; a cut that does not lie along a clear edge all its length, or
+ * that cuts off no corner of one color, is not made. */
+static void test_corner_cuts(void)
+{
+    xgl_shape_tree_t *tree;
+    int i, tilted;
+    XGL_ShapesClear();
+    tree = XGL_TextureShapes(make(0, 64, 64, lamp));
+    assert(tree);
+    check_tree(tree);
+    /* Boxed in by upright and level cuts, then all four corners. */
+    assert(corner_cuts(tree) == 4);
+    for (i = tilted = 0; i < tree->count; ++i)
+        if (tree->nodes[i].child[0] >= 0 && (tree->nodes[i].flags & XGL_SHAPE_AXIS) == 2) ++tilted;
+    assert(tilted == 4);
+    /* The lamp, its middle and well into each side, is one bright piece; a
+     * texel in each corner of its box is of the ground. */
+    assert(near_value(tree->colors[3 * node_at(tree, 23, 23)], 230));
+    assert(node_at(tree, 23, 12) == node_at(tree, 23, 23) && node_at(tree, 23, 35) == node_at(tree, 23, 23));
+    assert(node_at(tree, 12, 23) == node_at(tree, 23, 23) && node_at(tree, 35, 23) == node_at(tree, 23, 23));
+    assert(near_value(tree->colors[3 * node_at(tree, 11, 11)], 40));
+    assert(near_value(tree->colors[3 * node_at(tree, 36, 11)], 40));
+    assert(near_value(tree->colors[3 * node_at(tree, 11, 36)], 40));
+    assert(near_value(tree->colors[3 * node_at(tree, 36, 36)], 40));
+    /* A cut across the corner of a square lamp would tell bright from dark
+     * better than any upright one, but only part of it lies along an edge. */
+    tree = XGL_TextureShapes(make(1, 64, 64, lamp_square));
+    assert(tree);
+    check_tree(tree);
+    assert(!corner_cuts(tree) && tree->count == 7);
+    assert(near_value(tree->colors[3 * node_at(tree, 0, 0)], 230) && near_value(tree->colors[3 * node_at(tree, 11, 11)], 230));
+    assert(near_value(tree->colors[3 * node_at(tree, 12, 5)], 40) && near_value(tree->colors[3 * node_at(tree, 5, 12)], 40));
+    /* The vein is a clear edge all along, but what lies beyond it is grain
+     * like the rest: no corner of one color. */
+    tree = XGL_TextureShapes(make(2, 64, 64, vein));
+    assert(tree);
+    check_tree(tree);
+    assert(!corner_cuts(tree));
+    /* Too faint an edge to be sure of. */
+    tree = XGL_TextureShapes(make(3, 64, 64, lamp_dim));
+    assert(tree);
+    check_tree(tree);
+    assert(!corner_cuts(tree));
+    XGL_ShapesClear();
+}
+
 static float piece_area(const xgl_shape_piece_t *piece)
 {
     float sum = 0;
@@ -484,6 +758,9 @@ int main(void)
     test_what_has_shapes();
     test_bands_origin_and_slopes();
     test_animated_frames();
+    test_small_textures();
+    test_steps_keep_like_details();
+    test_corner_cuts();
     test_cut_faces();
     puts("XGL texture shape contracts passed");
     return 0;

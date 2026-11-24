@@ -6,9 +6,10 @@ smooth-shaded triangles; the
 renderer does not upload textures or draw UI image rasters. BSP/PVS
 visibility, brush/model transforms, animation and game collision use the
 existing engine structures and rules. Sky and water use animated sampled
-geometry. Menu, HUD, console and image-based labels use native stroke text
+geometry. Menu, console and image-based labels use native stroke text
 and geometric replacements, so their appearance differs from the original
-pixel artwork; unknown pictures receive a labelled fallback.
+pixel artwork; unknown pictures receive a labelled fallback. The status
+bar's pictures are drawn from their own pixels, as rectangles of color.
 
 Texture detail and sprite cutouts are geometric approximations. The XGL
 renderer does not implement the OpenGL renderer's optional mirrors, projected
@@ -181,6 +182,17 @@ Each wall texture is examined once, while the map loads:
   across the tilted line along its whole length. A part with a tilted side
   is also tried with a cut parallel to that side, since an outline is often
   a thin line of its own color.
+- A round or chamfered shape, once upright and level cuts have boxed it
+  in, has corners of another color. Each corner of a part's box is tried
+  cut off at 45 degrees, 3 to 32 texels a leg, in place of the part's
+  upright cut: a round lamp becomes an octagon and not a square or a
+  staircase. Such a cut is made only where the color steps clearly across
+  it along its whole length and the corner it cuts off is of one color; the
+  corner of a square, or a vein across grain, is left alone.
+- Tilted cuts must not lose what plain ones had. If, with as many pieces as
+  the verdict below looks at, the division with tilts and corners describes
+  the texture worse than upright and level cuts alone, the plain division
+  is used.
 - A piece is drawn in the color of what mostly fills it: the mean of its
   texels without the darkest and the brightest fifth, so that a thin line or
   a few specks not yet cut out do not tint it.
@@ -190,10 +202,23 @@ Each wall texture is examined once, while the map loads:
   better than a smooth mesh with as many triangles would: they must leave at
   most 85% of its color error. Rock, brick, wood grain and rough metal do
   not pass and are drawn as before.
+- A small texture is examined at its own scale. A sign 32 texels square has
+  as much to show as a panel of 64, but a mesh with a vertex every 16 texels
+  has four vertices for it and pays for two pieces, and on two pieces no
+  sign passes. Along a side shorter than 64 texels a texture is therefore
+  compared with a mesh of four cells, as the same picture drawn 64 texels
+  long would be, on the pieces that mesh pays for: nine for a square one.
+  A cut is asked for as much less as the texture has fewer texels than a
+  square of 64. A picture and the same picture at twice the size are then
+  divided alike, cut for cut. Grain, a smooth swell or a glow without an
+  edge still has no shapes at any size.
 
-In the shareware episode this selects between none and a third of a map's
-wall area: about 28% in `e1m1`, 34% in `e1m5`, 15% in `start`, 3% in `e1m2`
-and under 2% elsewhere.
+In the shareware episode this selects between none and nearly half of a
+map's wall area: about 46% in `e1m1`, 36% in `e1m5`, 17% in `start`, 3% in
+`e1m2`, `e1m6` and `e1m8` and under 1% elsewhere, and four fifths of the
+faces of the ammunition and health boxes. Of the 97 wall textures with a
+side under 64 texels, 58 have shapes: arrows, the exit sign, keys, runes,
+buttons, small lights, trim strips and the box faces.
 
 A face is cut by the lines of its texture's division, repeated as the
 texture repeats. Pieces share their corners along their sides, so no seam
@@ -202,18 +227,54 @@ halved so that baked light is still sampled along it. How many of the cuts
 are made depends on a step of detail that follows the distance:
 
 - A repeat of the texture gets as many pieces as `xgl_detaildensity` pays
-  for at that distance, in steps of 1, 2, 3, 4, 6, 8 and so on. The step
-  depends on the texture and the distance alone, so every face of a wall is
-  cut alike and its pattern runs unbroken across them.
+  for at that distance, in steps of 1, 2, 3, 4, 6, 8 and so on.
+- A step shows like details all or none. The bars of one light, or four
+  lamps in a row, are found one after another and are worth about the same;
+  a step that made just the cuts it pays for would stop among them and show
+  one bar of five, then two. A step therefore ends only where every cut it
+  makes is worth half as much again as any it leaves out, at the nearest
+  such place to the pieces it pays for and at most twice as many. Over the
+  shareware textures that shows a set of like pieces in part at 34 of the
+  steps, where the count alone did at 215, for about the same triangles.
+- A wall is cut alike all over. Faces in one plane, facing one way, with
+  one texture laid one way, that are joined by their edges are one wall,
+  found when the map loads. The whole wall is cut at the step its nearest
+  face asks for, so that the pattern runs unbroken across it. Left to their
+  own distances, more than half of the neighbouring faces of such walls
+  were cut differently. The far end of a long wall is in consequence cut
+  finer than its distance alone would have it.
+- The nearest face is the nearest from where the viewer stands, in view or
+  not. Turning the head, which takes the near end of a wall out of view and
+  brings it back, therefore changes nothing: only walking does. Counting
+  only the faces in view, the rest of a wall went coarser or plain when its
+  near end left the view, and was built finer again when it came back. In
+  replays of walks through `e1m1`, `e1m5` and `start` this costs 2 to 4%
+  more wall triangles and builds up to a fifth fewer meshes.
+- A repeat of a small texture gets the pieces that one of 64 texels square
+  would. By its own texels a sign 32 texels square would have fewer than
+  two pieces from 200 units and stay plain; it is cut out to about 385, as
+  a panel of 64 is.
 - A cut must also be worth its triangles, by the same measure as a split in
   a smooth mesh (`xgl_detailerror` and `xgl_detailedge`); nearer than about
   160 units, where a texel is wider than a pixel, a cut needs to be worth
-  less. A part that would be narrower than a pixel and a half is not cut
-  off: it would only flicker.
-- A wall is made finer in the frame it is called for, but coarser only when
-  the distance asks for half the pieces or fewer, and then one wall every
-  four frames. A step that would make the same cuts as the mesh a wall has
+  less. A small texture's cut is weighed as the same cut at full size would
+  be. A part that would be narrower than a pixel and a half is not cut off,
+  whatever the size of the texture: it would only flicker.
+- A wall is made finer as soon as the frame's building allows, but coarser
+  only when it asks for half the pieces or fewer, and then one wall every
+  four frames, all its faces following one another so that it is not long
+  cut two ways. A step that would make the same cuts as the mesh a wall has
   does not build it again.
+- A face that should be cut and has no cut mesh at all is built before any
+  other mesh in the frame. A wall that is plain where it should be cut
+  shows more than one a step too coarse, and walking into a room of such
+  walls a third of them used to wait their turn, plain, for some frames.
+- A wall that is cut stays cut until its nearest face is about 1.4 times
+  as far off as where it would first be cut, and a cut face stays in range
+  of detail as far beyond `xgl_detaildistance`. Stepping back and forth
+  across either distance then changes nothing. Beyond that the wall goes
+  plain all at once; the cut meshes it had wait in the cache, and serve
+  again if it is cut again before their memory is wanted.
 - One face has at most 256 triangles. A large face of a busy texture is cut
   at the finest step that fits; that is found out the first time and
   remembered.
@@ -229,10 +290,13 @@ frame showing. The mesh is not built again as the texture changes.
 
 Examining the textures adds to the time a map takes to load, and the engine
 reports how long it took. On the SM61 the 72 textures of `e1m3` and its
-item boxes, the map of `demo1`, took 5.3 seconds. The examination has since
-been made to do 43% less work for that map, and 35% less over the whole
-shareware episode, with the same result for every texture; that is counted
-on a development host and not yet timed again on the machine.
+item boxes, the map of `demo1`, took 5.3 seconds. The examination was then
+made to do 43% less work for that map, and 35% less over the whole
+shareware episode, with the same result for every texture, and took 3.0
+seconds on the machine. Examining small textures at their own scale divides
+more of them to the end: about 11% more work for that map and 7% more over
+the episode, counted on a development host and not yet timed on the
+machine.
 
 A texture is examined once for as long as it stays loaded, not once a map.
 While a map loads, the textures of the one before are kept; one the new map
@@ -245,7 +309,11 @@ after `e1m3` examines 49 textures where it would examine 71 from nothing.
 Replayed off the machine on the same maps, walls cut this way cost about
 what they cost before: in views of `e1m1`, 1725 wall triangles a frame
 against 1785, with the mean color error against the full textures down from
-9.9 to 9.4 of 255.
+9.9 to 9.4 of 255. Those figures are from before faces outside the view
+were left out. Small textures were brought in later: in the same views of
+`e1m1` the wall triangles stayed at 1017 a frame, and in replays of the
+three demos the world's triangles rose by 1 to 3%, mostly on the boxes;
+detailed meshes were built 9 to 18% more often.
 
 ### Frame order
 
@@ -297,12 +365,22 @@ vertices and the middles of the edges between them.
   of the shareware episode the points are 35% of the vertices the commands
   name, and 45% of those named after one subdivision.
 - Light is worked out for the same points. A vertex has the light of its
-  normal in that pose, worked out once for each normal the pose uses; the
-  162 model normals are kept ready for each model scale. The middle of an
+  normal in that pose, worked out once for each normal the pose uses. The
+  model's normals are used as they are stored: they are those of its true
+  shape, and are not adjusted for the scale its vertices are stored at,
+  which bent them badly on the unevenly scaled view weapons. The middle of an
   edge has the mean of its two ends' light. Light therefore runs evenly
   along every edge of the model's own triangles, as it does on a model that
   is not subdivided: subdivision adds detail from the skin and does not
   round the shading.
+- Some models have a face made twice over, once for each side: two
+  triangles on the same three vertices, wound opposite ways and colored
+  from different places on the skin. The nailgun has six such pairs, as
+  view weapon and as item, and five monsters one each. Quake hides the side
+  turned away; the device here hides nothing, and the two sides fought for
+  the same depth. Such pairs are found when a model's mesh is made, and each
+  frame only the side facing the viewer is drawn. A model that has any goes
+  out as separate triangles, not strips.
 - Under native illumination (`xgl_alias_shade 0`) the device needs a normal
   for every point instead. A middle then has the mean of its ends' normals
   brought back to unit length, which is a square root for each middle every
@@ -403,6 +481,28 @@ Each picture Quake draws is told apart by its name once, when first asked
 for, and found by its handle after that. A box with an edge is two
 rectangles, the edge color under the fill, not a fill and four strips.
 
+### Status bar pictures
+
+The pictures of the status bar, and the other small pictures the game keeps
+with them (in Quake, those of `gfx.wad`), are drawn from their own pixels.
+Each is divided once, when first drawn, into rectangles of one color: the
+most telling upright or level cut first, then the next. Where a picture has
+transparent pixels its outline is followed first, up to 64 rectangles, so a
+digit has exactly its own shape; after that its colors are told apart until
+`xgl_hudpieces` rectangles show. Each rectangle has the mean color of the
+pixels it covers. Nothing depends on what a picture is called or shows, so
+another game's status bar is drawn from its own art in the same way.
+
+With the shareware pictures a digit takes 8 to 35 rectangles, and at the
+default of 16 a face, a weapon or an ammunition box 16 each, as does either
+bar: recognisable, not detailed. A full bar comes to some 400 to 500
+rectangles, sent in the polygon calls the bar already made, where it had
+about 40 and a dozen pieces of text. Their cost has not been timed on the
+Sun ZX. In a small window the bar is drawn only when it changes; in a large
+one it is drawn every frame, and a lower setting then saves time. 0 draws
+the earlier stand-ins, which the menus and the larger pictures still use:
+those are told apart by name.
+
 ### Status bar
 
 Quake's status bar code already knows when the bar has changed and draws it
@@ -437,7 +537,7 @@ kept at all; a line on the terminal says so.
 | `xgl_detailedge` | 16 | Edges of this many texels or less are never split, clamped to 4–64; smaller is finer. |
 | `xgl_detailface` | 192 | Most triangles in one face's detailed mesh, clamped to 4–1024. |
 | `xgl_detaildensity` | 160 | Triangles a face may have for its apparent size: this times its area over its squared distance, up to `xgl_detailface`. Larger gives near faces their limit sooner; 0 gives every face `xgl_detailface`. |
-| `xgl_detailtris` | 2048 | Detailed wall and brush-entity triangles per frame; faces beyond the allowance draw their coarse mesh. |
+| `xgl_detailtris` | 3072 | Detailed wall and brush-entity triangles per frame; faces beyond the allowance draw their coarse mesh. |
 | `xgl_detaildistance` | 512 | Distance within which faces are considered for detail and water uses its finer grid. |
 | `xgl_detailbuild` | 128 | Detailed-mesh triangles built per frame; one mesh is always allowed, 0 removes the limit. |
 | `xgl_shapes` | 1 | Cut walls along the shapes of their textures where a texture has them; 0 draws every wall as a smooth mesh. See [texture shapes](#texture-shapes). |
@@ -451,6 +551,7 @@ kept at all; a line on the terminal says so.
 | `xgl_lightfalloff` | 2 | How fast a dynamic light fades with distance, clamped to 1–64; 1 is the slowest and brightest. |
 | `xgl_lightrange` | 4 | Distance, in light radii, beyond which geometry is not illuminated by a dynamic light; 0 removes the limit. |
 | `xgl_alias_shade` | 1 | Shade models on the CPU and submit them unlit; 0 uses native illumination. |
+| `xgl_hudpieces` | 16 | Rectangles of color a status-bar picture is drawn in, besides those its outline takes; 0 draws labelled stand-ins instead. |
 | `xgl_keepbar` | -1 | Leave an unchanged status bar in place instead of clearing and redrawing it: -1 in small windows only, 0 never, 1 whenever possible. |
 | `xgl_smp` | -1 | Worker thread for model preparation: -1 automatic, 0 off, 1 on. |
 | `xgl_profile` | 0 | 1 reports graphics timings and native call counts; 2 adds preparation and cache detail. Output goes to the terminal once per second. |

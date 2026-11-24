@@ -2264,8 +2264,9 @@ static void test_shape_distance(void)
 {
     const xgl_surface_mesh_t *mesh;
     const xgl_color_vertex_t *kept;
+    xgl_shape_terms_t terms;
     float z, distances[4];
-    int i, step, steps[4], triangles[4], near_step, frames;
+    int i, step, steps[4], triangles[4], cuts[4], near_step, frames;
     setup_shapes();
     r_fullbright.value = 1;
     xgl_detaildensity.value = 160;
@@ -2285,9 +2286,13 @@ static void test_shape_distance(void)
         assert(steps[i] == XGL_SurfaceShapeStep(&test_surface, distances[i] * distances[i]));
         assert(steps[i] > 0 && xgl_surfaces[0].detail.count == captured_count);
         assert(fabs(captured_area() - 128.0f * 128.0f) < 2);
-        if (i) assert(steps[i] >= steps[i - 1] && triangles[i] >= triangles[i - 1]);
+        /* Finer is more cuts; not always more triangles, since a long piece
+         * is halved for the light along it and its parts need not be. */
+        XGL_ShapeTerms(XGL_SurfaceShapes(&test_surface), steps[i], &terms);
+        cuts[i] = XGL_ShapeCuts(XGL_SurfaceShapes(&test_surface), &terms);
+        if (i) assert(steps[i] >= steps[i - 1] && cuts[i] >= cuts[i - 1]);
     }
-    assert(steps[3] > steps[0] && triangles[3] > triangles[0]);
+    assert(steps[3] > steps[0] && cuts[3] > cuts[0]);
     /* Where every cut is made, each piece is one color of the picture. */
     assert(check_shape_frame(0, 0) == triangles[3]);
     /* A step is a set of cuts: the lowest of those that make the same. */
@@ -2335,6 +2340,433 @@ static void test_shape_distance(void)
     assert(xgl_surfaces[0].shape_step == near_step);
     mesh = &xgl_surfaces[0].detail;
     assert(mesh->count == triangles[3] * 3);
+    XGL_WorldShutdown();
+}
+
+/* A small face of a cut wall, or a far one, is allowed no triangles of the
+ * ordinary kind. It is cut along the shapes all the same: it was once given
+ * its plain mesh over again and counted as cut. */
+static void test_small_face_of_shaped_wall(void)
+{
+    xgl_shape_tree_t *tree;
+    const xgl_shape_node_t *node;
+    float low[2], distance, first;
+    int i, j, step, colors;
+    setup_shapes();
+    r_fullbright.value = 1;
+    xgl_detaildensity.value = 160;
+    tree = XGL_SurfaceShapes(&test_surface);
+    assert(tree);
+    /* A face 24 units square, laid across the texture's first cut. */
+    node = &tree->nodes[0];
+    assert((node->flags & XGL_SHAPE_AXIS) < 2);
+    low[0] = low[1] = 20;
+    low[node->flags & XGL_SHAPE_AXIS] = node->d + tree->origin[node->flags & XGL_SHAPE_AXIS] - 12;
+    for (i = 0; i < 4; ++i) {
+        test_vertices[i].position[0] = low[0] + (i == 1 || i == 2 ? 24 : 0);
+        test_vertices[i].position[1] = low[1] + (i >= 2 ? 24 : 0);
+    }
+    test_surface.extents[0] = test_surface.extents[1] = 24;
+    XGL_WorldNewMap();
+    r_origin[0] = low[0] + 12; r_origin[1] = low[1] + 12;
+    /* From here the face may have no ordinary triangle at all, and its
+     * texture two pieces or more to a repeat. */
+    distance = 320;
+    assert(XGL_DetailWant(24.0f * 24.0f, distance * distance) == 0);
+    step = XGL_SurfaceShapeStep(&test_surface, distance * distance);
+    assert(step > 0);
+    r_origin[2] = distance;
+    begin_frame();
+    assert(xgl_surfaces[0].shape_need == step && xgl_surfaces[0].shape_step == step);
+    assert(xgl_surfaces[0].detail.vertices && xgl_surfaces[0].detail_frame == r_framecount);
+    /* Drawn in pieces: more than its plain two triangles, in two colors. */
+    assert(captured_count > 6 && captured_count == xgl_surfaces[0].detail.count);
+    assert(fabs(captured_area() - 24.0f * 24.0f) < .5f);
+    first = captured[0].color.rgb[0]; colors = 1;
+    for (i = 0; i < captured_count; i += 3) {
+        for (j = 1; j < 3; ++j) assert(captured[i + j].color.rgb[0] == captured[i].color.rgb[0]);
+        if (fabs(captured[i].color.rgb[0] - first) > 8 / 255.0f) colors = 2;
+    }
+    assert(colors == 2);
+    assert(profile_counts[XGL_PROFILE_WORLD_SHAPE_SURFACES] == 1);
+    assert(profile_counts[XGL_PROFILE_WORLD_SHAPE_TRIANGLES] == (unsigned long)(captured_count / 3));
+    assert(!profile_counts[XGL_PROFILE_WORLD_MESH_FAILURES]);
+    XGL_WorldShutdown();
+}
+
+/* Square faces in the plane of the test face, for the tests of walls: the
+ * corners of each, counterclockwise, and which of its sides is an edge
+ * another face had first (the number of that edge, to be gone along the
+ * other way), or zero. Edge 0 is not used: it cannot be gone along both
+ * ways. */
+static msurface_t wall_surfaces[4], *wall_marks[4];
+static mvertex_t wall_vertices[16];
+static medge_t wall_edges[20];
+static int wall_surfedges[16], wall_edge_count;
+static mtexinfo_t wall_texinfo;
+
+static void wall_face(int face, float x0, float y0, float x1, float y1, const int *shared)
+{
+    int i, edge;
+    wall_surfaces[face] = test_surface;
+    wall_surfaces[face].firstedge = face * 4;
+    wall_surfaces[face].extents[0] = (short)(x1 - x0); wall_surfaces[face].extents[1] = (short)(y1 - y0);
+    for (i = 0; i < 4; ++i) {
+        wall_vertices[face * 4 + i].position[0] = i == 1 || i == 2 ? x1 : x0;
+        wall_vertices[face * 4 + i].position[1] = i >= 2 ? y1 : y0;
+        wall_vertices[face * 4 + i].position[2] = 0;
+        if (shared && shared[i]) { wall_surfedges[face * 4 + i] = -shared[i]; continue; }
+        edge = wall_edge_count++;
+        wall_edges[edge].v[0] = (unsigned short)(face * 4 + i);
+        wall_edges[edge].v[1] = (unsigned short)(face * 4 + (i + 1) % 4);
+        wall_surfedges[face * 4 + i] = edge;
+    }
+    wall_marks[face] = &wall_surfaces[face];
+}
+
+static void wall_world(int faces)
+{
+    test_model.surfaces = wall_surfaces;
+    test_model.numsurfaces = test_model.nummodelsurfaces = faces;
+    test_model.vertexes = wall_vertices; test_model.edges = wall_edges; test_model.surfedges = wall_surfedges;
+    test_model.numedges = wall_edge_count;
+    test_node.numsurfaces = (unsigned short)faces;
+    test_leaves[1].firstmarksurface = wall_marks; test_leaves[1].nummarksurfaces = faces;
+    XGL_WorldNewMap();
+}
+
+/* Faces in one plane with one texture laid one way, joined by their edges,
+ * are one wall, and a wall is cut alike all over: every face of it at the
+ * finest step any of them asks for. */
+static void test_shaped_walls(void)
+{
+    static const int beside[4] = {0, 0, 0, 2}, above[4] = {3, 0, 0, 0};
+    float distance[4];
+    int i, own[4], frames, first, step;
+    setup_shapes();
+    r_fullbright.value = 1;
+    xgl_detaildensity.value = 160;
+    xgl_detailbuild.value = 0;
+    memset(wall_edges, 0, sizeof(wall_edges));
+    wall_edge_count = 1;
+    wall_face(0, 0, 0, 128, 128, NULL);          /* Edges 1 to 4. */
+    wall_face(1, 128, 0, 256, 128, beside);      /* Its last side is edge 2 of the first. */
+    wall_face(2, 0, 128, 128, 256, above);       /* Its first side is edge 3 of the first. */
+    wall_face(3, 600, 0, 728, 128, NULL);        /* Apart from them all. */
+    /* The face above is of the same texture laid by another record. */
+    wall_texinfo = test_texinfo;
+    wall_surfaces[2].texinfo = &wall_texinfo;
+    wall_world(4);
+    assert(xgl_surfaces[0].wall == 0 && xgl_surfaces[1].wall == 0);
+    assert(xgl_surfaces[2].wall == 2 && xgl_surfaces[3].wall == 3);
+    /* From over the first face: it is near, the one beside it farther. */
+    r_origin[0] = r_origin[1] = 64; r_origin[2] = 200;
+    distance[0] = 200.0f * 200.0f;
+    distance[1] = 128.0f * 128.0f + distance[0];
+    distance[2] = 128.0f * 128.0f + distance[0];
+    distance[3] = 600.0f * 600.0f + distance[0];
+    for (i = 0; i < 4; ++i) own[i] = XGL_SurfaceShapeStep(&wall_surfaces[i], distance[i]);
+    assert(own[0] > 0 && own[1] < own[0] && own[3] == 0);
+    begin_frame();
+    /* The far face of the wall is cut as the near one is. */
+    assert(xgl_surfaces[0].shape_step == own[0] && xgl_surfaces[1].shape_need == own[0]);
+    assert(xgl_surfaces[1].shape_step == own[0] && xgl_surfaces[1].detail_frame == r_framecount);
+    /* The faces of other walls have what their own distance asks. */
+    assert(xgl_surfaces[2].shape_need == own[2] && xgl_surfaces[3].shape_need == 0);
+    assert(!xgl_surfaces[3].detail.vertices);
+    assert(xgl_surfaces[0].detail.count == xgl_surfaces[1].detail.count);
+    assert(fabs(captured_area() - 128.0f * 128.0f * 4) < 8);
+    /* Farther off the wall asks for half the pieces or fewer. With building
+     * limited a wall waits its turn to be made coarser, and then all of it
+     * goes together: it is not left cut two ways. */
+    xgl_detailbuild.value = 128;
+    r_origin[2] = 300;
+    step = XGL_SurfaceShapeStep(&wall_surfaces[0], 300.0f * 300.0f);
+    assert(step > 0 && xgl_shape_levels[step] * 2 <= xgl_shape_levels[own[0]]);
+    first = -1;
+    for (frames = 0; frames < 2 * XGL_SHAPE_COARSEN && first < 0; ++frames) {
+        begin_frame();
+        assert(xgl_surfaces[0].shape_need == step && xgl_surfaces[1].shape_need == step);
+        if (xgl_surfaces[0].shape_step != own[0] || xgl_surfaces[1].shape_step != own[0]) first = frames;
+        else assert(r_framecount % XGL_SHAPE_COARSEN);
+    }
+    assert(first >= 0 && first < XGL_SHAPE_COARSEN && r_framecount % XGL_SHAPE_COARSEN == 0);
+    assert(xgl_surfaces[0].shape_step == step && xgl_surfaces[1].shape_step == step);
+    /* Without the edges to tell by, every face is a wall of its own. */
+    XGL_WorldShutdown();
+    setup_shapes();
+    xgl_detaildensity.value = 160;
+    xgl_detailbuild.value = 0;
+    test_model.surfaces = wall_surfaces;
+    test_model.numsurfaces = test_model.nummodelsurfaces = 4;
+    test_model.vertexes = wall_vertices; test_model.edges = wall_edges; test_model.surfedges = wall_surfedges;
+    test_model.numedges = 0;
+    test_node.numsurfaces = 4;
+    test_leaves[1].firstmarksurface = wall_marks; test_leaves[1].nummarksurfaces = 4;
+    XGL_WorldNewMap();
+    for (i = 0; i < 4; ++i) assert(xgl_surfaces[i].wall == i);
+    r_origin[0] = r_origin[1] = 64; r_origin[2] = 200;
+    begin_frame();
+    assert(xgl_surfaces[0].shape_need == own[0] && xgl_surfaces[1].shape_need == own[1]);
+    XGL_WorldShutdown();
+}
+
+/* A wall's step is that of its nearest face from where the viewer stands,
+ * whether the traversal found that face or not: turning the head, which
+ * takes the near end of a wall out of view and brings it back, changes
+ * nothing of the rest. And the wall goes plain, and is cut again, as one. */
+static void test_wall_by_position(void)
+{
+    static const int beside[4] = {0, 0, 0, 2};
+    const void *mesh;
+    float first_cut, z;
+    int own[2], lowest;
+    setup_shapes();
+    r_fullbright.value = 1;
+    xgl_detaildensity.value = 160;
+    xgl_detailbuild.value = 0;
+    memset(wall_edges, 0, sizeof(wall_edges));
+    wall_edge_count = 1;
+    wall_face(0, 0, 0, 128, 128, NULL);
+    wall_face(1, 128, 0, 256, 128, beside);
+    wall_world(2);
+    assert(xgl_surfaces[0].wall == 0 && xgl_surfaces[1].wall == 0);
+    assert(xgl_surfaces[0].wall_next == 1 && xgl_surfaces[1].wall_next == -1);
+    /* Over the first face, which the traversal does not find: only the one
+     * beside it, farther off, is in a leaf the view reaches. */
+    wall_marks[0] = &wall_surfaces[1];
+    test_leaves[1].nummarksurfaces = 1;
+    r_origin[0] = r_origin[1] = 64; r_origin[2] = 200;
+    own[0] = XGL_SurfaceShapeStep(&wall_surfaces[0], 200.0f * 200.0f);
+    own[1] = XGL_SurfaceShapeStep(&wall_surfaces[1], 128.0f * 128.0f + 200.0f * 200.0f);
+    assert(own[1] > 0 && own[0] > own[1]);
+    begin_frame();
+    assert(xgl_surfaces[1].shape_need == own[0] && xgl_surfaces[1].shape_step == own[0]);
+    assert(xgl_surfaces[1].detail_frame == r_framecount && captured_count == xgl_surfaces[1].detail.count);
+    assert(!xgl_surfaces[0].coarse.vertices && !xgl_surfaces[0].detail.vertices);
+    mesh = xgl_surfaces[1].detail.vertices;
+    /* Turning toward the near face: it is built, coarse and cut, and the
+     * far one is as it was. */
+    wall_marks[0] = &wall_surfaces[0]; wall_marks[1] = &wall_surfaces[1];
+    test_leaves[1].nummarksurfaces = 2;
+    begin_frame();
+    assert(xgl_surfaces[0].shape_step == own[0] && xgl_surfaces[0].detail_frame == r_framecount);
+    assert(xgl_surfaces[1].detail.vertices == mesh && xgl_surfaces[1].shape_step == own[0]);
+    assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 2);
+    /* And away again. */
+    wall_marks[0] = &wall_surfaces[1];
+    test_leaves[1].nummarksurfaces = 1;
+    begin_frame();
+    assert(xgl_surfaces[1].detail.vertices == mesh && xgl_surfaces[1].detail_frame == r_framecount);
+    assert(!profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS]);
+    /* Farther off than the far face would be cut on its own account, and
+     * just nearer than the near one is first cut: the wall is cut. */
+    for (z = 700; z > 100 && XGL_SurfaceShapeStep(&wall_surfaces[0], z * z) <= 0; z -= 1) {}
+    first_cut = z;
+    lowest = XGL_SurfaceShapeStep(&wall_surfaces[0], first_cut * first_cut);
+    assert(first_cut > 200 && first_cut < 600 && lowest > 0);
+    r_origin[2] = first_cut - 4;
+    assert(XGL_SurfaceShapeStep(&wall_surfaces[1], 128.0f * 128.0f + r_origin[2] * r_origin[2]) == 0);
+    begin_frame();
+    assert(xgl_surfaces[1].shape_need == lowest && xgl_surfaces[1].shape_step == lowest);
+    assert(captured_count > 6);
+    /* The wall stays cut a margin beyond that, by the near face's distance. */
+    r_origin[2] = first_cut + 40;
+    begin_frame();
+    assert(xgl_surfaces[1].shape_need == lowest && xgl_surfaces[1].detail_frame == r_framecount);
+    /* Half as far again: plain, at once, and its cut mesh waits. */
+    r_origin[2] = first_cut * 1.5f;
+    begin_frame();
+    assert(xgl_surfaces[1].shape_need == 0 && captured_count == 6);
+    assert(XGL_SurfaceIsCut(&xgl_surfaces[1]) && xgl_surfaces[1].detail_frame != r_framecount);
+    r_origin[2] = first_cut + 40;
+    begin_frame();
+    assert(xgl_surfaces[1].shape_need == 0 && captured_count == 6);
+    /* Near enough again: cut as before, and nothing is built for it. */
+    r_origin[2] = first_cut - 4;
+    begin_frame();
+    assert(xgl_surfaces[1].shape_need == lowest && captured_count > 6);
+    assert(xgl_surfaces[1].detail_frame == r_framecount && !profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS]);
+    XGL_WorldShutdown();
+}
+
+/* A face that should be cut and has no cut mesh is built before any other
+ * mesh this frame: a wall plain where it should be cut shows more than a
+ * wall a step too coarse, or an ordinary one waiting for its detail. */
+static void test_unbuilt_shaped_first(void)
+{
+    static texture_t ordinary;
+    int i;
+    setup_shapes();
+    xgl_detaildensity.value = 160;
+    memset(wall_edges, 0, sizeof(wall_edges));
+    wall_edge_count = 1;
+    wall_face(0, 0, 0, 128, 128, NULL);
+    wall_face(1, 200, 0, 328, 128, NULL);
+    /* The near face is of an ordinary texture with something to show. */
+    ordinary = test_texture;
+    ordinary.gl_texturenum = 2;
+    wall_texinfo = test_texinfo;
+    wall_texinfo.texture = &ordinary;
+    wall_surfaces[0].texinfo = &wall_texinfo;
+    shape_texels[1] = NULL; /* No texels to examine: no shapes. */
+    pattern_material = 1;
+    xgl_detailbuild.value = 16; /* One mesh a frame. */
+    wall_world(2);
+    r_origin[0] = r_origin[1] = 64; r_origin[2] = 100;
+    assert(XGL_SurfaceShapeStep(&wall_surfaces[0], 100.0f * 100.0f) < 0);
+    assert(XGL_SurfaceShapeStep(&wall_surfaces[1], 200.0f * 200.0f + 100.0f * 100.0f) > 0);
+    begin_frame();
+    /* The near face ranks first; the far one is built first. */
+    assert(xgl_surfaces[0].bucket > xgl_surfaces[1].bucket);
+    assert(XGL_SurfaceIsCut(&xgl_surfaces[1]) && xgl_surfaces[1].detail_frame == r_framecount);
+    assert(!xgl_surfaces[0].detail.vertices);
+    for (i = 0; i < 4 && !xgl_surfaces[0].detail.vertices; ++i) begin_frame();
+    assert(xgl_surfaces[0].detail.vertices && XGL_SurfaceIsCut(&xgl_surfaces[1]));
+    XGL_WorldShutdown();
+}
+
+/* A face that is cut stays cut until it is well beyond where it would first
+ * be cut, and in range of detail as much longer: stepping back and forth
+ * across either distance changes nothing. */
+static void test_shape_margin(void)
+{
+    static model_t external;
+    static msurface_t external_surface;
+    xgl_surface_cache_t *face;
+    entity_t entity;
+    float first_cut, z;
+    int i;
+    setup_shapes();
+    r_fullbright.value = 1;
+    xgl_detaildensity.value = 160;
+    xgl_detailbuild.value = 0;
+    /* Where the wall is first cut, coming nearer. */
+    for (z = 700; z > 100 && XGL_SurfaceShapeStep(&test_surface, z * z) <= 0; z -= 1) {}
+    first_cut = z;
+    assert(first_cut > 200 && first_cut < 600);
+    r_origin[2] = first_cut + 40;
+    begin_frame();
+    assert(captured_count == 6 && !XGL_SurfaceIsCut(&xgl_surfaces[0]));
+    r_origin[2] = first_cut - 4;
+    begin_frame();
+    assert(captured_count > 6 && XGL_SurfaceIsCut(&xgl_surfaces[0]));
+    /* Back past that distance: still cut, at the lowest step that cuts. */
+    r_origin[2] = first_cut + 40;
+    begin_frame();
+    assert(XGL_SurfaceShapeStep(&test_surface, r_origin[2] * r_origin[2]) == 0);
+    assert(xgl_surfaces[0].shape_need > 0 && captured_count > 6);
+    assert(xgl_surfaces[0].detail_frame == r_framecount);
+    /* Half as far again and more: plain. */
+    r_origin[2] = first_cut * 1.5f;
+    begin_frame();
+    assert(xgl_surfaces[0].shape_need == 0 && captured_count == 6);
+    /* And plain it stays, coming back, until it is as near as at first. */
+    r_origin[2] = first_cut + 40;
+    begin_frame();
+    assert(xgl_surfaces[0].shape_need == 0 && captured_count == 6);
+    r_origin[2] = first_cut - 4;
+    begin_frame();
+    assert(captured_count > 6);
+    /* The range of detail has the same margin for a face that is cut. The
+     * face reaches about 90 units from its middle. */
+    xgl_detaildistance.value = 250;
+    assert(first_cut > 345);
+    r_origin[2] = 330;
+    begin_frame();
+    assert(captured_count > 6 && xgl_surfaces[0].detail_frame == r_framecount);
+    r_origin[2] = 400; /* Out of range for a plain face, in for a cut one. */
+    begin_frame();
+    assert(captured_count > 6 && xgl_surfaces[0].detail_frame == r_framecount);
+    r_origin[2] = 460; /* Out of range for either. */
+    begin_frame();
+    assert(captured_count == 6);
+    r_origin[2] = 400;
+    begin_frame();
+    assert(captured_count == 6);
+    r_origin[2] = 330;
+    begin_frame();
+    assert(captured_count > 6);
+    /* A box drawn as an entity is a wall to itself, with the same margin
+     * between cut and plain; and once plain it is drawn plain at once, its
+     * cut mesh kept for when it is wanted again. */
+    xgl_detaildistance.value = 768;
+    xgl_detailbuild.value = 128;
+    external = test_model; external_surface = test_surface;
+    external.surfaces = &external_surface;
+    memset(&entity, 0, sizeof(entity));
+    entity.model = &external;
+    for (i = 0; i < 6; ++i) {
+        static const float back[6] = {40, -4, 40, 0, 40, -4};
+        r_origin[2] = back[i] ? first_cut + back[i] : first_cut * 1.5f;
+        begin_frame();
+        memset(profile_counts, 0, sizeof(profile_counts));
+        captured_count = 0;
+        XGL_DrawBrushModel(&entity);
+        face = XGL_BrushModelFace(&external, &external_surface);
+        assert(face);
+        /* Plain; cut; kept cut; plain; plain; cut again, and nothing built. */
+        if (i == 1 || i == 2 || i == 5) assert(captured_count > 6 && XGL_SurfaceIsCut(face));
+        else assert(captured_count == 6);
+        if (i >= 3) assert(XGL_SurfaceIsCut(face) && !profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS]);
+    }
+    XGL_WorldShutdown();
+}
+
+/* A wall of a small texture is given pieces, and weighs a cut, as a wall of
+ * the same picture at full size would be: a sign 32 texels square has as
+ * much to show as a panel of 64. */
+static byte small_shape_image[32 * 32];
+static void test_small_shape_distance(void)
+{
+    xgl_shape_tree_t *tree;
+    xgl_shape_terms_t full, small;
+    int x, y, step, full_area, near_triangles;
+    setup_shapes();
+    xgl_detaildensity.value = 160;
+    tree = XGL_SurfaceShapes(&test_surface);
+    assert(tree && tree->width == 64 && tree->area == 64 * 64);
+    full_area = tree->area;
+    step = XGL_ShapeStep(tree, 250.0f * 250.0f);
+    assert(step > 0);
+    XGL_ShapeTerms(tree, step, &full);
+    XGL_WorldShutdown();
+    /* The same picture, half the size. */
+    setup_world();
+    for (y = 0; y < 32; ++y)
+        for (x = 0; x < 32; ++x) small_shape_image[y * 32 + x] = (byte)shape_picture(0, 2 * x, 2 * y);
+    shape_texels[0] = small_shape_image; shape_texels[1] = NULL;
+    shape_width = shape_height = 32;
+    test_texture.width = test_texture.height = 32;
+    xgl_shapes.value = 1;
+    XGL_WorldNewMap();
+    r_fullbright.value = 1;
+    xgl_detaildensity.value = 160;
+    tree = XGL_SurfaceShapes(&test_surface);
+    assert(tree && tree->width == 32 && tree->height == 32 && tree->area == full_area);
+    /* By its own texels a repeat would have less than two pieces from 250
+     * units and the wall would be plain. It is cut. */
+    assert(32 * 32 * xgl_detaildensity.value / ((250.0f * 250.0f + 64) * XGL_SHAPE_PER_PIECE) < 2);
+    assert(XGL_ShapeStep(tree, 250.0f * 250.0f) > 0);
+    /* The same step asks as much of where a cut comes in the order and of
+     * how wide a part must be, which is a matter of pixels; and a quarter
+     * of the gain, there being a quarter of the texels to gain it among. */
+    XGL_ShapeTerms(tree, step, &small);
+    assert(small.most == full.most && small.thin == full.thin);
+    assert(fabs(small.worth * 4 - full.worth) <= 1e-4f * full.worth);
+    r_origin[2] = 700;
+    begin_frame();
+    assert(xgl_surfaces[0].shape_need == 0 && captured_count == 6);
+    r_origin[2] = 250;
+    begin_frame();
+    assert(xgl_surfaces[0].shape_need > 0 && xgl_surfaces[0].shape_step == xgl_surfaces[0].shape_need);
+    assert(captured_count > 6 && xgl_surfaces[0].detail.count == captured_count);
+    assert(fabs(captured_area() - 128.0f * 128.0f) < 2);
+    near_triangles = captured_count / 3;
+    r_origin[2] = 60;
+    begin_frame();
+    assert(captured_count / 3 >= near_triangles);
+    assert(fabs(captured_area() - 128.0f * 128.0f) < 2);
     XGL_WorldShutdown();
 }
 
@@ -2496,17 +2928,17 @@ static void test_shape_animation(void)
 static void test_shape_limits(void)
 {
     int i, triangles;
-    /* A face that shows the texture sixty-four times. Every cut would
+    /* A face that shows the texture sixteen times. Every cut would
      * make more pieces than one mesh holds: it is cut at the finest step
      * that fits, and that is found out once. */
     setup_shapes();
     for (i = 1; i < 4; ++i) {
-        test_vertices[i].position[0] *= 4;
-        test_vertices[i].position[1] *= 4;
+        test_vertices[i].position[0] *= 2;
+        test_vertices[i].position[1] *= 2;
     }
     memset(shape_light, 64, sizeof(shape_light));
     test_surface.samples = shape_light;
-    test_surface.extents[0] = test_surface.extents[1] = 512;
+    test_surface.extents[0] = test_surface.extents[1] = 256;
     xgl_subdivide.value = 256;
     XGL_WorldNewMap();
     begin_frame();
@@ -2515,7 +2947,7 @@ static void test_shape_limits(void)
     assert(xgl_surfaces[0].shape_need > xgl_surfaces[0].shape_step);
     triangles = xgl_surfaces[0].detail.count / 3;
     assert(triangles > 2 && triangles <= XGL_SHAPE_TRIANGLES && captured_count == triangles * 3);
-    assert(fabs(captured_area() - 512.0f * 512.0f) < 16);
+    assert(fabs(captured_area() - 256.0f * 256.0f) < 16);
     assert(profile_counts[XGL_PROFILE_WORLD_MESH_BUILDS] == 2 && xgl_detail_built == triangles);
     begin_frame();
     assert(captured_count == triangles * 3 && !xgl_detail_built);
@@ -2559,6 +2991,12 @@ int main(void)
     test_brush_entity_basis_and_external_cache();
     test_shaped_wall();
     test_shape_distance();
+    test_small_shape_distance();
+    test_shaped_walls();
+    test_wall_by_position();
+    test_unbuilt_shaped_first();
+    test_shape_margin();
+    test_small_face_of_shaped_wall();
     test_shape_map_change();
     test_faces_outside_view();
     test_shape_animation();

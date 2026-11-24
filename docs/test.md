@@ -25,16 +25,35 @@ records of which vertices are one point: on the skin, and in space.
 The entity tests require a model drawn from its kept mesh to match the
 same model drawn by direct recursion, check that each vertex of a model and
 each middle of an edge is placed once, that light at a middle is the mean
-of its ends', and that nothing is kept for a pose.
+of its ends', that nothing is kept for a pose, that a model's normals are
+not bent by its scale, and that of a face made once for each side only the
+side facing the viewer is drawn.
 The shape tests examine made-up textures: which have shapes and which do
 not, bands, sloping edges, where a repeat begins, and the frames of an
-animated texture. They cut faces along the result and check that the pieces
+animated texture. A sign 32 texels square must be divided cut for cut as
+the same picture at twice the size is, and grain, a swell and a glow must
+have no shapes at any size. Of five like bars every step must show all or
+none. A round lamp must have its four corners cut off at 45
+degrees, and a square lamp, a vein across grain and a lamp too dim to be
+sure of must have none. They cut faces along the result and check that the pieces
 cover the face exactly, have the texture's colors, and share every corner
 that lies along a side. The world tests then draw such walls: their colors
-and baked light, the steps of detail by distance, and the limits; and load a
-map again to see that nothing is examined twice.
+and baked light, the steps of detail by distance, and the limits; a wall of
+a small texture cut from as far as one of the same picture at full size; a
+face too small to be allowed any ordinary triangle cut like the rest of its
+wall; faces joined into walls and a wall cut at one step all over, made
+coarser all together; a wall cut by its nearest face whether the view
+reaches that face or not, so that turning toward it builds that face and
+changes no other; a face with no cut mesh built before any other; a cut
+wall, and a box drawn as an entity, kept cut a margin beyond where it would
+first be cut, and beyond the range of detail, then plain at once with its
+cut mesh kept for when it is wanted again; and load a map again to see
+that nothing is examined twice.
 The screen tests cover when an unchanged status bar is left in place, and
-the UI tests that every picture name draws what it did before.
+the UI tests that every picture name draws what it did before with
+`xgl_hudpieces` off, and that with it on a picture is drawn from its pixels:
+rectangles covering just what is not transparent, in the colors of what
+they cover.
 Run from `WinQuake/`:
 
 ```sh

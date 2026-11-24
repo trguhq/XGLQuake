@@ -162,8 +162,16 @@ typedef struct {
 } xgl_shape_node_t;
 /* The steps of detail a wall cut along such a division can have. */
 #define XGL_SHAPE_STEPS 24
+/* A small texture is treated as the same picture drawn larger: a sign 32
+ * texels square has as much to show as one of 64, in a quarter of the
+ * texels. This is the side of the square a small one is taken up to. */
+#define XGL_SHAPE_FULL 64
 typedef struct {
     int width, height;
+    /* The texels a repeat counts as: its own, or those of a square of
+     * XGL_SHAPE_FULL a side if it has fewer. A wall is given pieces for
+     * that many, and weighs a cut by what it would gain among that many. */
+    int area;
     /* The texel the repeat is taken to begin at, so that its border falls
      * on an edge in the picture where there is one. */
     int origin[2];
@@ -172,6 +180,13 @@ typedef struct {
     /* What each node's part of the texture is drawn in when it is a piece:
      * three bytes for each node. */
     byte *colors;
+    /* How many of the cuts, first found first, a step of detail makes that
+     * pays for a number of pieces: cuts[n] for n pieces. Not always n - 1.
+     * Like details, the bars of one light, are found one after another and
+     * are worth about the same, and a step that stopped among them would
+     * show some of them and not the rest; it stops before them all or
+     * after them all, whichever is nearer what it pays for. */
+    byte cuts[XGL_SHAPE_PIECES + 1];
     /* Not the division's own: what the code that cuts walls along it has
      * worked out about its steps of detail, kept here to be found again.
      * steps_key is zero when the division is made. */

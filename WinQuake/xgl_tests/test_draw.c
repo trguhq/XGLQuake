@@ -11,8 +11,14 @@ typedef struct {
 
 static test_op ops[1024];
 static int num_ops, file_opens, file_reads, file_closes, file_header[2];
-static qpic_t wad_picture;
+static struct { qpic_t pic; byte more[64*64]; } wad_storage;
+#define wad_picture wad_storage.pic
+/* A picture with pixels: a lamp four pixels square in the middle of
+ * nothing, its third row another color. */
+static struct { qpic_t pic; byte more[64]; } lamp_picture;
+byte xgl_palette[768];
 viddef_t vid;
+void Cvar_RegisterVariable(cvar_t *variable) { (void)variable; }
 static int identity_long(int value) { return value; }
 int (*LittleLong)(int) = identity_long;
 
@@ -37,6 +43,14 @@ void W_CleanupName(char *in, char *out)
 
 void *W_GetLumpName(char *name)
 {
+    if (!strcmp(name,"lamp")) {
+        int x, y;
+        lamp_picture.pic.width = lamp_picture.pic.height = 8;
+        for (y = 0; y < 8; ++y)
+            for (x = 0; x < 8; ++x)
+                ((byte *)&lamp_picture + 8)[y*8+x] = (byte)(x < 2 || x > 5 || y < 2 || y > 5 ? 255 : (y == 4 ? 20 : 10));
+        return &lamp_picture.pic;
+    }
     wad_picture.width = !strcmp(name,"backtile") ? 64 : 24;
     wad_picture.height = wad_picture.width;
     return &wad_picture;
@@ -99,6 +113,15 @@ void XGL_UIFill(float x, float y, float width, float height, int color, float op
     assert(width > 0 && height > 0 && opacity >= 0 && opacity <= 1);
     op = next_op('Q');
     op->x=x; op->y=y; op->width=width; op->height=height; op->color=color;
+}
+
+void XGL_UIFillRGB(float x, float y, float width, float height, const float rgb[3], float opacity)
+{
+    test_op *op;
+    assert(width > 0 && height > 0 && opacity == 1);
+    op = next_op('P');
+    op->x=x; op->y=y; op->width=width; op->height=height;
+    op->color=(int)(rgb[0]*255+.5f) | (int)(rgb[1]*255+.5f) << 8 | (int)(rgb[2]*255+.5f) << 16;
 }
 
 void XGL_UIFlush(void) { (void)next_op('F'); }
@@ -340,6 +363,54 @@ static void test_descriptors_and_panels(void)
     assert(num_ops==9 && ops[2].kind=='T' && !strcmp(ops[2].text,"10"));
 }
 
+/* A picture of the status bar's kind is drawn from its own pixels: in
+ * rectangles that cover just what is not transparent, each in the mean
+ * color of what it covers, however the picture is named. */
+static void test_pictures_from_pixels(void)
+{
+    qpic_t *lamp, *digit;
+    int i, x, y, covered[64], color;
+    for (i = 0; i < 256; ++i) {
+        xgl_palette[3*i] = (byte)i; xgl_palette[3*i+1] = (byte)(255-i); xgl_palette[3*i+2] = 7;
+    }
+    lamp = Draw_PicFromWad("lamp");
+    assert(lamp->width == 8 && lamp->height == 8);
+    /* Switched off, it is the stand-in: a box with its name. */
+    reset_ops();
+    Draw_Pic(100,50,lamp);
+    assert(has_text("L") || has_text("LA") || has_text("LAMP") || num_ops >= 2);
+    for (i = 0; i < num_ops; ++i) assert(ops[i].kind != 'P');
+    xgl_hudpieces.value = 16;
+    reset_ops();
+    Draw_Pic(100,50,lamp);
+    memset(covered, 0, sizeof(covered));
+    assert(num_ops == 3);
+    for (i = 0; i < num_ops; ++i) {
+        assert(ops[i].kind == 'P');
+        color = ops[i].y == 54 ? 20 : 10;
+        assert(ops[i].color == (color | (255-color) << 8 | 7 << 16));
+        for (y = (int)ops[i].y - 50; y < (int)(ops[i].y + ops[i].height) - 50; ++y)
+            for (x = (int)ops[i].x - 100; x < (int)(ops[i].x + ops[i].width) - 100; ++x) ++covered[y*8+x];
+    }
+    for (i = 0; i < 64; ++i) assert(covered[i] == (((const byte *)&lamp_picture + 8)[i] != 255));
+    /* Allowed one color, it keeps its outline: one rectangle, the mean of
+     * twelve pixels of one color and four of the other. */
+    xgl_hudpieces.value = 1;
+    reset_ops();
+    Draw_Pic(0,0,lamp);
+    assert(num_ops == 1 && ops[0].kind == 'P' && ops[0].x == 2 && ops[0].y == 2);
+    assert(ops[0].width == 4 && ops[0].height == 4 && (ops[0].color & 255) == 13);
+    /* A digit is its picture too, here all of one color, and no text. */
+    xgl_hudpieces.value = 16;
+    digit = Draw_PicFromWad("num_5");
+    reset_ops();
+    Draw_TransPic(0,0,digit);
+    XGL_DrawFlush();
+    assert(num_ops == 2 && ops[0].kind == 'P' && ops[0].width == 24 && ops[0].height == 24);
+    xgl_hudpieces.value = 0;
+    reset_ops();
+}
+
 int main(void)
 {
     memset(&vid,0,sizeof(vid));
@@ -354,6 +425,7 @@ int main(void)
     test_pictures_and_translation();
     test_number_runs();
     test_descriptors_and_panels();
+    test_pictures_from_pixels();
     puts("XGL UI adapter semantic tests passed (no device rendering)");
     return 0;
 }
