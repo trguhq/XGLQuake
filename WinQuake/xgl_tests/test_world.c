@@ -136,6 +136,8 @@ void XGL_AliasPrepareFrame(void)
 }
 void XGL_AudioUpdate(void) {}
 unsigned int XGL_TextureRevision(int id) { assert(id == 1 || id == 2); return texture_revision; }
+static int texture_sweeps;
+void XGL_TextureSweepMap(void) { ++texture_sweeps; }
 unsigned int XGL_ColorRevision(void) { return color_revision; }
 int XGL_PointLights(const xgl_point_light_t **lights)
 {
@@ -2307,6 +2309,39 @@ static void test_shape_distance(void)
     XGL_WorldShutdown();
 }
 
+/* A map that has the textures of the one before does not examine them
+ * again; a texture loaded with other texels is examined; and the going
+ * map's leftover materials are released each time a map has loaded. */
+static void test_shape_map_change(void)
+{
+    int sweeps, triangles;
+    setup_shapes();
+    assert(texel_calls == 1);
+    r_fullbright.value = 1;
+    begin_frame();
+    triangles = check_shape_frame(0, 0);
+    /* The same map again, as after a death. */
+    sweeps = texture_sweeps;
+    printed[0] = 0;
+    XGL_WorldFlush();
+    XGL_WorldNewMap();
+    assert(texture_sweeps == sweeps + 1);
+    assert(texel_calls == 1 && !strstr(printed, "examined for shapes"));
+    begin_frame();
+    assert(check_shape_frame(0, 0) == triangles);
+    /* Another map, whose texture of that name is another picture. */
+    shape_texels[0] = shape_images[1];
+    ++texture_revision;
+    printed[0] = 0;
+    XGL_WorldFlush();
+    XGL_WorldNewMap();
+    assert(texel_calls == 2);
+    assert(strstr(printed, "XGL: wall textures examined for shapes: 1 in 0.5 s, 1 with shapes\n"));
+    begin_frame();
+    check_shape_frame(1, 0);
+    XGL_WorldShutdown();
+}
+
 static void test_shape_animation(void)
 {
     int triangles;
@@ -2319,7 +2354,8 @@ static void test_shape_animation(void)
     test_texture.anim_min = 0; test_texture.anim_max = 1; test_texture.anim_next = &shape_frame;
     shape_frame.anim_min = 1; shape_frame.anim_max = 2; shape_frame.anim_next = &test_texture;
     XGL_WorldNewMap();
-    assert(texel_calls == 3); /* The first once more for the new map, and the other. */
+    /* The first is known from the map before; only the other is examined. */
+    assert(texel_calls == 2);
     cl.time = 0;
     begin_frame();
     triangles = check_shape_frame(0, 0);
@@ -2403,6 +2439,7 @@ int main(void)
     test_brush_entity_basis_and_external_cache();
     test_shaped_wall();
     test_shape_distance();
+    test_shape_map_change();
     test_shape_animation();
     test_shape_limits();
     XGL_WorldShutdown();

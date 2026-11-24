@@ -1045,6 +1045,28 @@ void XGL_ShapesClear (void)
     xgl_shape_examined = xgl_shape_found = 0;
 }
 
+/* The textures of a new map are loaded. What is known of a texture that
+ * is still what it was stays; what is known of one that has gone, or whose
+ * place another has, goes. Which division each animated texture is cut
+ * along is worked out again in any case: the new map's frames may be linked
+ * differently. */
+void XGL_ShapesSweep (void)
+{
+    xgl_shape_entry_t *entry;
+    int i;
+    if (!xgl_shape_entries) return;
+    for (i = 0, entry = xgl_shape_entries; i < XGL_SHAPE_TEXTURES; ++i, ++entry) {
+        if (entry->revision && XGL_TextureRevision(i + 1) != entry->revision) {
+            XGL_ShapeForget(entry);
+            entry->revision = 0;
+        }
+    }
+    for (i = 0, entry = xgl_shape_entries; i < XGL_SHAPE_TEXTURES; ++i, ++entry) {
+        entry->resolved = 0;
+        entry->wall = NULL;
+    }
+}
+
 void XGL_ShapesCount (int *examined, int *shaped)
 {
     if (examined) *examined = xgl_shape_examined;

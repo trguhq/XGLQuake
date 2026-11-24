@@ -117,7 +117,10 @@ library allocations are additional. These limits are not a measurement of
 total process memory.
 A full world cache releases detailed meshes that have not been drawn recently
 and otherwise falls back to complete coarse faces; exceeding the CPU material
-limit reports an error rather than silently dropping assets.
+limit reports an error rather than silently dropping assets. While a map
+loads, the textures of the map before are still held within that limit, so
+that those both maps have need not be prepared twice; they are released
+first if the limit is reached.
 
 ### Solaris audio and hardware interfaces
 

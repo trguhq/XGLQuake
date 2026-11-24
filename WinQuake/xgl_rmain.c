@@ -227,5 +227,7 @@ void R_RenderView (void)
 void D_FlushCaches (void)
 {
     XGL_AliasFinishFrame();
-    XGL_WorldShutdown();
+    /* The map's faces are about to go. What is known of its textures stays
+     * for the next map, which may have them too. */
+    XGL_WorldFlush();
 }

@@ -269,6 +269,110 @@ static void test_reduced_images(void)
     XGL_TextureShutdown();
 }
 
+/* From one map to the next. A texture both have, the same texels under the
+ * same name, is the same material throughout: its number, its revision and
+ * its reduced images stay, so nothing worked out from it is done again. One
+ * the new map does not ask for goes when the map has loaded, or sooner if
+ * its room or its place is wanted. */
+static void test_map_change(void)
+{
+    static byte wall[16 * 16], floor_a[16 * 16], floor_b[16 * 16], megabyte[1024 * 1024];
+    byte before[3], after[3], tiny;
+    unsigned int wall_revision, floor_revision, skin_revision;
+    int wall_id, floor_id, gone_id, skin_id, borrowed_id, id, i, first;
+    char name[32];
+    for (i = 0; i < 16 * 16; ++i) {
+        wall[i] = (byte)(i * 7); floor_a[i] = (byte)(i * 3); floor_b[i] = (byte)(i * 5 + 1);
+    }
+    wall_id = XGL_LoadTexture("wall", 16, 16, wall, true, false);
+    floor_id = XGL_LoadTexture("floor", 16, 16, floor_a, true, false);
+    gone_id = XGL_LoadTexture("gone", 16, 16, floor_b, true, false);
+    borrowed_id = XGL_LoadTexture("borrowed", 16, 16, floor_a, true, false);
+    skin_id = XGL_LoadTexture("progs/soldier.mdl_0", 16, 16, wall, true, false);
+    XGL_TextureMarkMap(wall_id); XGL_TextureMarkMap(floor_id);
+    XGL_TextureMarkMap(gone_id); XGL_TextureMarkMap(borrowed_id);
+    /* The reduced images exist once a box has been sampled. */
+    assert(XGL_SampleTextureBox(wall_id, 5, 9, 8, before));
+    wall_revision = XGL_TextureRevision(wall_id);
+    floor_revision = XGL_TextureRevision(floor_id);
+    skin_revision = XGL_TextureRevision(skin_id);
+    assert(wall_revision && floor_revision && skin_revision);
+
+    XGL_TextureClearMap();
+    /* The same texture again: nothing changes. */
+    assert(XGL_LoadTexture("wall", 16, 16, wall, true, false) == wall_id);
+    XGL_TextureMarkMap(wall_id);
+    assert(XGL_TextureRevision(wall_id) == wall_revision);
+    /* The same name with other texels: the same number, a new revision. */
+    assert(XGL_LoadTexture("floor", 16, 16, floor_b, true, false) == floor_id);
+    XGL_TextureMarkMap(floor_id);
+    assert(XGL_TextureRevision(floor_id) != floor_revision);
+    /* Asked for by someone who is not the map: it is theirs now. */
+    assert(XGL_LoadTexture("borrowed", 16, 16, floor_a, true, false) == borrowed_id);
+    /* Until the map has loaded, the one nobody asked for is still there. */
+    assert(XGL_TextureRevision(gone_id));
+    XGL_TextureSweepMap();
+    assert(!XGL_TextureRevision(gone_id));
+    assert(XGL_TextureRevision(wall_id) == wall_revision);
+    assert(XGL_TextureRevision(borrowed_id) && XGL_TextureRevision(skin_id) == skin_revision);
+    assert(XGL_SampleTextureBox(wall_id, 5, 9, 8, after) && !memcmp(before, after, 3));
+    sample_is(floor_id, .5f / 16, .5f / 16, floor_b[0], NULL);
+    /* Another map change with nothing asked for again takes the map's and
+     * leaves the others'. */
+    XGL_TextureClearMap();
+    XGL_TextureSweepMap();
+    assert(!XGL_TextureRevision(wall_id) && !XGL_TextureRevision(floor_id));
+    assert(XGL_TextureRevision(borrowed_id) && XGL_TextureRevision(skin_id) == skin_revision);
+    XGL_TextureShutdown();
+
+    /* Seven megabytes of one map and seven of the next do not fit together
+     * in eight: the going map's are released as their room is wanted. */
+    memset(megabyte, 9, sizeof(megabyte));
+    for (i = 0; i < 7; ++i) {
+        sprintf(name, "old%d", i);
+        megabyte[0] = (byte)i;
+        id = XGL_LoadTexture(name, 1024, 1024, megabyte, true, false);
+        assert(id == i + 1);
+        XGL_TextureMarkMap(id);
+    }
+    XGL_TextureClearMap();
+    for (i = 0; i < 7; ++i) {
+        sprintf(name, "new%d", i);
+        megabyte[0] = (byte)(100 + i);
+        id = XGL_LoadTexture(name, 1024, 1024, megabyte, true, false);
+        assert(id > 0);
+        XGL_TextureMarkMap(id);
+        sample_is(id, 0, 0, 100 + i, NULL);
+    }
+    XGL_TextureSweepMap();
+    megabyte[0] = 100;
+    assert(XGL_LoadTexture("new0", 1024, 1024, megabyte, true, false) > 0);
+    XGL_TextureShutdown();
+
+    /* Every place taken by a going map: a new texture still finds one. */
+    first = 0;
+    for (i = 0; ; ++i) {
+        sprintf(name, "place%d", i);
+        tiny = (byte)i;
+        expect_error = 1;
+        if (setjmp(error_jump)) break;
+        id = XGL_LoadTexture(name, 1, 1, &tiny, true, false);
+        expect_error = 0;
+        if (!first) first = id;
+        XGL_TextureMarkMap(id);
+        assert(i < 100000);
+    }
+    expect_error = 0;
+    assert(strstr(error_message, "slots exhausted") && i > 100);
+    XGL_TextureClearMap();
+    tiny = 77;
+    id = XGL_LoadTexture("fresh", 1, 1, &tiny, true, false);
+    assert(id > 0);
+    sample_is(id, 0, 0, 77, NULL);
+    assert(!XGL_TextureRevision(id == first ? first + 1 : first));
+    XGL_TextureShutdown();
+}
+
 int main (void)
 {
     byte pixels[8] = {0, 1, 255, 7, 8, 9, 10, 11};
@@ -308,9 +412,15 @@ int main (void)
     sample_is (sprite, .875f, .75f, 11, NULL);
     assert (!XGL_SampleTexture (0, 0, 0, rgb, NULL));
     assert (!XGL_SampleTexture (alias, (float)HUGE_VAL, 0, rgb, NULL));
+    /* A going map's material stays, as it is, until the next has loaded. */
     XGL_TextureClearMap ();
     XGL_TextureClearMap ();
+    sample_is (sprite, .875f, .75f, 11, NULL);
+    assert(XGL_TextureRevision(sprite) == revision);
+    XGL_TextureSweepMap ();
+    XGL_TextureSweepMap ();
     assert (!XGL_SampleTexture (sprite, 0, 0, rgb, NULL));
+    assert(!XGL_TextureRevision(sprite));
     sample_is (alias, .375f, .25f, 29, NULL);
     XGL_TextureInit ();
     sample_is (alias, .375f, .25f, 29, NULL);
@@ -319,9 +429,13 @@ int main (void)
     assert(XGL_TextureRevision(replacement) != revision);
     XGL_TextureMarkMap (replacement);
     XGL_TextureClearMap ();
+    XGL_TextureSweepMap ();
+    assert(!XGL_TextureRevision(replacement));
     sample_is (alias, .375f, .25f, 29, NULL);
     XGL_TextureShutdown ();
     assert (!XGL_SampleTexture (alias, 0, 0, rgb, NULL));
+
+    test_map_change();
 
     test_index_samples();
     test_filtered_materials();

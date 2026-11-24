@@ -277,6 +277,11 @@ static void XGL_WorldRelease (void)
     xgl_tone_next = 0;
 }
 
+void XGL_WorldFlush (void)
+{
+    XGL_WorldRelease();
+}
+
 void XGL_WorldShutdown (void)
 {
     XGL_WorldRelease();
@@ -2092,9 +2097,9 @@ static void XGL_ExamineShapes (void)
 {
     model_t *model;
     double start;
-    int i, before, examined, shaped;
+    int i, before, shaped_before, examined, shaped;
     if (!xgl_shapes.value) return;
-    XGL_ShapesCount(&before, NULL);
+    XGL_ShapesCount(&before, &shaped_before);
     start = Sys_FloatTime();
     XGL_ExamineModelShapes(xgl_cached_world);
     /* The boxes and other models built as maps are. The map's own doors and
@@ -2102,10 +2107,11 @@ static void XGL_ExamineShapes (void)
     for (i = 1; i < MAX_MODELS && (model = cl.model_precache[i]) != NULL; ++i)
         if (model != xgl_cached_world && model->type == mod_brush && model->name[0] != '*')
             XGL_ExamineModelShapes(model);
+    /* Only those not already known from the map before. */
     XGL_ShapesCount(&examined, &shaped);
     if (examined != before)
         Con_Printf("XGL: wall textures examined for shapes: %d in %.1f s, %d with shapes\n",
-                   examined, Sys_FloatTime() - start, shaped);
+                   examined - before, Sys_FloatTime() - start, shaped - shaped_before);
 }
 
 /* Start the cache afresh for the map in hand, with the settings as they
@@ -2147,8 +2153,11 @@ static void XGL_WorldSetup (void)
 
 void XGL_WorldNewMap (void)
 {
-    /* The textures are the new map's: what was known of the old ones goes. */
-    XGL_ShapesClear();
+    /* The new map's textures are loaded. Those the map before had and this
+     * one has not go now, and what was known of them with them; those both
+     * have were never loaded again, and are not examined again. */
+    XGL_TextureSweepMap();
+    XGL_ShapesSweep();
     XGL_WorldSetup();
 }
 

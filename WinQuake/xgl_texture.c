@@ -33,7 +33,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 typedef struct {
     char name[XGL_MATERIAL_NAME];
     int width, height;
-    qboolean alpha, has_alpha, map_owned;
+    /* map_owned: loaded for the map, not for a model that outlives it.
+     * map_stale: of a map that is going, and not asked for again yet. */
+    qboolean alpha, has_alpha, map_owned, map_stale;
     byte *pixels, *filtered;
     size_t filter_bytes, filter_offset[XGL_FILTER_LEVELS];
     int filter_levels, filter_attempted;
@@ -47,6 +49,7 @@ static unsigned int xgl_material_revision;
 /* Called by the model loader; alias/cache and startup materials remain live. */
 void XGL_TextureMarkMap (int id);
 void XGL_TextureClearMap (void);
+void XGL_TextureSweepMap (void);
 
 void XGL_TextureInit (void)
 {
@@ -67,24 +70,50 @@ void XGL_TextureShutdown (void)
 
 void XGL_TextureMarkMap (int id)
 {
-    if (id > 0 && id <= XGL_MAX_MATERIALS && xgl_materials[id-1].pixels)
+    if (id > 0 && id <= XGL_MAX_MATERIALS && xgl_materials[id-1].pixels) {
         xgl_materials[id-1].map_owned = true;
+        xgl_materials[id-1].map_stale = false;
+    }
 }
 
+/* A map is going. Its materials are kept while the next one loads: one
+ * that is asked for again, the same texels under the same name, stays as
+ * it is, with its reduced images and its revision, so that whatever was
+ * worked out from it still holds. Most of a map's textures are the last
+ * map's too, and all of them when it is the same map again. */
 void XGL_TextureClearMap (void)
 {
     int i;
+    for (i = 0; i < XGL_MAX_MATERIALS; ++i)
+        if (xgl_materials[i].pixels && xgl_materials[i].map_owned)
+            xgl_materials[i].map_stale = true;
+}
+
+/* Release the going map's materials that were not asked for again, all but
+ * `keep`: when the new map has loaded, or sooner if their room or their
+ * places are wanted. Returns how many went. */
+static int XGL_ReleaseStaleMaterials (const xgl_material_t *keep)
+{
     xgl_material_t *material;
+    int i, released;
+    released = 0;
     for (i = 0; i < XGL_MAX_MATERIALS; ++i)
     {
         material = &xgl_materials[i];
-        if (!material->pixels || !material->map_owned)
+        if (!material->pixels || !material->map_owned || !material->map_stale || material == keep)
             continue;
         xgl_material_bytes -= (size_t)material->width * material->height + material->filter_bytes;
         free (material->pixels);
         free (material->filtered);
         memset (material, 0, sizeof(*material));
+        ++released;
     }
+    return released;
+}
+
+void XGL_TextureSweepMap (void)
+{
+    XGL_ReleaseStaleMaterials (NULL);
 }
 
 /* Filtering is an optional cache. Indexed assets always have priority within
@@ -134,16 +163,27 @@ int XGL_LoadTexture (char *identifier, int width, int height, byte *data,
             break;
         }
     }
+    if (slot < 0 && XGL_ReleaseStaleMaterials (NULL))
+    {
+        /* The going map's leftovers held every place. */
+        for (i = 0; i < XGL_MAX_MATERIALS && slot < 0; ++i)
+            if (!xgl_materials[i].pixels) slot = i;
+    }
     if (slot < 0)
     {
         Sys_Error ("XGL_LoadTexture: %d CPU material slots exhausted", XGL_MAX_MATERIALS);
         return 0;
     }
     material = &xgl_materials[slot];
+    /* Whoever asks for a material has it: the map's loader says so again
+     * for its own, and nobody else's is released with a map. */
+    material->map_owned = material->map_stale = false;
     previous = material->pixels ? (size_t)material->width * material->height : 0;
     if (previous == pixels && material->width == width && material->height == height &&
         material->alpha == alpha && !memcmp(material->pixels, data, pixels))
         return slot + 1;
+    if (xgl_material_bytes - previous - material->filter_bytes > XGL_MATERIAL_BYTES - pixels)
+        XGL_ReleaseStaleMaterials (material);
     if (xgl_material_bytes - previous - material->filter_bytes > XGL_MATERIAL_BYTES - pixels)
         XGL_ClearTextureFilters();
     if (xgl_material_bytes - previous - material->filter_bytes > XGL_MATERIAL_BYTES - pixels)

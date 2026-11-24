@@ -188,10 +188,13 @@ xgl_shape_tree_t *XGL_TextureShapes(texture_t *texture);
  * size laid over it, as the other frames of an animated texture are. NULL
  * when the texture does not fit the division or there is no memory. */
 const byte *XGL_ShapeColors(const xgl_shape_tree_t *tree, texture_t *texture);
-/* Forget every division: the textures are about to change. */
+/* Forget every division. */
 void XGL_ShapesClear(void);
+/* A new map's textures are loaded: forget the divisions of those that have
+ * gone or changed, and keep the rest. */
+void XGL_ShapesSweep(void);
 /* How many textures have been examined since the last clear, and how many
- * of them have shapes. */
+ * of them had shapes. */
 void XGL_ShapesCount(int *examined, int *shaped);
 /* What a wall asks of a cut before it is made: that it be among the first
  * found, `most` being the last node those can have made; that it gain at
@@ -232,10 +235,16 @@ typedef struct {
 int XGL_ShapePiece(int index, xgl_shape_piece_t *piece);
 void XGL_TextureInit(void);
 void XGL_TextureShutdown(void);
+/* The materials of the map before stay while a map loads, so that a
+ * texture both have is not loaded and examined twice. Call this when the
+ * new map has loaded, to release those it did not ask for. */
+void XGL_TextureSweepMap(void);
 void XGL_MakeAliasModelDisplayLists(model_t *model, aliashdr_t *header);
 void XGL_SubdivideSurface(msurface_t *surface);
 
 void XGL_WorldNewMap(void);
+/* Release the meshes of the map in hand: its faces are going. */
+void XGL_WorldFlush(void);
 void XGL_WorldShutdown(void);
 /* XGL_DrawWorld finds the visible faces and draws the walls a dynamic light
  * reaches, illuminated; XGL_DrawWorldUnlit draws the others. With no such

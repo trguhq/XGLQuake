@@ -5,7 +5,10 @@ queueing and profiling tests need no SDK or game data. They run against
 controlled engine/backend mocks. Alias color checks also use the real CPU
 texture sampler to compare cached output with the original color calculation.
 The texture tests compare every level of the reduced images with its
-definition, for sizes that are halved evenly and for ones that are not.
+definition, for sizes that are halved evenly and for ones that are not, and
+follow materials from one map to the next: kept when asked for again,
+replaced when their texels differ, released when not, or early when their
+memory or their place is needed.
 The SMP tests use a real POSIX worker with controlled CPU counts and startup
 failures to check mode selection, queuing, reclaiming of unstarted jobs,
 draining, and shutdown. The world and entity tests also cover drawing order
@@ -22,7 +25,8 @@ not, bands, sloping edges, where a repeat begins, and the frames of an
 animated texture. They cut faces along the result and check that the pieces
 cover the face exactly, have the texture's colors, and share every corner
 that lies along a side. The world tests then draw such walls: their colors
-and baked light, the steps of detail by distance, and the limits.
+and baked light, the steps of detail by distance, and the limits; and load a
+map again to see that nothing is examined twice.
 The screen tests cover when an unchanged status bar is left in place, and
 the UI tests that every picture name draws what it did before.
 Run from `WinQuake/`:
