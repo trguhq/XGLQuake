@@ -257,8 +257,8 @@ static void XGL_BuildTextureFilter(xgl_material_t *material)
     int width, height, next_width, next_height, level, x, y, c;
     int sx, sy, x0, x1, y0, y1, count, index, block, weight, wx, wy;
     unsigned int sum;
-    const byte *source;
-    byte *target;
+    const byte *source, *first, *second;
+    byte *target, *out;
     if (material->filter_attempted) return;
     material->filter_attempted = 1;
     width = material->width; height = material->height;
@@ -280,6 +280,38 @@ static void XGL_BuildTextureFilter(xgl_material_t *material)
         block = 1 << level;
         offset = material->filter_offset[level];
         target = material->filtered + offset;
+        if (!(width & 1) && !(height & 1) &&
+            width * block == material->width && height * block == material->height) {
+            /* Every cell here stands for as many texels as every other, and
+             * each new cell takes four whole ones: their plain mean is the
+             * weighted one, rounded the same way. All but the last levels
+             * of an ordinary texture are made here. */
+            first = source; out = target;
+            for (y = 0; y < next_height; ++y) {
+                if ((y & 31) == 0) XGL_AudioUpdate();
+                if (level) {
+                    second = first + (size_t)width * 3;
+                    for (x = 0; x < next_width; ++x, first += 6, second += 6, out += 3) {
+                        out[0] = (byte)((first[0] + first[3] + second[0] + second[3] + 2) >> 2);
+                        out[1] = (byte)((first[1] + first[4] + second[1] + second[4] + 2) >> 2);
+                        out[2] = (byte)((first[2] + first[5] + second[2] + second[5] + 2) >> 2);
+                    }
+                    first = second;
+                } else {
+                    second = first + width;
+                    for (x = 0; x < next_width; ++x, first += 2, second += 2, out += 3) {
+                        const byte *a = xgl_palette + first[0] * 3, *b = xgl_palette + first[1] * 3;
+                        const byte *c2 = xgl_palette + second[0] * 3, *d = xgl_palette + second[1] * 3;
+                        out[0] = (byte)((a[0] + b[0] + c2[0] + d[0] + 2) >> 2);
+                        out[1] = (byte)((a[1] + b[1] + c2[1] + d[1] + 2) >> 2);
+                        out[2] = (byte)((a[2] + b[2] + c2[2] + d[2] + 2) >> 2);
+                    }
+                    first = second;
+                }
+            }
+            source = target; width = next_width; height = next_height;
+            continue;
+        }
         for (y = 0; y < next_height; ++y) {
             if ((y & 31) == 0) XGL_AudioUpdate();
             y0 = y * 2; y1 = y0 + 2; if (y1 > height) y1 = height;

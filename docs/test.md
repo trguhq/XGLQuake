@@ -4,6 +4,8 @@ Shareware recognition, CPU texture/mesh, native UI/entity/particle submission, a
 queueing and profiling tests need no SDK or game data. They run against
 controlled engine/backend mocks. Alias color checks also use the real CPU
 texture sampler to compare cached output with the original color calculation.
+The texture tests compare every level of the reduced images with its
+definition, for sizes that are halved evenly and for ones that are not.
 The SMP tests use a real POSIX worker with controlled CPU counts and startup
 failures to check mode selection, queuing, reclaiming of unstarted jobs,
 draining, and shutdown. The world and entity tests also cover drawing order
