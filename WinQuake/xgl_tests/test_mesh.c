@@ -152,6 +152,16 @@ static int check_commands (void)
                 !memcmp (every_uv[i], every_uv[vertex], sizeof(every_uv[0]))) break;
         assert (welds[vertex] == i);
     }
+    /* Then, for every vertex again: the first one that is the same model
+     * vertex at all, on whichever half of the skin. */
+    welds += pheader->poseverts;
+    for (vertex = 0; vertex < pheader->poseverts; ++vertex)
+    {
+        for (i = 0; i < vertex; ++i)
+            if (every_index[i] == every_index[vertex]) break;
+        assert (welds[vertex] == i);
+        assert (!memcmp (&poses[welds[vertex]], &poses[vertex], sizeof(trivertx_t)));
+    }
     return word;
 }
 
@@ -211,9 +221,9 @@ int main (void)
     assert (check_commands () == saved_words && pheader->poseverts == saved_poseverts);
     /* Every load is a new generation; nothing else may differ. The record
      * sits directly before the commands and describes exactly those words
-     * and the welds after them. */
+     * and the two lists of welds after them. */
     identity = XGL_AliasIdentity (pheader);
-    assert (identity && identity->words == saved_words + saved_poseverts);
+    assert (identity && identity->words == saved_words + 2 * saved_poseverts);
     assert (identity->hash == XGL_AliasCommandHash (
         (const int *)((const byte *)pheader + pheader->commands), identity->words));
     previous = (const xgl_alias_identity_t *)

@@ -74,9 +74,9 @@ times overlap the stages and one another; do not add them to a frame total.
 - **detail ms**: world visibility; detail selection (which includes mesh
   builds); mesh builds, where a detailed mesh also pays for the texture and
   light samples that decide its shape; ordinary color validation and
-  refresh; animated sky/water colors; generic vertex packing; alias cache work plus cached-pose
-  transforms. Packing excludes submission, so a drop in packing time alone is
-  not an FPS gain.
+  refresh; animated sky/water colors; generic vertex packing; alias cache work plus
+  placing and lighting the live pose. Packing excludes submission, so a drop in
+  packing time alone is not an FPS gain.
 - **entity scopes**: wall, submission and wait time for alias, brush and
   sprite drawing, and visits per frame. Native times refer to calls executed
   during the scope, which can include geometry queued earlier: batches span
@@ -118,15 +118,18 @@ Detailed counts are per-frame averages.
   [texture shapes](render.md#texture-shapes); then the dynamic lights
   enabled for illuminated geometry and the faces drawn illuminated, both
   zero in a frame with no dynamic light.
-- **alias cache per frame**: color and pose (normal/topology) cache hits,
-  misses and evictions, and fallback draws, show cache pressure. Compare text
-  calls with glyphs to see how well the installed font allows runs. Both are
-  counted when the text is drawn, not when it is asked for.
+- **alias cache per frame**: color cache hits, misses and evictions, and
+  fallback draws, show cache pressure. Compare text calls with glyphs to see
+  how well the installed font allows runs. Both are counted when the text is
+  drawn, not when it is asked for.
 - **reuse**: sky and water color time, distinct animated vertices colored
   against animated corners emitted, and vertices per frame by path: queued from
   persistent meshes (`cached native`), written straight into the batch
   (`direct native`) or converted (`packed`).
-- **alias preparation**: cache work against live transforms, shared-topology
-  hits and misses, and pose evictions by entry or byte limit.
+- **alias preparation**: cache work against placing and lighting the live
+  pose; hits, misses and evictions of the meshes kept for each model and
+  depth (`topology`); and `points placed`, the vertices of models and
+  middles of edges that were placed and lit, each once. See
+  [animated models](render.md#animated-models).
 
 Measure FPS with profiling disabled.

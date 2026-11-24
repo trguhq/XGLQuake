@@ -20,8 +20,12 @@ and that a face wholly outside the view is left out of the frame but found
 built when the view turns to it.
 The entity tests also draw a model as triangle strips and as separate
 triangles and require the same triangles either way, from the serial path
-and from the worker's output, and the mesh tests check the loader's record
-of which vertices are one point.
+and from the worker's output, and the mesh tests check the loader's two
+records of which vertices are one point: on the skin, and in space.
+The entity tests require a model drawn from its kept mesh to match the
+same model drawn by direct recursion, check that each vertex of a model and
+each middle of an edge is placed once, that light at a middle is the mean
+of its ends', and that nothing is kept for a pose.
 The shape tests examine made-up textures: which have shapes and which do
 not, bands, sloping edges, where a repeat begins, and the frames of an
 animated texture. They cut faces along the result and check that the pieces

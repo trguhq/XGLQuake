@@ -51,6 +51,11 @@ static int numorder;
 // renderer joins triangles into strips across the commands by it.
 static int vertexweld[MAXALIASTRIS * 3];
 static int weldfirst[2][MAXALIASVERTS];
+/* For each vertex the commands name, the first they name that is the same
+ * vertex of the model, whichever half of the skin it is drawn with: the
+ * two are at one place in every pose, with one normal. */
+static int vertexsame[MAXALIASTRIS * 3];
+static int samefirst[MAXALIASVERTS];
 
 
 
@@ -219,7 +224,7 @@ static void BuildTris (void)
 	numcommands = 0;
 	memset (used, 0, sizeof(used));
 	for (i=0 ; i<pheader->numverts ; i++)
-		weldfirst[0][i] = weldfirst[1][i] = -1;
+		weldfirst[0][i] = weldfirst[1][i] = samefirst[i] = -1;
 	for (i=0 ; i<pheader->numtris ; i++)
 	{
 		// pick an unused triangle and start the trifan
@@ -268,6 +273,9 @@ static void BuildTris (void)
 			if (weldfirst[back][k] < 0)
 				weldfirst[back][k] = numorder;
 			vertexweld[numorder] = weldfirst[back][k];
+			if (samefirst[k] < 0)
+				samefirst[k] = numorder;
+			vertexsame[numorder] = samefirst[k];
 			vertexorder[numorder++] = k;
 
 			// emit s/t coords into the commands stream
@@ -315,16 +323,18 @@ void XGL_MakeAliasModelDisplayLists (model_t *m, aliashdr_t *hdr)
     BuildTris ();
     paliashdr->poseverts = numorder;
     /* The identity record travels with the commands in the cache block,
-     * and so does the list of welds, straight after their terminator. */
-    identity = Hunk_Alloc (sizeof(*identity) + (numcommands + numorder) * sizeof(*cmds));
+     * and so do the two lists of which vertices are one, straight after
+     * their terminator: by place on the skin, then by place in space. */
+    identity = Hunk_Alloc (sizeof(*identity) + (numcommands + 2 * numorder) * sizeof(*cmds));
     cmds = (int *)(identity + 1);
     paliashdr->commands = (byte *)cmds - (byte *)paliashdr;
     memcpy (cmds, commands, numcommands * sizeof(*cmds));
     memcpy (cmds + numcommands, vertexweld, numorder * sizeof(*cmds));
+    memcpy (cmds + numcommands + numorder, vertexsame, numorder * sizeof(*cmds));
     if (!++generation) ++generation;
     identity->magic = XGL_ALIAS_IDENTITY_MAGIC;
     identity->generation = generation;
-    identity->words = numcommands + numorder;
+    identity->words = numcommands + 2 * numorder;
     identity->hash = XGL_AliasCommandHash (cmds, identity->words);
     verts = Hunk_Alloc (paliashdr->numposes * numorder * sizeof(*verts));
     paliashdr->posedata = (byte *)verts - (byte *)paliashdr;

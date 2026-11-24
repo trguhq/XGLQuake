@@ -113,7 +113,7 @@ static void test_detail_levels(void)
     XGL_ProfileCount(XGL_PROFILE_WORLD_BUILD_VERTICES, 96);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_COLOR_HITS, 3);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_COLOR_MISSES, 2);
-    XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_HITS, 1);
+    XGL_ProfileCount(XGL_PROFILE_ALIAS_POINTS, 500);
     XGL_ProfileCount(XGL_PROFILE_TEXT_CALLS, 4);
     XGL_ProfileCount(XGL_PROFILE_WORLD_ANIMATED_SAMPLES, 15);
     XGL_ProfileCount(XGL_PROFILE_NATIVE_CACHED_VERTICES, 48);
@@ -121,8 +121,7 @@ static void test_detail_levels(void)
     XGL_ProfileCount(XGL_PROFILE_VERTEX_PACKED, 6);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_TOPOLOGY_HITS, 3);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_TOPOLOGY_MISSES, 1);
-    XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_SLOT_EVICTIONS, 2);
-    XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_BYTE_EVICTIONS, 4);
+    XGL_ProfileCount(XGL_PROFILE_ALIAS_TOPOLOGY_EVICTIONS, 4);
     XGL_ProfileCount(XGL_PROFILE_WORLD_EVICTIONS, 5);
     XGL_ProfileCount(XGL_PROFILE_WORLD_DETAIL_SURFACES, 7);
     XGL_ProfileCount(XGL_PROFILE_WORLD_DETAIL_TRIANGLES, 300);
@@ -148,7 +147,7 @@ static void test_detail_levels(void)
     XGL_ProfileCount(XGL_PROFILE_WORLD_MESH_BUILDS, 1);
     XGL_ProfileCount(XGL_PROFILE_WORLD_BUILD_VERTICES, 6);
     XGL_ProfileCount(XGL_PROFILE_ALIAS_COLOR_HITS, 1);
-    XGL_ProfileCount(XGL_PROFILE_ALIAS_POSE_HITS, 3);
+    XGL_ProfileCount(XGL_PROFILE_ALIAS_POINTS, 300);
     XGL_ProfileCount(XGL_PROFILE_TEXT_CALLS, 2);
     clock_time = 102.2; XGL_ProfileEndFrame();
     assert(print_calls == 2);
@@ -157,13 +156,12 @@ static void test_detail_levels(void)
     assert(strstr(output, "visibility 50.00 select 0.00 build 150.00"));
     assert(strstr(output, "builds 1.5 failed builds 0.5"));
     assert(strstr(output, "vertices built 51.0"));
-    assert(strstr(output, "color hits 2.0 misses 1.0 evictions 0.0"));
-    assert(strstr(output, "pose hits 2.0 misses 0.0 evictions 0.0"));
+    assert(strstr(output, "color hits 2.0 misses 1.0 evictions 0.0; fallbacks 0.0; text calls 3.0\n"));
     assert(strstr(output, "text calls 3.0"));
     assert(strstr(output, "sky 10.00 water 20.00 ms; animated samples/frame 7.5"));
     assert(strstr(output, "vertices/frame cached native 24.0 direct native 6.0 packed 3.0"));
-    assert(strstr(output, "cache 10.00 transform 30.00 ms; topology hits 1.5 misses 0.5"));
-    assert(strstr(output, "pose evictions slot 1.0 bytes 2.0"));
+    assert(strstr(output, "cache 10.00 transform 30.00 ms; topology hits 1.5 misses 0.5 evictions 2.0; "
+                          "points placed 400.0\n"));
     assert(strstr(output, "SMP alias preparation: 1.5 jobs/frame; main prepass 2.00 worker 7.00 main wait 1.00 ms/frame"));
     assert(strstr(output, "0.5 more jobs/frame run by main while joining\n"));
     assert(strstr(output, "vertices built 51.0 recolored 0.0 animated 0.0; detail meshes evicted 2.5; "

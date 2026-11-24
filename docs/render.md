@@ -49,7 +49,9 @@ the original behavior, a slow falloff applied to every wall facing a light.
 
 Animated models are shaded on the CPU and submitted unlit. Each vertex color
 is multiplied by ambient light plus a fixed directional fill from above,
-which is the sum the device used to compute. A dynamic light within reach
+which is the sum the device used to compute. That light is worked out at the
+model's own vertices and runs evenly between them, whether or not the model
+is [subdivided](#animated-models). A dynamic light within reach
 raises the whole model's light level by its radius less its distance, as
 Quake does, instead of lighting the side that faces it. `xgl_alias_shade 0`
 returns models to native illumination by the fill and every dynamic light.
@@ -273,15 +275,39 @@ away; particles keep the four-unit limit.
 
 Sampled skin colors are cached per model, skin, subdivision depth and player
 colors as palette indices, so lighting, gamma and color changes take effect
-at once. Subdivision topology is shared between poses, normals are cached
-per pose, and positions are transformed from the live pose every frame. Each
-loaded model carries an identity record, so a cache lookup compares a few
-numbers instead of the model's command list. All of this is bounded: 1 MiB
-for colors and 1 MiB for topology, normals and work space. A model whose
+at once. The subdivided mesh is kept for each model and depth and shared by
+all its poses and skins; nothing is kept for a single pose. Each loaded
+model carries an identity record, so a cache lookup compares a few numbers
+instead of the model's command list. All of this is bounded: 1 MiB for
+colors and 1 MiB for meshes, normal tables and work space. A model whose
 caches cannot be built is drawn by direct recursion instead.
 
 `xgl_alias_subdivide` and `xgl_entity_triangles` bound the extra triangles.
 The allowance is spent in visible-list order whatever the drawing order.
+
+A model's drawing commands name most of its vertices several times: once
+for each strip or fan that passes through, and again where the skin has a
+seam. Subdivision names the middle of an edge once for each triangle on it.
+The loader records which of the commands' vertices are one vertex of the
+model, and the mesh counts every place once. Its points are the model's
+vertices and the middles of the edges between them.
+
+- Every frame each point is placed once from the live pose: a vertex by the
+  model's transform, a middle half way between its two ends. For the models
+  of the shareware episode the points are 35% of the vertices the commands
+  name, and 45% of those named after one subdivision.
+- Light is worked out for the same points. A vertex has the light of its
+  normal in that pose, worked out once for each normal the pose uses; the
+  162 model normals are kept ready for each model scale. The middle of an
+  edge has the mean of its two ends' light. Light therefore runs evenly
+  along every edge of the model's own triangles, as it does on a model that
+  is not subdivided: subdivision adds detail from the skin and does not
+  round the shading.
+- Under native illumination (`xgl_alias_shade 0`) the device needs a normal
+  for every point instead. A middle then has the mean of its ends' normals
+  brought back to unit length, which is a square root for each middle every
+  frame. Where two opposite normals leave a middle no direction of its own,
+  it takes the normal of the end that is the earlier vertex of the model.
 
 A model's triangles are sent as triangle strips where they join up. On the
 Sun ZX, smooth-shaded strips of eight triangles and more took a third less
@@ -289,19 +315,17 @@ time for each triangle than separate ones, and a strip needs one new vertex
 for each triangle instead of three, so the CPU also writes fewer than half
 as many.
 
-- The loader records which vertices of a model's command list are the same
-  point of the mesh: the same model vertex at the same place on the skin.
-  When a model's subdivided mesh is first built, its triangles are joined
-  across those points, and across the middles of shared edges, into strips
-  of up to 126 triangles. That is done once for each model and depth;
-  scaled from a development host it should take the SM61 a few
-  milliseconds, and some tens for the largest model.
-- Every corner that shares such a point has the same position, light and
-  skin color, so strips draw exactly the triangles that were drawn before.
-  One rule changed to make that so. Where two opposite vertex normals leave
-  the middle of an edge with no direction of its own, it now takes the
-  normal of the end that comes first on the skin, from both triangles on
-  the edge; it used to take whichever end each triangle named first.
+- The loader also records which vertices of a model's command list are at
+  the same place on the skin as well as in space. When a model's subdivided
+  mesh is first built, its triangles are joined across those vertices, and
+  across the middles of the edges between them, into strips of up to 126
+  triangles. That is done once for each model and depth; scaled from a
+  development host it should take the SM61 a few milliseconds, and some
+  tens for the largest model.
+- Every corner that a strip shares has the same position, light and skin
+  color, so strips draw exactly the triangles that separate triangles
+  would. A seam of the skin is one point in space with two colors, and no
+  strip crosses it.
 - `xgl_alias_strips` is the fewest triangles a run must have to be sent as a
   strip. Shorter runs go out as separate triangles in the ordinary batch.
   The default of 4 is cautious: how short a strip still pays on the Sun ZX
@@ -321,8 +345,8 @@ default (`-1`) uses a worker thread when more than one CPU is online, which
 means none on a single-processor machine. Use `0` to select the serial path
 or `1` to request the worker explicitly.
 
-While the main thread draws the world, the worker transforms cached model
-positions, evaluates each vertex's shade and prepares gamma-adjusted colors. When the
+While the main thread draws the world, the worker places each model's points
+from its pose, works out their light and prepares gamma-adjusted colors. When the
 main thread reaches the models it runs any jobs the worker has not started,
 waits for the one in progress, and submits the results to XGL in drawing
 order. Models with cold caches and the view weapon use the serial path. If

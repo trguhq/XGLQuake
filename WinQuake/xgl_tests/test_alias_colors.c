@@ -15,7 +15,6 @@ static xgl_alias_color_t colors[TEST_TRIANGLES];
 static unsigned short indices[TEST_VERTICES];
 static xgl_alias_cache_t cache;
 static xgl_alias_topology_t topology;
-static xgl_alias_pose_cache_t pose;
 static xgl_alias_draw_t draw;
 static const xgl_alias_shade_t native_shade = {XGL_SHADE_NATIVE, 0, {0, 0, 0}};
 static xgl_vertex_t actual[TEST_VERTICES], expected[TEST_VERTICES];
@@ -140,14 +139,13 @@ static void setup_fixture(int triangles, int material, const byte *translation)
     reset_output();
     memset(&cache, 0, sizeof(cache));
     memset(&topology, 0, sizeof(topology));
-    memset(&pose, 0, sizeof(pose));
     memset(&draw, 0, sizeof(draw));
     memset(colors, 0, sizeof(colors));
     memset(input, 0, sizeof(input));
     cache.colors = colors;
     cache.triangle_count = topology.triangle_count = triangles;
+    /* Every corner a point of its own, placed by hand below. */
     topology.indices = indices;
-    pose.topology = &topology;
     draw.cache = &cache;
     /* Native illumination: the sampled, lit and gamma-prepared colors are
      * submitted as they are, with the vertex normals. */
@@ -243,7 +241,7 @@ static void generic_output(float light)
 static void native_output(float light, int distinct_colors)
 {
     reset_output();
-    XGL_EmitAliasPose(&pose, &draw, light, 2);
+    XGL_EmitAliasPose(&topology, &draw, light, 2);
     finish_reservation();
     legacy_output(light);
     compare_output();
@@ -290,7 +288,7 @@ static void test_palette_and_light(int material)
     for (k = 0; k < 768; ++k) xgl_palette[k] ^= 255;
     reset_output();
     refuse_reservation = 1;
-    XGL_EmitAliasPose(&pose, &draw, .20f, 2);
+    XGL_EmitAliasPose(&topology, &draw, .20f, 2);
     assert(actual_count == 0 && prepare_calls == 0 && reserve_calls == 1);
 }
 

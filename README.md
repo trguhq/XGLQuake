@@ -104,10 +104,10 @@ on the Sun ZX, and how the renderer uses it, is in
 The existing Solaris main allocates a 16 MiB engine heap. World geometry
 cache storage is capped at another 8 MiB, CPU material pixels and optional
 filter levels at another 8 MiB, and alias color caches at 1 MiB. The alias
-normal/topology cache, its fixed entry table and reusable work array together
-are capped at another 1 MiB. The XGL audio ring is 32 KiB, building world
-meshes uses about 0.35 MiB of fixed scratch space, and a multiprocessor
-worker adds about 0.75 MiB. Cutting walls along
+mesh cache, its fixed entry table, the normal tables and the reusable work
+array together are capped at another 1 MiB. The XGL audio ring is 32 KiB,
+building world meshes uses about 0.35 MiB of fixed scratch space, and a
+multiprocessor worker adds about 0.75 MiB. Cutting walls along
 [texture shapes](docs/render.md#texture-shapes) uses another 0.25 MiB of
 fixed scratch space and keeps about 3 KiB for each texture that has shapes;
 examining a texture borrows memory while a map loads, 0.3 MiB for one of 64

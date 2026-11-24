@@ -202,11 +202,11 @@ void XGL_ProfileEndFrame(void)
             "of them cut along texture shapes %.1f and %.1f; "
             "dynamic lights in use %.2f, faces illuminated %.1f\n"
             "  alias cache per frame: color hits %.1f misses %.1f evictions %.1f; "
-            "pose hits %.1f misses %.1f evictions %.1f; fallbacks %.1f; text calls %.1f\n"
+            "fallbacks %.1f; text calls %.1f\n"
             "  reuse: sky %.2f water %.2f ms; animated samples/frame %.1f; "
             "vertices/frame cached native %.1f direct native %.1f packed %.1f\n"
             "  alias preparation (overlap): cache %.2f transform %.2f ms; "
-            "topology hits %.1f misses %.1f; pose evictions slot %.1f bytes %.1f\n"
+            "topology hits %.1f misses %.1f evictions %.1f; points placed %.1f\n"
             "  entity scopes wall/submit/sync ms (native calls executed during scope): "
             "alias %.2f/%.2f/%.2f brush %.2f/%.2f/%.2f sprite %.2f/%.2f/%.2f; "
             "visits/frame %.1f/%.1f/%.1f\n"
@@ -249,9 +249,6 @@ void XGL_ProfileEndFrame(void)
             (double)total_counts[XGL_PROFILE_ALIAS_COLOR_HITS] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_COLOR_MISSES] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_COLOR_EVICTIONS] / total_frames,
-            (double)total_counts[XGL_PROFILE_ALIAS_POSE_HITS] / total_frames,
-            (double)total_counts[XGL_PROFILE_ALIAS_POSE_MISSES] / total_frames,
-            (double)total_counts[XGL_PROFILE_ALIAS_POSE_EVICTIONS] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_FALLBACKS] / total_frames,
             (double)total_counts[XGL_PROFILE_TEXT_CALLS] / total_frames,
             total_sections[XGL_PROFILE_WORLD_SKY] * scale,
@@ -264,8 +261,8 @@ void XGL_ProfileEndFrame(void)
             total_sections[XGL_PROFILE_ALIAS_TRANSFORM] * scale,
             (double)total_counts[XGL_PROFILE_ALIAS_TOPOLOGY_HITS] / total_frames,
             (double)total_counts[XGL_PROFILE_ALIAS_TOPOLOGY_MISSES] / total_frames,
-            (double)total_counts[XGL_PROFILE_ALIAS_POSE_SLOT_EVICTIONS] / total_frames,
-            (double)total_counts[XGL_PROFILE_ALIAS_POSE_BYTE_EVICTIONS] / total_frames,
+            (double)total_counts[XGL_PROFILE_ALIAS_TOPOLOGY_EVICTIONS] / total_frames,
+            (double)total_counts[XGL_PROFILE_ALIAS_POINTS] / total_frames,
             total_draw[XGL_PROFILE_DRAW_ALIAS].wall * scale,
             total_draw[XGL_PROFILE_DRAW_ALIAS].submit * scale,
             total_draw[XGL_PROFILE_DRAW_ALIAS].sync * scale,
