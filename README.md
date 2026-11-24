@@ -8,6 +8,12 @@ with native XGL text and geometry. A similar approach can be seen at
 specifically for the ZX graphics card, so texture mapping is not supported yet 
 but it will be added for Sun hardware that supports it.
 
+The approximation done on the ZX with smooth-shaded polygons is very imperfect
+compared to true texture mapping. This is inevitable to a degree but is being refined.
+The intent here is provide software demonstrating 3D hardware that has very little
+other software available. That is runs in a playable manner would be a bonus. It
+does achieve approximately 15 FPS at 640x480 on the test system.
+
 ## Quick start
 
 ### Build
