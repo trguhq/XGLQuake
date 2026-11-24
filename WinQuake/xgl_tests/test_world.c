@@ -2338,6 +2338,63 @@ static void test_shape_distance(void)
     XGL_WorldShutdown();
 }
 
+/* A wall of a small texture is given pieces, and weighs a cut, as a wall of
+ * the same picture at full size would be: a sign 32 texels square has as
+ * much to show as a panel of 64. */
+static byte small_shape_image[32 * 32];
+static void test_small_shape_distance(void)
+{
+    xgl_shape_tree_t *tree;
+    xgl_shape_terms_t full, small;
+    int x, y, step, full_area, near_triangles;
+    setup_shapes();
+    xgl_detaildensity.value = 160;
+    tree = XGL_SurfaceShapes(&test_surface);
+    assert(tree && tree->width == 64 && tree->area == 64 * 64);
+    full_area = tree->area;
+    step = XGL_ShapeStep(tree, 250.0f * 250.0f);
+    assert(step > 0);
+    XGL_ShapeTerms(tree, step, &full);
+    XGL_WorldShutdown();
+    /* The same picture, half the size. */
+    setup_world();
+    for (y = 0; y < 32; ++y)
+        for (x = 0; x < 32; ++x) small_shape_image[y * 32 + x] = (byte)shape_picture(0, 2 * x, 2 * y);
+    shape_texels[0] = small_shape_image; shape_texels[1] = NULL;
+    shape_width = shape_height = 32;
+    test_texture.width = test_texture.height = 32;
+    xgl_shapes.value = 1;
+    XGL_WorldNewMap();
+    r_fullbright.value = 1;
+    xgl_detaildensity.value = 160;
+    tree = XGL_SurfaceShapes(&test_surface);
+    assert(tree && tree->width == 32 && tree->height == 32 && tree->area == full_area);
+    /* By its own texels a repeat would have less than two pieces from 250
+     * units and the wall would be plain. It is cut. */
+    assert(32 * 32 * xgl_detaildensity.value / ((250.0f * 250.0f + 64) * XGL_SHAPE_PER_PIECE) < 2);
+    assert(XGL_ShapeStep(tree, 250.0f * 250.0f) > 0);
+    /* The same step asks as much of where a cut comes in the order and of
+     * how wide a part must be, which is a matter of pixels; and a quarter
+     * of the gain, there being a quarter of the texels to gain it among. */
+    XGL_ShapeTerms(tree, step, &small);
+    assert(small.most == full.most && small.thin == full.thin);
+    assert(fabs(small.worth * 4 - full.worth) <= 1e-4f * full.worth);
+    r_origin[2] = 700;
+    begin_frame();
+    assert(xgl_surfaces[0].shape_need == 0 && captured_count == 6);
+    r_origin[2] = 250;
+    begin_frame();
+    assert(xgl_surfaces[0].shape_need > 0 && xgl_surfaces[0].shape_step == xgl_surfaces[0].shape_need);
+    assert(captured_count > 6 && xgl_surfaces[0].detail.count == captured_count);
+    assert(fabs(captured_area() - 128.0f * 128.0f) < 2);
+    near_triangles = captured_count / 3;
+    r_origin[2] = 60;
+    begin_frame();
+    assert(captured_count / 3 >= near_triangles);
+    assert(fabs(captured_area() - 128.0f * 128.0f) < 2);
+    XGL_WorldShutdown();
+}
+
 /* A leaf is tested against the view by its box, and all its faces are
  * marked when it reaches in. A face that lies wholly outside the view is
  * then left out of the frame: not drawn, colored, lit or animated. It is
@@ -2559,6 +2616,7 @@ int main(void)
     test_brush_entity_basis_and_external_cache();
     test_shaped_wall();
     test_shape_distance();
+    test_small_shape_distance();
     test_shape_map_change();
     test_faces_outside_view();
     test_shape_animation();

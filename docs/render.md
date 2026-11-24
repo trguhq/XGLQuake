@@ -190,10 +190,23 @@ Each wall texture is examined once, while the map loads:
   better than a smooth mesh with as many triangles would: they must leave at
   most 85% of its color error. Rock, brick, wood grain and rough metal do
   not pass and are drawn as before.
+- A small texture is examined at its own scale. A sign 32 texels square has
+  as much to show as a panel of 64, but a mesh with a vertex every 16 texels
+  has four vertices for it and pays for two pieces, and on two pieces no
+  sign passes. Along a side shorter than 64 texels a texture is therefore
+  compared with a mesh of four cells, as the same picture drawn 64 texels
+  long would be, on the pieces that mesh pays for: nine for a square one.
+  A cut is asked for as much less as the texture has fewer texels than a
+  square of 64. A picture and the same picture at twice the size are then
+  divided alike, cut for cut. Grain, a smooth swell or a glow without an
+  edge still has no shapes at any size.
 
-In the shareware episode this selects between none and a third of a map's
-wall area: about 28% in `e1m1`, 34% in `e1m5`, 15% in `start`, 3% in `e1m2`
-and under 2% elsewhere.
+In the shareware episode this selects between none and nearly half of a
+map's wall area: about 46% in `e1m1`, 36% in `e1m5`, 17% in `start`, 3% in
+`e1m2`, `e1m6` and `e1m8` and under 1% elsewhere, and four fifths of the
+faces of the ammunition and health boxes. Of the 97 wall textures with a
+side under 64 texels, 58 have shapes: arrows, the exit sign, keys, runes,
+buttons, small lights, trim strips and the box faces.
 
 A face is cut by the lines of its texture's division, repeated as the
 texture repeats. Pieces share their corners along their sides, so no seam
@@ -205,11 +218,16 @@ are made depends on a step of detail that follows the distance:
   for at that distance, in steps of 1, 2, 3, 4, 6, 8 and so on. The step
   depends on the texture and the distance alone, so every face of a wall is
   cut alike and its pattern runs unbroken across them.
+- A repeat of a small texture gets the pieces that one of 64 texels square
+  would. By its own texels a sign 32 texels square would have fewer than
+  two pieces from 200 units and stay plain; it is cut out to about 385, as
+  a panel of 64 is.
 - A cut must also be worth its triangles, by the same measure as a split in
   a smooth mesh (`xgl_detailerror` and `xgl_detailedge`); nearer than about
   160 units, where a texel is wider than a pixel, a cut needs to be worth
-  less. A part that would be narrower than a pixel and a half is not cut
-  off: it would only flicker.
+  less. A small texture's cut is weighed as the same cut at full size would
+  be. A part that would be narrower than a pixel and a half is not cut off,
+  whatever the size of the texture: it would only flicker.
 - A wall is made finer in the frame it is called for, but coarser only when
   the distance asks for half the pieces or fewer, and then one wall every
   four frames. A step that would make the same cuts as the mesh a wall has
@@ -229,10 +247,13 @@ frame showing. The mesh is not built again as the texture changes.
 
 Examining the textures adds to the time a map takes to load, and the engine
 reports how long it took. On the SM61 the 72 textures of `e1m3` and its
-item boxes, the map of `demo1`, took 5.3 seconds. The examination has since
-been made to do 43% less work for that map, and 35% less over the whole
-shareware episode, with the same result for every texture; that is counted
-on a development host and not yet timed again on the machine.
+item boxes, the map of `demo1`, took 5.3 seconds. The examination was then
+made to do 43% less work for that map, and 35% less over the whole
+shareware episode, with the same result for every texture, and took 3.0
+seconds on the machine. Examining small textures at their own scale divides
+more of them to the end: about 11% more work for that map and 7% more over
+the episode, counted on a development host and not yet timed on the
+machine.
 
 A texture is examined once for as long as it stays loaded, not once a map.
 While a map loads, the textures of the one before are kept; one the new map
@@ -245,7 +266,11 @@ after `e1m3` examines 49 textures where it would examine 71 from nothing.
 Replayed off the machine on the same maps, walls cut this way cost about
 what they cost before: in views of `e1m1`, 1725 wall triangles a frame
 against 1785, with the mean color error against the full textures down from
-9.9 to 9.4 of 255.
+9.9 to 9.4 of 255. Those figures are from before faces outside the view
+were left out. Small textures were brought in later: in the same views of
+`e1m1` the wall triangles stayed at 1017 a frame, and in replays of the
+three demos the world's triangles rose by 1 to 3%, mostly on the boxes;
+detailed meshes were built 9 to 18% more often.
 
 ### Frame order
 

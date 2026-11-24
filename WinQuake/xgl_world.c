@@ -1092,7 +1092,7 @@ static void XGL_ShapeTerms (const xgl_shape_tree_t *tree, int step, xgl_shape_te
      * wall in range is as if at the viewer's feet. */
     distance = 0;
     if (xgl_detaildensity.value > 0)
-        distance = (float)tree->width * tree->height * xgl_detaildensity.value /
+        distance = (float)tree->area * xgl_detaildensity.value /
                    (XGL_SHAPE_PER_PIECE * XGL_SHAPE_STEP_MIDDLE * level) - 64;
     if (distance < 0) distance = 0;
     /* A cut must be worth what the ordinary builder asks of a split: a step
@@ -1107,6 +1107,10 @@ static void XGL_ShapeTerms (const xgl_shape_tree_t *tree, int step, xgl_shape_te
     if (nearness < XGL_SHAPE_NEAR) nearness = XGL_SHAPE_NEAR;
     if (nearness > 1) nearness = 1;
     terms->worth = .375f * edge * edge * threshold * threshold * XGL_SHAPE_PIECE_COST * nearness;
+    /* A small texture's cuts gained what they did among few texels: they
+     * are weighed as the same picture's at full size would be. Whether a
+     * part is wide enough to see is a matter of pixels, whatever the size. */
+    terms->worth *= (float)tree->width * tree->height / tree->area;
     terms->thin = XGL_SHAPE_THIN * (float)sqrt(distance) / XGL_SHAPE_PIXEL_DISTANCE;
 }
 
@@ -1133,14 +1137,16 @@ static const byte *XGL_ShapeSteps (xgl_shape_tree_t *tree)
 
 /* The step of detail a wall of this texture has at a squared distance: the
  * pieces a repeat gets are what the frame's density of triangles pays for.
- * Zero when its plain mesh shows all it can be given there. */
+ * A repeat of a small texture gets what one of XGL_SHAPE_FULL texels a side
+ * would: a sign or the face of a box has as much to show as a panel. Zero
+ * when its plain mesh shows all it can be given there. */
 static int XGL_ShapeStep (xgl_shape_tree_t *tree, float distance_squared)
 {
     float pieces;
     int step;
     step = XGL_SHAPE_STEPS - 1;
     if (xgl_detaildensity.value > 0) {
-        pieces = (float)tree->width * tree->height * xgl_detaildensity.value /
+        pieces = (float)tree->area * xgl_detaildensity.value /
                  ((distance_squared + 64) * XGL_SHAPE_PER_PIECE);
         for (step = 0; step + 1 < XGL_SHAPE_STEPS && xgl_shape_levels[step + 1] <= pieces; ++step) {}
     }

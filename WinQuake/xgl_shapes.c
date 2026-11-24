@@ -36,7 +36,17 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  *
  * A texture is drawn this way only if as many pieces as a smooth mesh would
  * have triangles for describe it distinctly better than that mesh does. Most
- * rock, brick and rough metal does not qualify and is left alone. */
+ * rock, brick and rough metal does not qualify and is left alone.
+ *
+ * A small texture is examined at its own scale. A sign 32 texels square has
+ * as much to show as a panel of 64, and a mesh with a vertex every 16
+ * texels has four vertices to show it with: judged against that on the two
+ * pieces those would pay for, no small texture has shapes. Along a side
+ * shorter than XGL_SHAPE_FULL texels it is therefore looked at as the same
+ * picture drawn that long: compared with a mesh of four cells along that
+ * side, on the pieces such a mesh pays for. And a texture with fewer texels
+ * than a square of XGL_SHAPE_FULL has is asked for as much less of a cut as
+ * it has fewer, here and when a wall weighs the cut. */
 #include "quakedef.h"
 #include "xgl_render.h"
 #include "xgl_audio.h"
@@ -56,9 +66,12 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define XGL_SHAPE_STOP 1.0
 #define XGL_SHAPE_STOP_GAIN 40000.0
 /* The smooth mesh the pieces are compared with has a vertex every so many
- * texels, and a piece is reckoned to cost 3.3 of its triangles. */
+ * texels, and a piece is reckoned to cost 3.3 of its triangles. Along a
+ * side under XGL_SHAPE_FULL texels the mesh has as many cells as along one
+ * of that length, though never cells under two texels. */
 #define XGL_SHAPE_GRID 16
 #define XGL_SHAPE_PIECE_TRIANGLES 3.3
+#define XGL_SHAPE_FULL_CELLS (XGL_SHAPE_FULL / XGL_SHAPE_GRID)
 /* Pieces must leave at most this share of the smooth mesh's error, and at
  * least one level of color less, for the texture to be drawn as pieces. */
 #define XGL_SHAPE_BETTER .85
@@ -156,6 +169,22 @@ typedef struct {
 static xgl_shape_entry_t *xgl_shape_entries;
 static int xgl_shape_examined, xgl_shape_found;
 
+/* The texels a repeat of a texture counts as: see xgl_shape_tree_t. */
+static int XGL_ShapeArea (int width, int height)
+{
+    return width * height > XGL_SHAPE_FULL * XGL_SHAPE_FULL ? width * height : XGL_SHAPE_FULL * XGL_SHAPE_FULL;
+}
+
+/* The cells of the smooth mesh along one side of the texture. */
+static int XGL_ShapeCells (int side)
+{
+    int cells, least;
+    cells = side / XGL_SHAPE_GRID;
+    least = side / 2 < XGL_SHAPE_FULL_CELLS ? side / 2 : XGL_SHAPE_FULL_CELLS;
+    if (cells < least) cells = least;
+    return cells > 1 ? cells : 1;
+}
+
 static void XGL_ShapeBox (int x0, int y0, int x1, int y1, double *sum)
 {
     const double *a = XGL_SHAPE_TABLE(x1, y1), *b = XGL_SHAPE_TABLE(x1, y0);
@@ -241,9 +270,10 @@ static int XGL_ShapeOrigin (unsigned int (*sums)[4], int length, int across)
 }
 
 /* The error of the ordinary kind of mesh on this texture: vertices every
- * XGL_SHAPE_GRID texels, each the mean of a box three quarters as wide,
- * colors running smoothly between them. Every second texel is compared, the
- * other ones on the next row, so that a striped texture is judged fairly. */
+ * XGL_SHAPE_GRID texels, or nearer along a short side, each the mean of a
+ * box three quarters as wide as their spacing, colors running smoothly
+ * between them. Every second texel is compared, the other ones on the next
+ * row, so that a striped texture is judged fairly. */
 static double XGL_ShapeSmooth (void)
 {
     static float grid[17][17][3];
@@ -253,11 +283,13 @@ static double XGL_ShapeSmooth (void)
     const unsigned int *texel;
     double sum[4], part[4], error;
     float fx, fy, value, difference;
-    int w, h, gw, gh, gx, gy, nx, ny, x, y, c, half, x0, y0, x1, y1, i, j, skip, taken;
+    int w, h, gw, gh, gx, gy, nx, ny, x, y, c, half_x, half_y, x0, y0, x1, y1, i, j, skip, taken;
     w = xgl_shape.width; h = xgl_shape.height;
-    gw = w / XGL_SHAPE_GRID; if (gw < 1) gw = 1;
-    gh = h / XGL_SHAPE_GRID; if (gh < 1) gh = 1;
-    half = XGL_SHAPE_GRID * 3 / 8;
+    gw = XGL_ShapeCells(w); gh = XGL_ShapeCells(h);
+    half_x = (w / gw < XGL_SHAPE_GRID ? w / gw : XGL_SHAPE_GRID) * 3 / 8;
+    half_y = (h / gh < XGL_SHAPE_GRID ? h / gh : XGL_SHAPE_GRID) * 3 / 8;
+    if (half_x < 1) half_x = 1;
+    if (half_y < 1) half_y = 1;
     for (gy = 0; gy < gh; ++gy)
         for (gx = 0; gx < gw; ++gx) {
             sum[0] = sum[1] = sum[2] = 0;
@@ -265,8 +297,8 @@ static double XGL_ShapeSmooth (void)
              * next repeat: up to four rectangles of this one. */
             for (j = 0; j < 2; ++j)
                 for (i = 0; i < 2; ++i) {
-                    x0 = gx * w / gw - half; x1 = gx * w / gw + half;
-                    y0 = gy * h / gh - half; y1 = gy * h / gh + half;
+                    x0 = gx * w / gw - half_x; x1 = gx * w / gw + half_x;
+                    y0 = gy * h / gh - half_y; y1 = gy * h / gh + half_y;
                     if (x1 - x0 > w) { x0 = 0; x1 = w; }
                     if (y1 - y0 > h) { y0 = 0; y1 = h; }
                     if (i == 0) {
@@ -285,7 +317,7 @@ static double XGL_ShapeSmooth (void)
                     XGL_ShapeBox(x0, y0, x1, y1, part);
                     for (c = 0; c < 3; ++c) sum[c] += part[c];
                 }
-            x0 = 2 * half < w ? 2 * half : w; y0 = 2 * half < h ? 2 * half : h;
+            x0 = 2 * half_x < w ? 2 * half_x : w; y0 = 2 * half_y < h ? 2 * half_y : h;
             for (c = 0; c < 3; ++c) grid[gy][gx][c] = (float)(sum[c] / (x0 * y0));
         }
     for (x = 0; x < w; ++x) {
@@ -833,14 +865,16 @@ static void XGL_ShapeTake (int index, int parent, int far)
 static int XGL_ShapeDivide (double smooth)
 {
     xgl_shape_part_t *part, *rest_part;
-    double whole, rest, pieces_error, texels;
+    double whole, rest, pieces_error, texels, stop_gain;
     int i, best, leaves, pass, first, judged, structured, enough, w, h;
     w = xgl_shape.width; h = xgl_shape.height;
     texels = 3.0 * w * h;
     /* As many pieces as the triangles of the smooth mesh would pay for. */
-    enough = (int)(2 * (w / XGL_SHAPE_GRID > 1 ? w / XGL_SHAPE_GRID : 1) *
-                   (h / XGL_SHAPE_GRID > 1 ? h / XGL_SHAPE_GRID : 1) / XGL_SHAPE_PIECE_TRIANGLES);
+    enough = (int)(2 * XGL_ShapeCells(w) * XGL_ShapeCells(h) / XGL_SHAPE_PIECE_TRIANGLES);
     if (enough < 2) enough = 2;
+    /* A cut removes less in all from a small texture, which has fewer
+     * texels, than from the same picture at full size. */
+    stop_gain = XGL_SHAPE_STOP_GAIN * w * h / XGL_ShapeArea(w, h);
     part = &xgl_shape.part[0];
     whole = XGL_ShapeError(part->sum, part->n);
     structured = 0;
@@ -857,7 +891,7 @@ static int XGL_ShapeDivide (double smooth)
                 if (xgl_shape.part[i].child[0] < 0 && xgl_shape.part[i].gain > 0 &&
                     (best < 0 || xgl_shape.part[i].gain > xgl_shape.part[best].gain)) best = i;
             if (best < 0 || xgl_shape.part[best].gain < XGL_SHAPE_STOP * w * h) break;
-            if (judged && xgl_shape.part[best].gain < XGL_SHAPE_STOP_GAIN) break;
+            if (judged && xgl_shape.part[best].gain < stop_gain) break;
             part = &xgl_shape.part[best];
             if (pass && !part->tilted) XGL_ShapeTilt(best);
             first = xgl_shape.count;
@@ -1109,6 +1143,7 @@ static xgl_shape_entry_t *XGL_ShapeEntry (texture_t *texture)
         return entry;
     }
     tree->width = width; tree->height = height;
+    tree->area = XGL_ShapeArea(width, height);
     entry->tree = tree;
     ++xgl_shape_found;
     return entry;

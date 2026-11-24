@@ -162,8 +162,16 @@ typedef struct {
 } xgl_shape_node_t;
 /* The steps of detail a wall cut along such a division can have. */
 #define XGL_SHAPE_STEPS 24
+/* A small texture is treated as the same picture drawn larger: a sign 32
+ * texels square has as much to show as one of 64, in a quarter of the
+ * texels. This is the side of the square a small one is taken up to. */
+#define XGL_SHAPE_FULL 64
 typedef struct {
     int width, height;
+    /* The texels a repeat counts as: its own, or those of a square of
+     * XGL_SHAPE_FULL a side if it has fewer. A wall is given pieces for
+     * that many, and weighs a cut by what it would gain among that many. */
+    int area;
     /* The texel the repeat is taken to begin at, so that its border falls
      * on an edge in the picture where there is one. */
     int origin[2];

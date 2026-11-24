@@ -28,11 +28,14 @@ each middle of an edge is placed once, that light at a middle is the mean
 of its ends', and that nothing is kept for a pose.
 The shape tests examine made-up textures: which have shapes and which do
 not, bands, sloping edges, where a repeat begins, and the frames of an
-animated texture. They cut faces along the result and check that the pieces
+animated texture. A sign 32 texels square must be divided cut for cut as
+the same picture at twice the size is, and grain, a swell and a glow must
+have no shapes at any size. They cut faces along the result and check that the pieces
 cover the face exactly, have the texture's colors, and share every corner
 that lies along a side. The world tests then draw such walls: their colors
-and baked light, the steps of detail by distance, and the limits; and load a
-map again to see that nothing is examined twice.
+and baked light, the steps of detail by distance, and the limits; a wall of
+a small texture cut from as far as one of the same picture at full size;
+and load a map again to see that nothing is examined twice.
 The screen tests cover when an unchanged status bar is left in place, and
 the UI tests that every picture name draws what it did before.
 Run from `WinQuake/`:
