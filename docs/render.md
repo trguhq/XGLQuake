@@ -20,6 +20,7 @@ Several choices below follow from measurements of the target device; see
 [Measured on the Sun ZX](hardware.md).
 
 ### Quality settings
+What each tier sets:
 
 | Setting | `ultralow` | `low` | `medium` | `high` | `ultra` |
 | --- | ---: | ---: | ---: | ---: | ---: |
