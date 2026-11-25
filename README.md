@@ -67,6 +67,13 @@ what might work, provided here as a starting point for your convenience. See [qu
 | `high` | `creator` | Finer wall meshes to twice the range, four times the detail allowance, models subdivided twice. For a Creator3D. |
 | `ultra` | `elite` | The finest meshes the renderer makes, to four times the range, with ten times the detail allowance. For an Elite3D. Note that this does not take advantage of hardware texture mapping at this time. |
 
+A tier named after a board is a guess at settings for it, not a statement
+that the board works. Which boards are expected to run XGLQuake at all, which
+will not, and what each needs is listed under
+[other Sun graphics hardware](docs/hardware.md#other-sun-graphics-hardware):
+in short the ZX works, the Creator3D and Elite3D should, the SX may with
+`-xglanydevice`, and the CG12 is unknown.
+
 `+xgl_quality sx` is the same as `+xgl_quality low`, and so on. What each
 tier sets:
 
@@ -85,10 +92,6 @@ The tiers are first approximations and have not been timed on any machine.
 Quake saves the last four settings of the table in `config.cfg`, so after a
 run at another tier give `+xgl_quality` again, `medium` included, rather
 than leaving it out.
-
-Whether XGL supports the CG12 at all on Solaris 2.6 is unknown. Which boards
-are expected to work, and what the SX needs, is in
-[other Sun graphics hardware](docs/hardware.md#other-sun-graphics-hardware).
 
 ### Common options
 
