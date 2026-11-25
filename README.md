@@ -53,7 +53,7 @@ locations and shareware restrictions.
 `+xgl_quality` sets the renderer's detail settings together, as one of five
 rough tiers. Without it the renderer runs at **medium**. Only **medium** has
 been tested on real hardware (Sun ZX) and the others are pure guesses as to
-what might work, provided here as a starting point for your convenience.
+what might work, provided here as a starting point for your convenience. See [quality settings](docs/render.md).
 
 ```sh
 ./xglquake -winsize 640 480 +_snd_mixahead 0.3 +xgl_quality high
