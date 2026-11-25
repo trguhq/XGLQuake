@@ -74,7 +74,7 @@ static void XGL_TimeRefresh_f (void)
     if (elapsed > 0) Con_Printf("%f seconds (%f fps)\n", elapsed, 128 / elapsed);
 }
 
-/* xgl_quality low|medium|high|ultra sets the detail settings together, as a
+/* xgl_quality ultralow|low|medium|high|ultra sets the detail settings together, as a
  * rough tier. It is a command, not a setting: it takes effect where it
  * stands among the others, so a setting given after it changes that one
  * setting and leaves the rest of the tier, and one given before it is
@@ -89,6 +89,7 @@ static const struct {
     const char *name;
     const char *values[XGL_QUALITY_SETTINGS];
 } xgl_quality_tiers[] = {
+    {"ultralow", {"256", "48", "48",   "32",  "30",   "256",  "256",   "32", "1", "0",     "0",  "2",  "4"}},
     {"low",    {"256", "32", "32",   "64",  "60",   "512",  "320",   "48", "1", "0",     "0",  "4",  "8"}},
     {"medium", {"128", "16", "16",  "192", "160",  "3072",  "512",  "128", "1", "1",   "512",  "8", "16"}},
     {"high",   { "64", "10", "10",  "384", "320", "12288", "1024",  "512", "1", "2",  "2048", "12", "32"}},
@@ -97,11 +98,12 @@ static const struct {
 /* Each tier is a guess at what one kind of Sun graphics hardware can draw,
  * and may be asked for by that hardware's name. Medium is the ZX the
  * renderer was made on. Sun's GBench figures give the SX about a quarter
- * of the ZX's shaded triangles, and the CG12 is taken to be no faster; the
+ * of the ZX's shaded triangles, and the CG12, in a slower machine, is taken
+ * as half of that again; the
  * Creator3D and Elite3D are taken as some four and some forty times the ZX,
  * on far faster processors. Only the ZX figures have been measured here. */
 static const struct { const char *name, *tier; } xgl_quality_names[] = {
-    {"cg", "low"}, {"cg12", "low"}, {"sx", "low"}, {"zx", "medium"},
+    {"cg", "ultralow"}, {"cg12", "ultralow"}, {"sx", "low"}, {"zx", "medium"},
     {"creator", "high"}, {"creator3d", "high"}, {"elite", "ultra"}, {"elite3d", "ultra"}
 };
 static const char *xgl_quality_last = "medium";
@@ -122,8 +124,8 @@ static void XGL_Quality_f (void)
             return;
         }
     }
-    Con_Printf("usage: xgl_quality low | medium | high | ultra\n");
-    Con_Printf("or by hardware: cg12 or sx (low), zx (medium), creator (high), elite (ultra)\n");
+    Con_Printf("usage: xgl_quality ultralow | low | medium | high | ultra\n");
+    Con_Printf("or by hardware: cg12 (ultralow), sx (low), zx (medium), creator (high), elite (ultra)\n");
     Con_Printf("last chosen: %s; settings given since may have changed it\n", xgl_quality_last);
 }
 

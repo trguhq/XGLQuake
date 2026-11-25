@@ -23,7 +23,7 @@ Several choices below follow from measurements of the target device; see
 
 | Setting | Default | Effect |
 | --- | ---: | --- |
-| `xgl_quality` | medium | A command, not a setting: `low`, `medium`, `high` or `ultra`, or `cg12`, `sx`, `zx`, `creator` or `elite` for the same four by hardware, sets the detail settings below together. Settings given after it override it one at a time. See the [README](../README.md#quality) for what each tier sets. |
+| `xgl_quality` | medium | A command, not a setting: `ultralow`, `low`, `medium`, `high` or `ultra`, or `cg12`, `sx`, `zx`, `creator` or `elite` for the same five by hardware, sets the detail settings below together. Settings given after it override it one at a time. See the [README](../README.md#quality) for what each tier sets. |
 | `xgl_subdivide` | 128 | Edge length, in texels, above which a detailed mesh always splits an edge, clamped to 8–256; smaller is finer. |
 | `xgl_detailerror` | 16 | Color difference, of 255, that a new vertex must make to be worth adding, clamped to 1–255; smaller is finer. |
 | `xgl_detailedge` | 16 | Edges of this many texels or less are never split, clamped to 4–64; smaller is finer. |
