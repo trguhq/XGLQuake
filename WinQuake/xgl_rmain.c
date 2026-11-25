@@ -89,19 +89,33 @@ static const struct {
     const char *name;
     const char *values[XGL_QUALITY_SETTINGS];
 } xgl_quality_tiers[] = {
-    {"low",    {"256", "24", "24",  "96",  "80",  "1024",  "384",  "64", "1", "0",    "0",  "4",  "8"}},
-    {"medium", {"128", "16", "16", "192", "160",  "3072",  "512", "128", "1", "1",  "512",  "8", "16"}},
-    {"high",   { "96", "12", "12", "256", "240",  "6144",  "768", "192", "1", "1", "1024", "12", "32"}},
-    {"ultra",  { "64",  "8",  "8", "512", "320", "12288", "1024", "256", "1", "2", "4096", "16", "64"}}
+    {"low",    {"256", "32", "32",   "64",  "60",   "512",  "320",   "48", "1", "0",     "0",  "4",  "8"}},
+    {"medium", {"128", "16", "16",  "192", "160",  "3072",  "512",  "128", "1", "1",   "512",  "8", "16"}},
+    {"high",   { "64", "10", "10",  "384", "320", "12288", "1024",  "512", "1", "2",  "2048", "12", "32"}},
+    {"ultra",  { "32",  "6",  "6", "1024", "640", "32768", "2048", "2048", "1", "2", "16384", "16", "64"}}
+};
+/* Each tier is a guess at what one kind of Sun graphics hardware can draw,
+ * and may be asked for by that hardware's name. Medium is the ZX the
+ * renderer was made on. Sun's GBench figures give the SX about a quarter
+ * of the ZX's shaded triangles, and the CG12 is taken to be no faster; the
+ * Creator3D and Elite3D are taken as some four and some forty times the ZX,
+ * on far faster processors. Only the ZX figures have been measured here. */
+static const struct { const char *name, *tier; } xgl_quality_names[] = {
+    {"cg", "low"}, {"cg12", "low"}, {"sx", "low"}, {"zx", "medium"},
+    {"creator", "high"}, {"creator3d", "high"}, {"elite", "ultra"}, {"elite3d", "ultra"}
 };
 static const char *xgl_quality_last = "medium";
 
 static void XGL_Quality_f (void)
 {
+    const char *tier;
     int i, j;
     if (Cmd_Argc() == 2) {
+        tier = Cmd_Argv(1);
+        for (i = 0; i < (int)(sizeof(xgl_quality_names) / sizeof(xgl_quality_names[0])); ++i)
+            if (!Q_strcasecmp(Cmd_Argv(1), (char *)xgl_quality_names[i].name)) tier = xgl_quality_names[i].tier;
         for (i = 0; i < (int)(sizeof(xgl_quality_tiers) / sizeof(xgl_quality_tiers[0])); ++i) {
-            if (Q_strcasecmp(Cmd_Argv(1), (char *)xgl_quality_tiers[i].name)) continue;
+            if (Q_strcasecmp((char *)tier, (char *)xgl_quality_tiers[i].name)) continue;
             for (j = 0; j < XGL_QUALITY_SETTINGS; ++j)
                 Cvar_Set((char *)xgl_quality_settings[j], (char *)xgl_quality_tiers[i].values[j]);
             xgl_quality_last = xgl_quality_tiers[i].name;
@@ -109,6 +123,7 @@ static void XGL_Quality_f (void)
         }
     }
     Con_Printf("usage: xgl_quality low | medium | high | ultra\n");
+    Con_Printf("or by hardware: cg12 or sx (low), zx (medium), creator (high), elite (ultra)\n");
     Con_Printf("last chosen: %s; settings given since may have changed it\n", xgl_quality_last);
 }
 

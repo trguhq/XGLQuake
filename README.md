@@ -57,30 +57,39 @@ rough tiers. Without it the renderer runs at **medium**.
 ./xglquake -winsize 640 480 +_snd_mixahead 0.3 +xgl_quality high
 ```
 
-| Tier | In short |
-| --- | --- |
-| `low` | Coarse walls, original model triangles, a third of medium's detail allowance. For the highest frame rate. |
-| `medium` | The default settings. |
-| `high` | Finer wall meshes out to a longer range, twice the detail allowance, sharper sprites and status bar. |
-| `ultra` | The finest meshes, models subdivided twice, four times the detail allowance. Slow on one 60 MHz CPU. |
+| Tier | Also called | In short |
+| --- | --- | --- |
+| `low` | `cg12`, `cg`, `sx` | Coarse walls near the viewer only, original model triangles, a sixth of medium's detail allowance. For a Sun CG12 or SX, or for the highest frame rate. |
+| `medium` | `zx` | The default settings, tuned on a Sun ZX. |
+| `high` | `creator` | Finer wall meshes to twice the range, four times the detail allowance, models subdivided twice. For a Creator3D. |
+| `ultra` | `elite` | The finest meshes the renderer makes, to four times the range, with ten times the detail allowance. For an Elite3D. |
 
-What each tier sets:
+`+xgl_quality sx` is the same as `+xgl_quality low`, and so on. What each
+tier sets:
 
 | Setting | `low` | `medium` | `high` | `ultra` |
 | --- | ---: | ---: | ---: | ---: |
-| `xgl_subdivide` | 256 | 128 | 96 | 64 |
-| `xgl_detailerror` | 24 | 16 | 12 | 8 |
-| `xgl_detailedge` | 24 | 16 | 12 | 8 |
-| `xgl_detailface` | 96 | 192 | 256 | 512 |
-| `xgl_detaildensity` | 80 | 160 | 240 | 320 |
-| `xgl_detailtris` | 1024 | 3072 | 6144 | 12288 |
-| `xgl_detaildistance` | 384 | 512 | 768 | 1024 |
-| `xgl_detailbuild` | 64 | 128 | 192 | 256 |
+| `xgl_subdivide` | 256 | 128 | 64 | 32 |
+| `xgl_detailerror` | 32 | 16 | 10 | 6 |
+| `xgl_detailedge` | 32 | 16 | 10 | 6 |
+| `xgl_detailface` | 64 | 192 | 384 | 1024 |
+| `xgl_detaildensity` | 60 | 160 | 320 | 640 |
+| `xgl_detailtris` | 512 | 3072 | 12288 | 32768 |
+| `xgl_detaildistance` | 320 | 512 | 1024 | 2048 |
+| `xgl_detailbuild` | 48 | 128 | 512 | 2048 |
 | `xgl_shapes` | 1 | 1 | 1 | 1 |
-| `xgl_alias_subdivide` | 0 | 1 | 1 | 2 |
-| `xgl_entity_triangles` | 0 | 512 | 1024 | 4096 |
+| `xgl_alias_subdivide` | 0 | 1 | 2 | 2 |
+| `xgl_entity_triangles` | 0 | 512 | 2048 | 16384 |
 | `xgl_sprite_cells` | 4 | 8 | 12 | 16 |
 | `xgl_hudpieces` | 8 | 16 | 32 | 64 |
+
+The hardware names are guesses at what each board can draw. Sun's GBench
+figures give the SX about a quarter of the ZX's shaded, Z-buffered
+triangles (30,500 a second against 125,000); the CG12 is taken to be no
+faster. The Creator3D and Elite3D are taken as roughly four and forty times
+the ZX, with much faster processors to prepare the meshes. Only the ZX has
+been run. On the faster boards the 8 MiB mesh cache, not the board, may be
+what limits `ultra`.
 
 Options take effect in the order given, and the last word wins. A setting
 after the tier changes that one setting and keeps the rest of the tier; a
@@ -93,7 +102,7 @@ setting before it is replaced by the tier's value:
 is `high` with a detail allowance of 4096. The same works in the console:
 `xgl_quality low`, and `xgl_quality` alone names the tiers.
 
-The tiers are first approximations and have not been timed on the machine.
+The tiers are first approximations and have not been timed on any machine.
 Quake saves the last four settings of the table in `config.cfg`, so after a
 run at another tier give `+xgl_quality` again, `medium` included, rather
 than leaving it out.
