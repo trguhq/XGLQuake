@@ -57,6 +57,9 @@ typedef struct {
     Xgl_light lights[6];
     Xgl_boolean light_switches[6];
     Xgl_usgn32 buffers;
+    /* Started with -xglanydevice on a device that is not all the renderer
+     * was made for: the status bar is not kept from frame to frame. */
+    int any_device;
     xgl_native_vertex_t points[XGL_BATCH_TRIANGLES * 3];
     /* The owned batch for points without normals; a batch is all of one
      * kind, and `format` says which the pending one is. */
@@ -727,7 +730,7 @@ float XGL_AmbientLight(void)
 
 void XGL_SetFrameKeep(int lines)
 {
-    xb.keep_request = lines > 0 ? lines : 0;
+    xb.keep_request = lines > 0 && !xb.any_device ? lines : 0;
 }
 
 int XGL_FrameKeepStreak(void)
@@ -1313,8 +1316,21 @@ void XGLB_Init(Display *display, Window window, int width, int height)
     if (!inquiry->dga_flag || inquiry->true_color != XGL_INQ_HARDWARE ||
         inquiry->hlhsr != XGL_INQ_HARDWARE || inquiry->shading != XGL_INQ_HARDWARE ||
         inquiry->maximum_buffer < 2) {
-        free(inquiry);
-        Sys_Error("XGLQuake needs local DGA hardware RGB/Z/shading and two buffers");
+        /* What the renderer was made for is direct access to a device with
+         * RGB color, a Z-buffer and shading in hardware and two buffers to
+         * switch between. A device such as the SX keeps its Z-buffer in
+         * main memory and shows a finished frame by copying it: XGL may
+         * say so here, and -xglanydevice goes on regardless, as long as
+         * XGL can do each thing at all. */
+        if (!COM_CheckParm("-xglanydevice") || inquiry->true_color == XGL_INQ_NOT_SUPPORTED ||
+            inquiry->hlhsr == XGL_INQ_NOT_SUPPORTED || inquiry->shading == XGL_INQ_NOT_SUPPORTED) {
+            free(inquiry);
+            Sys_Error("XGLQuake needs local DGA hardware RGB/Z/shading and two buffers"
+                      " (-xglanydevice tries a device with less)");
+        }
+        xb.any_device = 1;
+        Con_SafePrintf("XGL: -xglanydevice: going on with DGA=%d and %d buffers; expect it to be slow\n",
+                       (int)inquiry->dga_flag, (int)inquiry->maximum_buffer);
     }
     free(inquiry);
     descriptor.win_ras.type = XGL_WIN_X | XGL_WIN_X_PROTO_DGA;
@@ -1325,9 +1341,15 @@ void XGLB_Init(Display *display, Window window, int width, int height)
     if (!xb.raster) Sys_Error("XGL window raster creation failed");
     xgl_object_get(xb.raster, XGL_WIN_RAS_BUFFERS_ALLOCATED, &xb.buffers);
     native_check();
-    if (xb.buffers < 2) Sys_Error("XGL did not allocate two window buffers");
-    xgl_object_set(xb.raster, XGL_WIN_RAS_BUF_DISPLAY, 0, XGL_WIN_RAS_BUF_DRAW, 1,
-                   XGL_RAS_SOURCE_BUFFER, XGL_BUFFER_SEL_DRAW, 0);
+    if (xb.buffers < 2 && !COM_CheckParm("-xglanydevice"))
+        Sys_Error("XGL did not allocate two window buffers (-xglanydevice draws in one)");
+    if (xb.buffers < 2) {
+        /* One buffer: each frame is drawn where it is seen, and flickers. */
+        xb.any_device = 1;
+        Con_SafePrintf("XGL: -xglanydevice: one window buffer; frames are drawn in view\n");
+    } else
+        xgl_object_set(xb.raster, XGL_WIN_RAS_BUF_DISPLAY, 0, XGL_WIN_RAS_BUF_DRAW, 1,
+                       XGL_RAS_SOURCE_BUFFER, XGL_BUFFER_SEL_DRAW, 0);
     memset(&color, 0, sizeof(color));
     xb.scene = xgl_object_create(xb.system, XGL_3D_CTX, NULL,
         XGL_CTX_DEVICE, xb.raster, XGL_CTX_RENDER_BUFFER, XGL_RENDER_DRAW_BUFFER,

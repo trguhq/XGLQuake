@@ -355,16 +355,30 @@ static int XGL_ChooseVisual (int screen, XVisualInfo *chosen)
             if (library) routine = (gamma_routine)dlsym(library, "XSolarisGetVisualGamma");
         }
         if (routine) {
-            /* A linear visual reports a gamma of one. */
+            /* A corrected visual is called linear: its response is taken to
+             * be reported as a gamma of one, and an uncorrected visual's as
+             * the monitor's own, about 2.2. That has not been seen on a
+             * board, so what each visual reports is printed, and among
+             * visuals that report differently the one farthest from one is
+             * used; should a first run show the numbers to mean the
+             * opposite, -visualid chooses. Visuals that all report alike
+             * cannot be told apart. */
+            double best = 0, low = 0, high = 0;
             found = 0;
-            for (i = 0; i < count && !found; ++i) {
+            for (i = 0; i < count; ++i) {
                 gamma = 0;
                 if (routine(xgl_display, screen, list[i].visual, &gamma) != 0) continue; /* Not Success. */
-                if (gamma > 1.05 || gamma < .95) { pick = i; found = 1; }
+                Con_SafePrintf("XGL: 24-bit TrueColor visual 0x%lx reports gamma %.2f\n",
+                               (unsigned long)list[i].visualid, gamma);
+                if (!found || gamma < low) low = gamma;
+                if (!found || gamma > high) high = gamma;
+                if (!found || fabs(gamma - 1.0) > fabs(best - 1.0)) { best = gamma; pick = i; }
+                found = 1;
             }
-            Con_SafePrintf(found ?
-                "XGL: %d 24-bit TrueColor visuals; using 0x%lx, which the hardware does not gamma-correct\n" :
-                "XGL: %d 24-bit TrueColor visuals, none known to be free of hardware gamma; using the first, 0x%lx\n",
+            if (!found || high - low < .05) pick = 0;
+            Con_SafePrintf(found && high - low >= .05 ?
+                "XGL: %d such visuals; using 0x%lx, taken to be the one without hardware gamma\n" :
+                "XGL: %d such visuals that cannot be told apart; using the first, 0x%lx\n",
                 count, (unsigned long)list[pick].visualid);
         } else
             Con_SafePrintf("XGL: %d 24-bit TrueColor visuals and no way to tell them apart; using the first, 0x%lx\n",

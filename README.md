@@ -86,6 +86,10 @@ Quake saves the last four settings of the table in `config.cfg`, so after a
 run at another tier give `+xgl_quality` again, `medium` included, rather
 than leaving it out.
 
+Whether XGL supports the CG12 at all on Solaris 2.6 is unknown. Which boards
+are expected to work, and what the SX needs, is in
+[other Sun graphics hardware](docs/setup.md#other-sun-graphics-hardware).
+
 ### Common options
 
 | Command-line option | Purpose |
