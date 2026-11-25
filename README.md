@@ -74,8 +74,7 @@ will not, and what each needs is listed under
 in short the ZX works, the Creator3D and Elite3D should, the SX may with
 `-xglanydevice`, and the CG12 is unknown.
 
-`+xgl_quality sx` is the same as `+xgl_quality low`, and so on. What each
-tier sets:
+`+xgl_quality sx` is the same as `+xgl_quality low`, and so on.
 
 Options take effect in the order given, and the last word wins. A setting
 after the tier changes that one setting and keeps the rest of the tier; a
