@@ -60,9 +60,9 @@ rough tiers. Without it the renderer runs at **medium**.
 | Tier | In short |
 | --- | --- |
 | `low` | Coarse walls, original model triangles, a third of medium's detail allowance. For the highest frame rate. |
-| `medium` | The default settings. |
+| `medium` | The default settings. The intended settings for a Sun ZX and SM61 processor.|
 | `high` | Finer wall meshes out to a longer range, twice the detail allowance, sharper sprites and status bar. |
-| `ultra` | The finest meshes, models subdivided twice, four times the detail allowance. Slow on one 60 MHz CPU. |
+| `ultra` | The finest meshes, models subdivided twice, four times the detail allowance. May be slow on vintage hardware. |
 
 What each tier sets:
 
