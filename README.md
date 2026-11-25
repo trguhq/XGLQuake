@@ -60,7 +60,7 @@ rough tiers. Without it the renderer runs at **medium**.
 | Tier | Also called | In short |
 | --- | --- | --- |
 | `low` | `cg12`, `cg`, `sx` | Coarse walls near the viewer only, original model triangles, a sixth of medium's detail allowance. For a Sun CG12 or SX, or for the highest frame rate. |
-| `medium` | `zx` | The default settings, tuned on a Sun ZX. |
+| `medium` | `zx` | The default settings. The intended settings for a Sun ZX and SM61 processor. |
 | `high` | `creator` | Finer wall meshes to twice the range, four times the detail allowance, models subdivided twice. For a Creator3D. |
 | `ultra` | `elite` | The finest meshes the renderer makes, to four times the range, with ten times the detail allowance. For an Elite3D. |
 
