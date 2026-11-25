@@ -19,6 +19,32 @@ OpenGL target are unchanged.
 Several choices below follow from measurements of the target device; see
 [Measured on the Sun ZX](hardware.md).
 
+### Quality settings
+
+| Setting | `ultralow` | `low` | `medium` | `high` | `ultra` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `xgl_subdivide` | 256 | 256 | 128 | 64 | 32 |
+| `xgl_detailerror` | 48 | 32 | 16 | 10 | 6 |
+| `xgl_detailedge` | 48 | 32 | 16 | 10 | 6 |
+| `xgl_detailface` | 32 | 64 | 192 | 384 | 1024 |
+| `xgl_detaildensity` | 30 | 60 | 160 | 320 | 640 |
+| `xgl_detailtris` | 256 | 512 | 3072 | 12288 | 32768 |
+| `xgl_detaildistance` | 256 | 320 | 512 | 1024 | 2048 |
+| `xgl_detailbuild` | 32 | 48 | 128 | 512 | 2048 |
+| `xgl_shapes` | 1 | 1 | 1 | 1 | 1 |
+| `xgl_alias_subdivide` | 0 | 0 | 1 | 2 | 2 |
+| `xgl_entity_triangles` | 0 | 0 | 512 | 2048 | 16384 |
+| `xgl_sprite_cells` | 2 | 4 | 8 | 12 | 16 |
+| `xgl_hudpieces` | 4 | 8 | 16 | 32 | 64 |
+
+The hardware names are guesses at what each board can draw. Sun's GBench
+figures give the SX about a quarter of the ZX's shaded, Z-buffered
+triangles (30,500 a second against 125,000); the CG12, an older board in a
+slower machine, is taken as half of the SX again, with no figure behind it. The Creator3D and Elite3D are taken as roughly four and forty times
+the ZX, with much faster processors to prepare the meshes. Only the ZX has
+been run. On the faster boards the 8 MiB mesh cache, not the board, may be
+what limits `ultra`.
+
 ### Renderer settings
 
 | Setting | Default | Effect |
