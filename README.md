@@ -48,6 +48,56 @@ Official Quake 1.00, 1.01, and 1.06 shareware PAK directories are recognized.
 See [game data and display setup](docs/setup.md) for alternate
 locations and shareware restrictions.
 
+### Quality
+
+`+xgl_quality` sets the renderer's detail settings together, as one of four
+rough tiers. Without it the renderer runs at **medium**.
+
+```sh
+./xglquake -winsize 640 480 +_snd_mixahead 0.3 +xgl_quality high
+```
+
+| Tier | In short |
+| --- | --- |
+| `low` | Coarse walls, original model triangles, a third of medium's detail allowance. For the highest frame rate. |
+| `medium` | The default settings. |
+| `high` | Finer wall meshes out to a longer range, twice the detail allowance, sharper sprites and status bar. |
+| `ultra` | The finest meshes, models subdivided twice, four times the detail allowance. Slow on one 60 MHz CPU. |
+
+What each tier sets:
+
+| Setting | `low` | `medium` | `high` | `ultra` |
+| --- | ---: | ---: | ---: | ---: |
+| `xgl_subdivide` | 256 | 128 | 96 | 64 |
+| `xgl_detailerror` | 24 | 16 | 12 | 8 |
+| `xgl_detailedge` | 24 | 16 | 12 | 8 |
+| `xgl_detailface` | 96 | 192 | 256 | 512 |
+| `xgl_detaildensity` | 80 | 160 | 240 | 320 |
+| `xgl_detailtris` | 1024 | 3072 | 6144 | 12288 |
+| `xgl_detaildistance` | 384 | 512 | 768 | 1024 |
+| `xgl_detailbuild` | 64 | 128 | 192 | 256 |
+| `xgl_shapes` | 1 | 1 | 1 | 1 |
+| `xgl_alias_subdivide` | 0 | 1 | 1 | 2 |
+| `xgl_entity_triangles` | 0 | 512 | 1024 | 4096 |
+| `xgl_sprite_cells` | 4 | 8 | 12 | 16 |
+| `xgl_hudpieces` | 8 | 16 | 32 | 64 |
+
+Options take effect in the order given, and the last word wins. A setting
+after the tier changes that one setting and keeps the rest of the tier; a
+setting before it is replaced by the tier's value:
+
+```sh
+./xglquake +xgl_quality high +xgl_detailtris 4096
+```
+
+is `high` with a detail allowance of 4096. The same works in the console:
+`xgl_quality low`, and `xgl_quality` alone names the tiers.
+
+The tiers are first approximations and have not been timed on the machine.
+Quake saves the last four settings of the table in `config.cfg`, so after a
+run at another tier give `+xgl_quality` again, `medium` included, rather
+than leaving it out.
+
 ### Common options
 
 | Command-line option | Purpose |

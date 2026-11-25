@@ -74,6 +74,44 @@ static void XGL_TimeRefresh_f (void)
     if (elapsed > 0) Con_Printf("%f seconds (%f fps)\n", elapsed, 128 / elapsed);
 }
 
+/* xgl_quality low|medium|high|ultra sets the detail settings together, as a
+ * rough tier. It is a command, not a setting: it takes effect where it
+ * stands among the others, so a setting given after it changes that one
+ * setting and leaves the rest of the tier, and one given before it is
+ * replaced. Medium is what the settings are to begin with. */
+static const char *const xgl_quality_settings[] = {
+    "xgl_subdivide", "xgl_detailerror", "xgl_detailedge", "xgl_detailface", "xgl_detaildensity",
+    "xgl_detailtris", "xgl_detaildistance", "xgl_detailbuild", "xgl_shapes",
+    "xgl_alias_subdivide", "xgl_entity_triangles", "xgl_sprite_cells", "xgl_hudpieces"
+};
+#define XGL_QUALITY_SETTINGS ((int)(sizeof(xgl_quality_settings) / sizeof(xgl_quality_settings[0])))
+static const struct {
+    const char *name;
+    const char *values[XGL_QUALITY_SETTINGS];
+} xgl_quality_tiers[] = {
+    {"low",    {"256", "24", "24",  "96",  "80",  "1024",  "384",  "64", "1", "0",    "0",  "4",  "8"}},
+    {"medium", {"128", "16", "16", "192", "160",  "3072",  "512", "128", "1", "1",  "512",  "8", "16"}},
+    {"high",   { "96", "12", "12", "256", "240",  "6144",  "768", "192", "1", "1", "1024", "12", "32"}},
+    {"ultra",  { "64",  "8",  "8", "512", "320", "12288", "1024", "256", "1", "2", "4096", "16", "64"}}
+};
+static const char *xgl_quality_last = "medium";
+
+static void XGL_Quality_f (void)
+{
+    int i, j;
+    if (Cmd_Argc() == 2) {
+        for (i = 0; i < (int)(sizeof(xgl_quality_tiers) / sizeof(xgl_quality_tiers[0])); ++i) {
+            if (Q_strcasecmp(Cmd_Argv(1), (char *)xgl_quality_tiers[i].name)) continue;
+            for (j = 0; j < XGL_QUALITY_SETTINGS; ++j)
+                Cvar_Set((char *)xgl_quality_settings[j], (char *)xgl_quality_tiers[i].values[j]);
+            xgl_quality_last = xgl_quality_tiers[i].name;
+            return;
+        }
+    }
+    Con_Printf("usage: xgl_quality low | medium | high | ultra\n");
+    Con_Printf("last chosen: %s; settings given since may have changed it\n", xgl_quality_last);
+}
+
 void R_Init (void)
 {
     XGL_ProfileInit();
@@ -96,6 +134,7 @@ void R_Init (void)
     Cvar_RegisterVariable(&xgl_detaildensity);
     Cvar_RegisterVariable(&xgl_shapes);
     Cmd_AddCommand("timerefresh", XGL_TimeRefresh_f);
+    Cmd_AddCommand("xgl_quality", XGL_Quality_f);
     Cmd_AddCommand("pointfile", R_ReadPointFile_f);
     XGL_TextureInit();
     XGL_EntitiesInit();
