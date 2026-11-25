@@ -88,7 +88,7 @@ than leaving it out.
 
 Whether XGL supports the CG12 at all on Solaris 2.6 is unknown. Which boards
 are expected to work, and what the SX needs, is in
-[other Sun graphics hardware](docs/setup.md#other-sun-graphics-hardware).
+[other Sun graphics hardware](docs/hardware.md#other-sun-graphics-hardware).
 
 ### Common options
 
