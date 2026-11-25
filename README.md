@@ -51,7 +51,9 @@ locations and shareware restrictions.
 ### Quality
 
 `+xgl_quality` sets the renderer's detail settings together, as one of five
-rough tiers. Without it the renderer runs at **medium**.
+rough tiers. Without it the renderer runs at **medium**. Only **medium** has
+been tested on real hardware (Sun ZX) and the others are pure guesses as to
+what might work, provided here as a starting point for your convenience. See [quality settings](docs/render.md).
 
 ```sh
 ./xglquake -winsize 640 480 +_snd_mixahead 0.3 +xgl_quality high
@@ -63,34 +65,10 @@ rough tiers. Without it the renderer runs at **medium**.
 | `low` | `sx` | Coarse walls near the viewer only, original model triangles, a sixth of medium's detail allowance. For a Sun SX, or for the highest frame rate on a ZX. |
 | `medium` | `zx` | The default settings. The intended settings for a Sun ZX and SM61 processor. |
 | `high` | `creator` | Finer wall meshes to twice the range, four times the detail allowance, models subdivided twice. For a Creator3D. |
-| `ultra` | `elite` | The finest meshes the renderer makes, to four times the range, with ten times the detail allowance. For an Elite3D. |
+| `ultra` | `elite` | The finest meshes the renderer makes, to four times the range, with ten times the detail allowance. For an Elite3D. Note that this does not take advantage of hardware texture mapping at this time. |
 
 `+xgl_quality sx` is the same as `+xgl_quality low`, and so on. What each
 tier sets:
-
-| Setting | `ultralow` | `low` | `medium` | `high` | `ultra` |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `xgl_subdivide` | 256 | 256 | 128 | 64 | 32 |
-| `xgl_detailerror` | 48 | 32 | 16 | 10 | 6 |
-| `xgl_detailedge` | 48 | 32 | 16 | 10 | 6 |
-| `xgl_detailface` | 32 | 64 | 192 | 384 | 1024 |
-| `xgl_detaildensity` | 30 | 60 | 160 | 320 | 640 |
-| `xgl_detailtris` | 256 | 512 | 3072 | 12288 | 32768 |
-| `xgl_detaildistance` | 256 | 320 | 512 | 1024 | 2048 |
-| `xgl_detailbuild` | 32 | 48 | 128 | 512 | 2048 |
-| `xgl_shapes` | 1 | 1 | 1 | 1 | 1 |
-| `xgl_alias_subdivide` | 0 | 0 | 1 | 2 | 2 |
-| `xgl_entity_triangles` | 0 | 0 | 512 | 2048 | 16384 |
-| `xgl_sprite_cells` | 2 | 4 | 8 | 12 | 16 |
-| `xgl_hudpieces` | 4 | 8 | 16 | 32 | 64 |
-
-The hardware names are guesses at what each board can draw. Sun's GBench
-figures give the SX about a quarter of the ZX's shaded, Z-buffered
-triangles (30,500 a second against 125,000); the CG12, an older board in a
-slower machine, is taken as half of the SX again, with no figure behind it. The Creator3D and Elite3D are taken as roughly four and forty times
-the ZX, with much faster processors to prepare the meshes. Only the ZX has
-been run. On the faster boards the 8 MiB mesh cache, not the board, may be
-what limits `ultra`.
 
 Options take effect in the order given, and the last word wins. A setting
 after the tier changes that one setting and keeps the rest of the tier; a
