@@ -65,7 +65,7 @@ what might work provided as a starting point for your convenience.
 | `low` | `sx` | Coarse walls near the viewer only, original model triangles, a sixth of medium's detail allowance. For a Sun SX, or for the highest frame rate on a ZX. |
 | `medium` | `zx` | The default settings. The intended settings for a Sun ZX and SM61 processor. |
 | `high` | `creator` | Finer wall meshes to twice the range, four times the detail allowance, models subdivided twice. For a Creator3D. |
-| `ultra` | `elite` | The finest meshes the renderer makes, to four times the range, with ten times the detail allowance. For an Elite3D. |
+| `ultra` | `elite` | The finest meshes the renderer makes, to four times the range, with ten times the detail allowance. For an Elite3D. Note that this does not take advantage of hardware texture mapping at this time. |
 
 `+xgl_quality sx` is the same as `+xgl_quality low`, and so on. What each
 tier sets:
