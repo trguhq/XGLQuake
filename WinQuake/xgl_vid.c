@@ -27,6 +27,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "xgl_smp.h"
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <dlfcn.h>
 
 viddef_t vid;
 unsigned short d_8to16table[256];
@@ -321,6 +322,59 @@ static void XGL_VideoMenuKey(int key)
     }
 }
 
+/* The 24-bit TrueColor visual to draw in. Some boards, the Creator3D and
+ * Elite3D among them, have two or more: one whose pixels the hardware
+ * corrects for the monitor's gamma, called linear, and one it does not.
+ * Quake's own gamma is applied to every color sent, so the uncorrected one
+ * is wanted; in the other the picture would be corrected twice. The X
+ * protocol cannot tell them apart. Solaris can, through a routine of its
+ * Xmu library, which is looked for when the program runs so that a system
+ * without it is none the worse. With one such visual, as on the ZX, or
+ * without the routine, the first is taken, as it always was. */
+static int XGL_ChooseVisual (int screen, XVisualInfo *chosen)
+{
+    static const char *const libraries[] = {"libXmu.so.4", "libXmu.so"};
+    typedef int (*gamma_routine)(Display *, int, Visual *, double *);
+    XVisualInfo wanted, *list;
+    gamma_routine routine;
+    void *library;
+    double gamma;
+    int count, i, pick, found;
+    memset(&wanted, 0, sizeof(wanted));
+    wanted.screen = screen; wanted.depth = 24; wanted.class = TrueColor;
+    list = XGetVisualInfo(xgl_display, VisualScreenMask | VisualDepthMask | VisualClassMask, &wanted, &count);
+    if (!list || count < 1) {
+        if (list) XFree(list);
+        return 0;
+    }
+    pick = 0;
+    if (count > 1) {
+        routine = NULL; library = NULL;
+        for (i = 0; i < 2 && !routine; ++i) {
+            library = dlopen(libraries[i], RTLD_LAZY);
+            if (library) routine = (gamma_routine)dlsym(library, "XSolarisGetVisualGamma");
+        }
+        if (routine) {
+            /* A linear visual reports a gamma of one. */
+            found = 0;
+            for (i = 0; i < count && !found; ++i) {
+                gamma = 0;
+                if (routine(xgl_display, screen, list[i].visual, &gamma) != 0) continue; /* Not Success. */
+                if (gamma > 1.05 || gamma < .95) { pick = i; found = 1; }
+            }
+            Con_SafePrintf(found ?
+                "XGL: %d 24-bit TrueColor visuals; using 0x%lx, which the hardware does not gamma-correct\n" :
+                "XGL: %d 24-bit TrueColor visuals, none known to be free of hardware gamma; using the first, 0x%lx\n",
+                count, (unsigned long)list[pick].visualid);
+        } else
+            Con_SafePrintf("XGL: %d 24-bit TrueColor visuals and no way to tell them apart; using the first, 0x%lx\n",
+                           count, (unsigned long)list[0].visualid);
+    }
+    *chosen = list[pick];
+    XFree(list);
+    return 1;
+}
+
 void VID_Init(unsigned char *palette)
 {
     XVisualInfo visual, requested, *matches;
@@ -361,7 +415,7 @@ void VID_Init(unsigned char *palette)
         XFree(matches);
         if (visual.depth != 24 || visual.class != TrueColor)
             Sys_Error("XGL: requested visual must be 24-bit TrueColor");
-    } else if (!XMatchVisualInfo(xgl_display, screen, 24, TrueColor, &visual))
+    } else if (!XGL_ChooseVisual(screen, &visual))
         Sys_Error("XGL: a 24-bit TrueColor visual is required");
     xgl_colormap = XCreateColormap(xgl_display, RootWindow(xgl_display, screen), visual.visual, AllocNone);
     memset(&attributes, 0, sizeof(attributes));

@@ -18,6 +18,13 @@ modified-game checks remain enabled.
 
 Use a local display with the Sun ZX's 24-bit TrueColor visual and DGA access.
 The renderer requires hardware RGB, Z buffering, shading and two buffers.
+Where a board has more than one 24-bit TrueColor visual, as the Creator3D
+and Elite3D have, the one the hardware does not gamma-correct is chosen:
+Quake applies its own gamma, and in a corrected ("linear") visual the
+picture would be corrected twice and look washed out. Solaris is asked
+which is which; startup names the visual chosen, and `-visualid` overrides
+it. On a board with one such visual, such as the ZX, nothing changes. This
+has not been run on those boards.
 `-display`, `-visualid`, `-width`, `-height`, `-winsize` and `-nomouse` select
 the display/window/input settings. The video menu offers window sizes.
 Original Quake console, save/load, demo, mouse sensitivity and key bindings
