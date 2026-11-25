@@ -19,6 +19,49 @@ OpenGL target are unchanged.
 Several choices below follow from measurements of the target device; see
 [Measured on the Sun ZX](hardware.md).
 
+### Renderer settings
+
+| Setting | Default | Effect |
+| --- | ---: | --- |
+| `xgl_quality` | medium | A command, not a setting: `low`, `medium`, `high` or `ultra` sets the detail settings below together. Settings given after it override it one at a time. See the [README](../README.md#quality) for what each tier sets. |
+| `xgl_subdivide` | 128 | Edge length, in texels, above which a detailed mesh always splits an edge, clamped to 8–256; smaller is finer. |
+| `xgl_detailerror` | 16 | Color difference, of 255, that a new vertex must make to be worth adding, clamped to 1–255; smaller is finer. |
+| `xgl_detailedge` | 16 | Edges of this many texels or less are never split, clamped to 4–64; smaller is finer. |
+| `xgl_detailface` | 192 | Most triangles in one face's detailed mesh, clamped to 4–1024. |
+| `xgl_detaildensity` | 160 | Triangles a face may have for its apparent size: this times its area over its squared distance, up to `xgl_detailface`. Larger gives near faces their limit sooner; 0 gives every face `xgl_detailface`. |
+| `xgl_detailtris` | 3072 | Detailed wall and brush-entity triangles per frame; faces beyond the allowance draw their coarse mesh. |
+| `xgl_detaildistance` | 512 | Distance within which faces are considered for detail and water uses its finer grid. |
+| `xgl_detailbuild` | 128 | Detailed-mesh triangles built per frame; one mesh is always allowed, 0 removes the limit. |
+| `xgl_shapes` | 1 | Cut walls along the shapes of their textures where a texture has them; 0 draws every wall as a smooth mesh. See [texture shapes](#texture-shapes). |
+| `xgl_alias_subdivide` | 1 | Alias subdivision depth, 0–2; distant models use less. |
+| `xgl_alias_strips` | 4 | Fewest triangles a run of a model's triangles must have to be sent as a triangle strip; 0 sends every triangle separately. |
+| `xgl_entity_triangles` | 512 | Additional alias subdivision triangles per frame; original model triangles remain. |
+| `xgl_sprite_cells` | 8 | Sample grid per sprite dimension, clamped to 2–16. |
+| `xgl_playercolors` | 1 | Apply original player shirt/pants palette translations to sampled skins. |
+| `xgl_ambient` | 1 | Ambient contribution, clamped to 0–1; below 1 keeps the world illuminated. |
+| `xgl_maxlights` | 4 | Maximum native point lights, clamped to 0–4. |
+| `xgl_lightfalloff` | 2 | How fast a dynamic light fades with distance, clamped to 1–64; 1 is the slowest and brightest. |
+| `xgl_lightrange` | 4 | Distance, in light radii, beyond which geometry is not illuminated by a dynamic light; 0 removes the limit. |
+| `xgl_alias_shade` | 1 | Shade models on the CPU and submit them unlit; 0 uses native illumination. |
+| `xgl_hudpieces` | 16 | Rectangles of color a status-bar picture is drawn in, besides those its outline takes; 0 draws labelled stand-ins instead. |
+| `xgl_keepbar` | -1 | Leave an unchanged status bar in place instead of clearing and redrawing it: -1 in small windows only, 0 never, 1 whenever possible. |
+| `xgl_smp` | -1 | Worker thread for model preparation: -1 automatic, 0 off, 1 on. |
+| `xgl_profile` | 0 | 1 reports graphics timings and native call counts; 2 adds preparation and cache detail. Output goes to the terminal once per second. |
+| `_snd_mixahead` | 0.3 | Audio lookahead in seconds for XGL; an existing archived value overrides this default. |
+| `r_wateralpha` | 1 | Water opacity; values below 1 request native blending. |
+
+Changing `xgl_subdivide`, `xgl_detailerror`, `xgl_detailedge`,
+`xgl_detailface`, `xgl_detaildensity` or `xgl_shapes` rebuilds the mesh
+cache. Textures are not examined again for it.
+
+Settings in configuration files or command-line options override these
+defaults. In particular, `xgl_entity_triangles` is saved in `config.cfg`, so
+an older saved value remains in effect until changed.
+
+The original `r_dynamic`, `r_fullbright`, `r_novis`, `r_drawentities`,
+`r_drawviewmodel`, `viewsize`, `fov`, `gamma` and `r_speeds` controls are also
+available.
+
 ### Lighting
 
 Baked BSP lighting and animated lightstyles are folded into the sampled
@@ -527,49 +570,6 @@ bar is also drawn again when the window is moved, mapped or exposed, and
 every 128 frames whatever the game says. If the device's viewport is not the
 window's rows counted from the top, or the window is scaled, the bar is not
 kept at all; a line on the terminal says so.
-
-### Renderer settings
-
-| Setting | Default | Effect |
-| --- | ---: | --- |
-| `xgl_quality` | medium | A command, not a setting: `low`, `medium`, `high` or `ultra` sets the detail settings below together. Settings given after it override it one at a time. See the [README](../README.md#quality) for what each tier sets. |
-| `xgl_subdivide` | 128 | Edge length, in texels, above which a detailed mesh always splits an edge, clamped to 8–256; smaller is finer. |
-| `xgl_detailerror` | 16 | Color difference, of 255, that a new vertex must make to be worth adding, clamped to 1–255; smaller is finer. |
-| `xgl_detailedge` | 16 | Edges of this many texels or less are never split, clamped to 4–64; smaller is finer. |
-| `xgl_detailface` | 192 | Most triangles in one face's detailed mesh, clamped to 4–1024. |
-| `xgl_detaildensity` | 160 | Triangles a face may have for its apparent size: this times its area over its squared distance, up to `xgl_detailface`. Larger gives near faces their limit sooner; 0 gives every face `xgl_detailface`. |
-| `xgl_detailtris` | 3072 | Detailed wall and brush-entity triangles per frame; faces beyond the allowance draw their coarse mesh. |
-| `xgl_detaildistance` | 512 | Distance within which faces are considered for detail and water uses its finer grid. |
-| `xgl_detailbuild` | 128 | Detailed-mesh triangles built per frame; one mesh is always allowed, 0 removes the limit. |
-| `xgl_shapes` | 1 | Cut walls along the shapes of their textures where a texture has them; 0 draws every wall as a smooth mesh. See [texture shapes](#texture-shapes). |
-| `xgl_alias_subdivide` | 1 | Alias subdivision depth, 0–2; distant models use less. |
-| `xgl_alias_strips` | 4 | Fewest triangles a run of a model's triangles must have to be sent as a triangle strip; 0 sends every triangle separately. |
-| `xgl_entity_triangles` | 512 | Additional alias subdivision triangles per frame; original model triangles remain. |
-| `xgl_sprite_cells` | 8 | Sample grid per sprite dimension, clamped to 2–16. |
-| `xgl_playercolors` | 1 | Apply original player shirt/pants palette translations to sampled skins. |
-| `xgl_ambient` | 1 | Ambient contribution, clamped to 0–1; below 1 keeps the world illuminated. |
-| `xgl_maxlights` | 4 | Maximum native point lights, clamped to 0–4. |
-| `xgl_lightfalloff` | 2 | How fast a dynamic light fades with distance, clamped to 1–64; 1 is the slowest and brightest. |
-| `xgl_lightrange` | 4 | Distance, in light radii, beyond which geometry is not illuminated by a dynamic light; 0 removes the limit. |
-| `xgl_alias_shade` | 1 | Shade models on the CPU and submit them unlit; 0 uses native illumination. |
-| `xgl_hudpieces` | 16 | Rectangles of color a status-bar picture is drawn in, besides those its outline takes; 0 draws labelled stand-ins instead. |
-| `xgl_keepbar` | -1 | Leave an unchanged status bar in place instead of clearing and redrawing it: -1 in small windows only, 0 never, 1 whenever possible. |
-| `xgl_smp` | -1 | Worker thread for model preparation: -1 automatic, 0 off, 1 on. |
-| `xgl_profile` | 0 | 1 reports graphics timings and native call counts; 2 adds preparation and cache detail. Output goes to the terminal once per second. |
-| `_snd_mixahead` | 0.3 | Audio lookahead in seconds for XGL; an existing archived value overrides this default. |
-| `r_wateralpha` | 1 | Water opacity; values below 1 request native blending. |
-
-Changing `xgl_subdivide`, `xgl_detailerror`, `xgl_detailedge`,
-`xgl_detailface`, `xgl_detaildensity` or `xgl_shapes` rebuilds the mesh
-cache. Textures are not examined again for it.
-
-Settings in configuration files or command-line options override these
-defaults. In particular, `xgl_entity_triangles` is saved in `config.cfg`, so
-an older saved value remains in effect until changed.
-
-The original `r_dynamic`, `r_fullbright`, `r_novis`, `r_drawentities`,
-`r_drawviewmodel`, `viewsize`, `fov`, `gamma` and `r_speeds` controls are also
-available.
 
 ### Display mapping
 
