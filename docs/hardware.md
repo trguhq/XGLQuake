@@ -117,28 +117,6 @@ changed where the window is small enough.
 XGL's texture mapping runs in software on this device: one frame of 512
 point-sampled triangles took 1.84 seconds. The renderer does not use it.
 
-## Other Sun graphics hardware
-
-XGLQuake was written and measured on a Sun ZX. It has also run on an SX,
-as described below. For the other boards what follows is from Sun's
-documentation, not from trial.
-
-| Hardware | `xgl_quality` | Expected |
-| --- | --- | --- |
-| ZX, TurboZX | `zx` (medium) | Works: the board the renderer was made on. |
-| Creator3D | `creator` (high) | Should work as it is. 24-bit windows with hardware double buffering and Z through XGL. See the note on gamma in [setup](setup.md). |
-| Elite3D | `elite` (ultra) | Should work as it is, by the same reasoning; its XGL support is assumed, not confirmed. |
-| Creator (not 3D) | none | Will not work: no double buffering or Z for 24-bit windows. |
-| SX (SPARCstation 10SX, 20) | `sx` (low) | Works as it is, at about a quarter of the ZX's speed for each triangle; see below. |
-| CG12 (GS) | `cg12` (ultralow) | Unknown. Sun's Solaris 2.6 frame buffer handbook does not list it, and nothing found says whether XGL on 2.6 supports it. |
-| GX, TurboGX, S24, PGX | none | Will not work: no 24-bit Z-buffered 3D. |
-
-Startup refuses a device unless XGL reports direct access, RGB color, a
-Z-buffer and shading all in hardware, and two window buffers. The ZX and
-the SX pass. `-xglanydevice` goes on with less, as long as XGL can do each of these at
-all; the status bar is then redrawn every frame, and with a single buffer
-frames are drawn in view and flicker.
-
 ## SX
 
 XGLQuake 0.1.13 has run on an SX in a machine with two 125 MHz HyperSPARC
@@ -197,3 +175,25 @@ What Sun's documentation says of the board:
   memory reserved is not known.
 - With 4 MB of video memory the larger resolutions (1280x1024 and up) have
   8 bits a pixel only, and so no 24-bit visual to run in.
+
+## Other Sun graphics hardware
+
+XGLQuake was written and measured on a Sun ZX. It has also run on an SX,
+as described below. For the other boards what follows is from Sun's
+documentation, not from trial.
+
+| Hardware | `xgl_quality` | Expected |
+| --- | --- | --- |
+| ZX, TurboZX | `zx` (medium) | Works: the board the renderer was made on. |
+| Creator3D | `creator` (high) | Should work as it is. 24-bit windows with hardware double buffering and Z through XGL. See the note on gamma in [setup](setup.md). |
+| Elite3D | `elite` (ultra) | Should work as it is, by the same reasoning; its XGL support is assumed, not confirmed. |
+| Creator (not 3D) | none | Will not work: no double buffering or Z for 24-bit windows. |
+| SX (SPARCstation 10SX, 20) | `sx` (low) | Works as it is, at about a quarter of the ZX's speed for each triangle; see below. |
+| CG12 (GS) | `cg12` (ultralow) | Unknown. Sun's Solaris 2.6 frame buffer handbook does not list it, and nothing found says whether XGL on 2.6 supports it. |
+| GX, TurboGX, S24, PGX | none | Will not work: no 24-bit Z-buffered 3D. |
+
+Startup refuses a device unless XGL reports direct access, RGB color, a
+Z-buffer and shading all in hardware, and two window buffers. The ZX and
+the SX pass. `-xglanydevice` goes on with less, as long as XGL can do each of these at
+all; the status bar is then redrawn every frame, and with a single buffer
+frames are drawn in view and flicker.
