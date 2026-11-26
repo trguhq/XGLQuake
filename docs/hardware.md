@@ -1,4 +1,6 @@
-# Measured on the Sun ZX
+# Hardware specifcs
+
+## Sun ZX
 
 These figures come from [xglbench](../xglbench/README.md) runs in November
 2026 on the project's test machine: a SPARCstation 10 with one 60 MHz SM61,
@@ -6,7 +8,7 @@ Solaris 2.6, XGL 3.3 and a Sun ZX (reported by XGL as `Sun:LEO`), in a 320x240
 window unless stated. They are measurements of that one machine, not
 specifications. The renderer's design follows from them, as noted under each.
 
-## The buffer switch waits for retrace
+### The buffer switch waits for retrace
 
 A buffer switch does not return until the next vertical retrace. The interval
 between consecutive switches, with nothing drawn, was 13.12 ms (median of
@@ -27,7 +29,7 @@ A saving that does not carry a frame across one of these boundaries changes
 its profile but not its duration. An average such as a timedemo result mixes
 frames of different lengths.
 
-## Triangles: illumination and lights
+### Triangles: illumination and lights
 
 2,048 smooth-shaded triangles of about 22 pixels each, complete draw:
 
@@ -52,7 +54,7 @@ At this size the device is limited by triangle count, not pixels: the same
 triangles at 640x480, four times the area, take the same time. Triangles of
 87 pixels take about 2.6 times as long at 640x480.
 
-## State changes
+### State changes
 
 Changing between illuminated and unlit drawing (three attribute calls, as the
 renderer issues them) costs about 0.54 ms per change. The renderer orders each
@@ -62,7 +64,7 @@ frame by native state for this reason; see
 Replacing the model transform costs about 0.5 ms per change, so the CPU keeps
 transforming entity vertices and the transform is left alone.
 
-## Clears
+### Clears
 
 | Clear | 320x240 |
 | --- | ---: |
@@ -83,7 +85,7 @@ several times that. The probe checked the middle of the view and of the
 band, not the row where they meet; the renderer's use of it has not yet been
 run on the device.
 
-## Submission calls
+### Submission calls
 
 | 512 flat triangles | Time |
 | --- | ---: |
@@ -100,7 +102,7 @@ smooth-shaded triangles the renderer draws has not been measured; the
 `probe/mesh` cases of [xglbench](../xglbench/README.md#hardware-probes) are
 there to find out.
 
-## Native stroke text
+### Native stroke text
 
 Text costs about 23 µs per glyph and about 0.2 ms per call. A status bar of
 four lines took 3.2 ms and a twelve-line console 8.0 ms, each including one
@@ -110,7 +112,7 @@ and one per status-bar number. It also queues text so that a status bar's
 rectangles go out in one polygon call, and draws the bar only when it has
 changed where the window is small enough.
 
-## Native texture mapping
+### Native texture mapping
 
 XGL's texture mapping runs in software on this device: one frame of 512
 point-sampled triangles took 1.84 seconds. The renderer does not use it.
@@ -137,7 +139,7 @@ the SX pass. `-xglanydevice` goes on with less, as long as XGL can do each of th
 all; the status bar is then redrawn every frame, and with a single buffer
 frames are drawn in view and flicker.
 
-### SX
+## SX
 
 XGLQuake 0.1.13 has run on an SX in a machine with two 125 MHz HyperSPARC
 processors, at 320x240, with no special options. XGL reports the device as
