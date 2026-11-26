@@ -117,8 +117,9 @@ point-sampled triangles took 1.84 seconds. The renderer does not use it.
 
 ## Other Sun graphics hardware
 
-XGLQuake was written and measured on a Sun ZX and has run on nothing else.
-What follows is from Sun's documentation, not from trial.
+XGLQuake was written and measured on a Sun ZX. It has also run on an SX,
+as described below. For the other boards what follows is from Sun's
+documentation, not from trial.
 
 | Hardware | `xgl_quality` | Expected |
 | --- | --- | --- |
@@ -126,33 +127,71 @@ What follows is from Sun's documentation, not from trial.
 | Creator3D | `creator` (high) | Should work as it is. 24-bit windows with hardware double buffering and Z through XGL. See the note on gamma in [setup](setup.md). |
 | Elite3D | `elite` (ultra) | Should work as it is, by the same reasoning; its XGL support is assumed, not confirmed. |
 | Creator (not 3D) | none | Will not work: no double buffering or Z for 24-bit windows. |
-| SX (SPARCstation 10SX, 20) | `sx` (low) | May work with `-xglanydevice` and memory reserved; see below. |
+| SX (SPARCstation 10SX, 20) | `sx` (low) | Works as it is, at about a quarter of the ZX's speed for each triangle; see below. |
 | CG12 (GS) | `cg12` (ultralow) | Unknown. Sun's Solaris 2.6 frame buffer handbook does not list it, and nothing found says whether XGL on 2.6 supports it. |
 | GX, TurboGX, S24, PGX | none | Will not work: no 24-bit Z-buffered 3D. |
 
 Startup refuses a device unless XGL reports direct access, RGB color, a
-Z-buffer and shading all in hardware, and two window buffers.
-`-xglanydevice` goes on with less, as long as XGL can do each of these at
+Z-buffer and shading all in hardware, and two window buffers. The ZX and
+the SX pass. `-xglanydevice` goes on with less, as long as XGL can do each of these at
 all; the status bar is then redrawn every frame, and with a single buffer
 frames are drawn in view and flicker.
 
 ### SX
 
-The SX draws pixels and leaves transforms and lighting to the processor,
-which is how the renderer works anyway, and the calls its XGL driver is
-tuned for are the ones used here: three-sided polygons, and opaque 24-bit
-triangle strips with a less-than-or-equal depth test. But its Z-buffer is in
-main memory and a 24-bit window is double-buffered by copying, so startup
-will probably need `-xglanydevice`.
+XGLQuake 0.1.13 has run on an SX in a machine with two 125 MHz HyperSPARC
+processors, at 320x240, with no special options. XGL reports the device as
+`Sun:SX` with RGB color, the Z-buffer and shading all in hardware, and
+gives the window two buffers, so startup accepts it without
+`-xglanydevice`. The status bar is kept from frame to frame as on the ZX:
+the shortened clear works there too.
 
-- Reserve memory for it, which XGL uses for the Z-buffer and the back
-  buffer at 4 bytes a pixel each: 8 MB for both, set in the system
-  configuration and taken at boot. Sun's "Platform Notes: SPARCstation 10SX
-  and SPARCstation 20 System Configuration Guide" has the procedure.
-- Use a resolution that has a 24-bit visual. With 4 MB of video memory the
-  larger resolutions (1280x1024 and up) have 8 bits a pixel only.
-- Sun's benchmark gives it about a quarter of the ZX's shaded triangles.
+Playing the three demos in a loop at the default settings, which are the
+ZX's (`medium`), with `xgl_profile 2`, over 960 frames:
+
+| Per frame | SX, two 125 MHz HyperSPARC | ZX, one 60 MHz SM61 |
+| --- | ---: | ---: |
+| Frames a second | about 11 | 21.9 |
+| Graphics time | 91.4 ms | 43.4 ms |
+| of it inside XGL drawing calls | 68.0 ms | |
+| World | 36.7 ms | 13.3 ms |
+| Entities | 20.8 ms | 10.6 ms |
+| Triangles | 2,106 | 1,868 |
+| Buffer switch | 3.3 ms | 7.6 ms |
+| Choosing and building meshes | 2.6 ms | |
+
+The ZX column is the `demo1` timedemo of an earlier version, so the two are
+to be compared loosely; the SX run was ordinary playback, not a timedemo.
+
+- The board is what limits it, not the processors: three quarters of a
+  frame is spent inside XGL's drawing calls, and under 3 ms choosing and
+  building meshes.
+- A triangle costs about 20 microseconds more, where the ZX takes 4.5. Sun's
+  own benchmark has the SX at about a quarter of the ZX's shaded triangles
+  (30,500 a second against 125,000), and this agrees.
+- About 27 ms of a frame does not depend on the number of triangles. That
+  may be the cost of each call: a frame has some 57 triangle strips of nine
+  triangles on average. It has not been looked into; `xglbench` on the SX,
+  or a run with `xgl_alias_strips 0`, would tell.
+
+The `sx` tier draws well under half the triangles and has not been timed
+there yet:
 
 ```sh
-./xglquake -xglanydevice -winsize 320 240 +_snd_mixahead 0.3 +xgl_quality sx
+./xglquake -winsize 320 240 +_snd_mixahead 0.3 +xgl_quality sx +xgl_profile 2 +timedemo demo1 > xglquake-sx.txt 2>&1
 ```
+
+What Sun's documentation says of the board:
+
+- It draws pixels and leaves transforms and lighting to the processor,
+  which is how the renderer works anyway, and the calls its XGL driver is
+  tuned for are the ones used here: three-sided polygons, and opaque 24-bit
+  triangle strips with a less-than-or-equal depth test.
+- Its Z-buffer and the back buffer of a 24-bit window are kept in main
+  memory, 4 bytes a pixel each, and faster if memory is reserved for them:
+  8 MB for both, set in the system configuration and taken at boot. Sun's
+  "Platform Notes: SPARCstation 10SX and SPARCstation 20 System
+  Configuration Guide" has the procedure. Whether the machine above had
+  memory reserved is not known.
+- With 4 MB of video memory the larger resolutions (1280x1024 and up) have
+  8 bits a pixel only, and so no 24-bit visual to run in.

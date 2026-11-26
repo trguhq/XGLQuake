@@ -1318,10 +1318,9 @@ void XGLB_Init(Display *display, Window window, int width, int height)
         inquiry->maximum_buffer < 2) {
         /* What the renderer was made for is direct access to a device with
          * RGB color, a Z-buffer and shading in hardware and two buffers to
-         * switch between. A device such as the SX keeps its Z-buffer in
-         * main memory and shows a finished frame by copying it: XGL may
-         * say so here, and -xglanydevice goes on regardless, as long as
-         * XGL can do each thing at all. */
+         * switch between. The ZX and the SX report all of that.
+         * -xglanydevice goes on with a device that reports less, as long
+         * as XGL can do each thing at all. */
         if (!COM_CheckParm("-xglanydevice") || inquiry->true_color == XGL_INQ_NOT_SUPPORTED ||
             inquiry->hlhsr == XGL_INQ_NOT_SUPPORTED || inquiry->shading == XGL_INQ_NOT_SUPPORTED) {
             free(inquiry);

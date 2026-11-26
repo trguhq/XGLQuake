@@ -71,8 +71,8 @@ A tier named after a board is a guess at settings for it, not a statement
 that the board works. Which boards are expected to run XGLQuake at all, which
 will not, and what each needs is listed under
 [other Sun graphics hardware](docs/hardware.md#other-sun-graphics-hardware):
-in short the ZX works, the Creator3D and Elite3D should, the SX may with
-`-xglanydevice`, and the CG12 is unknown.
+in short the ZX and the SX work, the Creator3D and Elite3D should, and the
+CG12 is unknown.
 
 `+xgl_quality sx` is the same as `+xgl_quality low`, and so on.
 

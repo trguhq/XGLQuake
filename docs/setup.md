@@ -37,8 +37,8 @@ mode is not applied to XGL rendering.
 
 ## Other Sun graphics hardware
 
-Which Sun boards are expected to run XGLQuake, the `-xglanydevice` option
-for those with less than the ZX has, and what the SX needs are in
+Which Sun boards run XGLQuake or are expected to, how it ran on an SX, and
+the `-xglanydevice` option for a device with less than those have are in
 [other Sun graphics hardware](hardware.md#other-sun-graphics-hardware).
 
 ## Troubleshooting
